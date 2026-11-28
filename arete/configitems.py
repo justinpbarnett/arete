@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -10,13 +11,69 @@ from dataclasses import asdict
 from difflib import unified_diff
 from pathlib import Path
 
-from . import config, configkinds, paths, refusals, settings
+from . import config, configkinds, configrepo, paths, refusals, settings
+from .store import config as config_store
 
 MAX_CONTENT = 1024 * 1024
 REVISION = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
+CONTENT_VERSION = re.compile(r"^[a-z_]+/.+@[0-9a-f]{12}$")
 
 
-def listing(kind: str, *, name: str | None = None) -> list[dict]:
+def kinds() -> list[dict]:
+    return [
+        {
+            "kind": name,
+            "home": [h.pattern for h in entry.home],
+            "schema": entry.schema.as_posix(),
+            "gate": entry.gate,
+            "verbs": list(entry.verbs),
+        }
+        for name, entry in configkinds.REGISTRY.items()
+    ]
+
+
+def _content_version_of(kind: str, name: str, raw: bytes) -> str:
+    return f"{kind}/{name}@{hashlib.sha256(raw).hexdigest()[:12]}"
+
+
+def _enrich(entry: dict, conn=None) -> dict:
+    kind, name, rel = entry["kind"], entry["name"], entry["path"]
+    if entry.get("engine"):
+        engine_path = Path(entry["engine"])
+        raw = engine_path.read_bytes() if engine_path.is_file() else b""
+        return {
+            "kind": kind,
+            "name": name,
+            "path": rel,
+            "subject": f"config:{kind}/{name}",
+            "version": 0,
+            "content_version": _content_version_of(kind, name, raw),
+            "level": "engine",
+        }
+    lookup_kind = "step_settings" if kind == "attention" else kind
+    row = config_store.live_item(lookup_kind, name, conn) or config_store.live_by_path(rel, conn)
+    ver = int(row["ver"]) if row and row.get("ver") is not None else 0
+    if row and kind != "attention":
+        cv = row["version"]
+    else:
+        file_path = paths.CONFIG_DIR.resolve() / rel
+        raw = file_path.read_bytes() if file_path.is_file() else b""
+        cv = _content_version_of(kind, name, raw)
+    level = row["origin"] if row and row["origin"].startswith("layer:") else configrepo.level_of(rel)
+    return {
+        "kind": kind,
+        "name": name,
+        "path": rel,
+        "subject": f"config:{kind}/{name}",
+        "version": ver,
+        "content_version": cv,
+        "level": level,
+    }
+
+
+def listing(kind: str, *, name: str | None = None, conn=None) -> list[dict]:
+    if kind not in configkinds.REGISTRY:
+        raise refusals.NotFound(f"Unknown config kind {kind}")
     root = paths.CONFIG_DIR.resolve()
     found = {}
     for home in configkinds.REGISTRY[kind].home:
@@ -25,10 +82,10 @@ def listing(kind: str, *, name: str | None = None) -> list[dict]:
             if path.resolve() != path or not path.is_file():
                 continue
             relative = path.relative_to(root).as_posix()
-            item = ("attention", "defaults") if kind == "attention" else configkinds.classify(relative)
-            if item is None or item[0] != kind:
+            item_info = ("attention", "defaults") if kind == "attention" else configkinds.classify(relative)
+            if item_info is None or item_info[0] != kind:
                 continue
-            item_name = item[1]
+            item_name = item_info[1]
             if kind == "step_settings" and relative == "layers/defaults/config.toml":
                 item_name = configkinds.DEFAULTS_LAYER_ADDRESS
             if name is not None and item_name != name:
@@ -36,18 +93,135 @@ def listing(kind: str, *, name: str | None = None) -> list[dict]:
             if item_name in found:
                 first = found[item_name]["path"]
                 raise refusals.Conflict(f"Config item {kind}/{item_name} is ambiguous: {first} and {relative}")
-            found[item_name] = {"kind": kind, "name": item_name, "path": relative}
+            found[item_name] = _enrich({"kind": kind, "name": item_name, "path": relative}, conn)
     return [found[key] for key in sorted(found)]
 
 
-def item(kind: str, name: str) -> dict:
-    if found := listing(kind, name=name):
-        return found[0]
+def _engine_item(kind: str, name: str) -> dict | None:
+    if kind == "step_settings" and name == "defaults":
+        target = paths.DEFAULTS_DIR / "steps.toml"
+        if target.is_file():
+            return {
+                **_enrich({"kind": kind, "name": name, "path": "arete/defaults/steps.toml", "engine": str(target)}),
+                "_engine_file": str(target),
+            }
+    if kind == "loop":
+        target = paths.PACKAGE_DIR / "loops" / name / "loop.toml"
+        if target.is_file():
+            return {
+                **_enrich({"kind": kind, "name": name, "path": f"arete/loops/{name}/loop.toml", "engine": str(target)}),
+                "_engine_file": str(target),
+            }
+    return None
+
+
+def item(kind: str, name: str, *, level: str | None = None, conn=None) -> dict:
+    if kind not in configkinds.REGISTRY:
+        raise refusals.NotFound(f"Unknown config kind {kind}")
+    if level == "engine":
+        engine = _engine_item(kind, name)
+        if engine is not None:
+            return engine
+        raise refusals.NotFound(f"No engine config item {kind}/{name}")
+    if found := listing(kind, name=name, conn=conn):
+        entry = found[0]
+        if level is not None and entry["level"] != level:
+            raise refusals.NotFound(f"No config item {kind}/{name} at level {level}")
+        return entry
     raise refusals.NotFound(f"No config item {kind}/{name}")
 
 
-def read(found: dict) -> dict:
-    if found["kind"] == "attention":
+def _validate_subfile(file_name: str) -> str:
+    if not file_name or "/" in file_name or "\\" in file_name or file_name in (".", "..") or "\0" in file_name:
+        raise refusals.Invalid(f"Invalid file selector {file_name!r}")
+    return file_name
+
+
+def _target_path(found: dict, file_name: str | None) -> str:
+    if not file_name:
+        return found["path"]
+    clean = _validate_subfile(file_name)
+    parent = Path(found["path"]).parent
+    return (parent / clean).as_posix()
+
+
+def _resolve_selector(found: dict, selector: str, conn=None) -> tuple[str, int | None, str | None] | None:
+    """Resolve a version selector (integer ver, content_version, or full git SHA) to (commit_sha, ver, content_version)."""
+    if re.fullmatch(REVISION, selector):
+        return selector, None, None
+    lookup_kind = "step_settings" if found["kind"] == "attention" else found["kind"]
+    history = configrepo.version_history(lookup_kind, found["name"], found["path"])
+    if selector.isdecimal():
+        wanted_ver = int(selector)
+        if wanted_ver < 1:
+            return None
+        for entry in history:
+            if entry["version"] == wanted_ver:
+                return entry["commit_sha"], entry["version"], entry["content_version"]
+        row = config_store.by_selector(lookup_kind, found["name"], selector, conn)
+        if row:
+            return row["commit_sha"], int(row.get("ver") or 0), row["version"]
+        return None
+    if CONTENT_VERSION.fullmatch(selector):
+        for entry in history:
+            if entry["content_version"] == selector or (
+                found["kind"] == "attention" and entry["content_version"].endswith(selector.partition("@")[2])
+            ):
+                return entry["commit_sha"], entry["version"], entry["content_version"]
+        row = config_store.by_selector(lookup_kind, found["name"], selector, conn)
+        if row:
+            return row["commit_sha"], int(row.get("ver") or 0), row["version"]
+        return None
+    raise refusals.Invalid("Config version selectors must be a positive integer, content_version, or full Git commit ID")
+
+
+def read(found: dict, *, version: str | None = None, level: str | None = None,
+         from_ref: str | None = None, file: str | None = None, conn=None) -> dict:
+    public = {k: v for k, v in found.items() if not k.startswith("_")}
+    if "_engine_file" in found:
+        engine_path = Path(found["_engine_file"])
+        if file:
+            engine_path = engine_path.parent / _validate_subfile(file)
+            if not engine_path.is_file():
+                raise refusals.NotFound(f"No file {file} for {found['kind']}/{found['name']}")
+        return {**public, "content": engine_path.read_text(encoding="utf-8")}
+    rel = _target_path(public, file)
+    if version is not None or (from_ref is not None and from_ref != "working"):
+        if (location := git_location(public["path"])) is None:
+            raise refusals.NotFound(f"No git history for {public['kind']}/{public['name']}")
+        root, _ = location
+        git_rel = (paths.CONFIG_DIR.resolve() / rel).relative_to(root).as_posix()
+        if version is not None:
+            resolved = _resolve_selector(public, version, conn=conn)
+            if resolved is None:
+                raise refusals.NotFound(f"No version {version} for {public['kind']}/{public['name']}")
+            commit_sha, matched_ver, matched_cv = resolved
+        elif from_ref == "live":
+            commit_sha = configrepo.live_sha(root)
+            if not commit_sha:
+                raise refusals.NotFound(f"No live revision for {public['kind']}/{public['name']}")
+            matched_ver, matched_cv = public["version"], public["content_version"]
+        else:
+            resolved = _resolve_selector(public, from_ref, conn=conn)
+            if resolved is None:
+                raise refusals.NotFound(f"No revision {from_ref} for {public['kind']}/{public['name']}")
+            commit_sha, matched_ver, matched_cv = resolved
+        raw_text = revision_text(root, commit_sha, git_rel)
+        if raw_text is None:
+            raise refusals.NotFound(f"The selected config revision is unavailable for {rel}")
+        if public["kind"] == "attention" and not file:
+            try:
+                content = asdict(config.ask_table(tomllib.loads(raw_text).get("ask", {})))
+            except (TypeError, ValueError) as error:
+                raise refusals.Invalid(str(error)) from error
+        else:
+            content = raw_text
+        if matched_ver is not None:
+            public["version"] = matched_ver
+        if matched_cv is not None:
+            public["content_version"] = matched_cv
+        return {**public, "content": content}
+    if public["kind"] == "attention" and not file:
         try:
             content = settings.attention()
         except FileNotFoundError:
@@ -55,8 +229,8 @@ def read(found: dict) -> dict:
         except (TypeError, ValueError) as error:
             raise refusals.Invalid(str(error)) from error
     else:
-        content = file_text(found["path"])
-    return {**found, "content": content}
+        content = file_text(rel)
+    return {**public, "content": content}
 
 
 def file_text(relative: str) -> str:
@@ -120,6 +294,17 @@ def revisions(found: dict) -> list[str]:
     return (git(root, "log", "-n", "50", "--format=%H", "--", path) or "").splitlines()
 
 
+def versions(found: dict, conn=None) -> tuple[list[str], list[dict]]:
+    location = git_location(found["path"])
+    if location is not None and location[0] == paths.CONFIG_DIR.resolve() and configrepo.is_repo():
+        lookup_kind = "step_settings" if found["kind"] == "attention" else found["kind"]
+        entries = configrepo.version_history(lookup_kind, found["name"], found["path"])
+        if entries:
+            return [entry["commit_sha"] for entry in entries], entries
+    shas = revisions(found)
+    return shas, []
+
+
 def revision_text(root: Path, ref: str, path: str) -> str | None:
     blob = f"{ref}^{{commit}}:{path}"
     size = git(root, "cat-file", "-s", blob)
@@ -130,19 +315,29 @@ def revision_text(root: Path, ref: str, path: str) -> str | None:
     return git(root, "cat-file", "blob", blob)
 
 
-def diff(found: dict, first: str | None, last: str | None) -> str | None:
-    if any(ref is not None and not re.fullmatch(REVISION, ref) for ref in (first, last)):
-        raise refusals.Invalid("Config revisions must be full Git commit IDs")
+def diff(found: dict, first: str | None, last: str | None, conn=None) -> str | None:
     if (location := git_location(found["path"])) is None:
         return None
     root, path = location
-    start = first or (git(root, "rev-parse", "--verify", "HEAD^{commit}") or "").strip()
+    if first is not None:
+        resolved = _resolve_selector(found, first, conn=conn)
+        if resolved is None:
+            raise refusals.NotFound(f"No version {first} for {found['kind']}/{found['name']}")
+        start = resolved[0]
+    else:
+        start = (git(root, "rev-parse", "--verify", "HEAD^{commit}") or "").strip()
     if not start:
         return None
     before = revision_text(root, start, path)
     if before is None:
         return None
-    after = revision_text(root, last, path) if last else file_text(found["path"])
+    if last is not None:
+        resolved_last = _resolve_selector(found, last, conn=conn)
+        if resolved_last is None:
+            raise refusals.NotFound(f"No version {last} for {found['kind']}/{found['name']}")
+        after = revision_text(root, resolved_last[0], path)
+    else:
+        after = file_text(found["path"])
     if after is None:
         return None
     if found["kind"] == "attention":

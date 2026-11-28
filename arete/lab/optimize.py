@@ -5,14 +5,13 @@ import difflib
 import hashlib
 import json
 import os
-import stat
 import tomllib
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
-from .. import config, paths, replay, settings, steps, util
+from .. import config, configrepo, paths, principals, replay, settings, steps, util
 from . import experiment
 from .experiment import NAME, Refused, Totals, append, events
 
@@ -550,18 +549,6 @@ def held_table(data: dict, table: str) -> dict:
     return data.get("steps", {}).get(table.removeprefix("steps."), {})
 
 
-def put(data: bytes) -> None:
-    util.write_durably(paths.CONFIG_FILE, data, stat.S_IMODE(paths.CONFIG_FILE.stat().st_mode))
-
-
-def restored(before: bytes, saved: Path) -> str:
-    try:
-        put(before)
-    except OSError as e:
-        return f"config.toml could not be restored ({e}); the original bytes are in {paths.short_path(saved)}"
-    return "config.toml was restored"
-
-
 def keep(file: Path, data: bytes) -> None:
     file.touch(mode=0o600)
     file.chmod(0o600)
@@ -662,7 +649,8 @@ def apply_winner(folder: Path, trail: Path, found: list[dict], end: dict) -> int
     if why := undeployable(end):
         raise Refused(f"apply refused: {why}")
     keys = {k: v for k, v in end["overrides"].items() if k in STEP_VALUES}
-    with util.lock("config", wait=True):
+    with configrepo.writer_lock() as fence:
+        configrepo.ensure_repo(fence=fence)
         cfg, layer = live(search)
         now = settled_now(cfg, layer, atom)
         inheritors = {r: settled_now(cfg, layer, r) for r in search["baseline"]["inheritors"]}
@@ -672,27 +660,33 @@ def apply_winner(folder: Path, trail: Path, found: list[dict], end: dict) -> int
             return 0
         if now != search["baseline"]["settings"] or inheritors != search["baseline"]["inheritors"]:
             raise Refused(f"settings for {atom} changed since the search began; run a new search")
-        before = paths.CONFIG_FILE.read_bytes()
-        old = tomllib.loads(before.decode())
+        before_text, base_blob = configrepo.read("config.toml")
+        before = before_text.encode()
+        old = tomllib.loads(before_text)
         table = table_name(old, atom)
-        text = edited(before.decode(), table, keys)
-        outcome, replaced = "config.toml is unchanged", False
+        text = edited(before_text, table, keys)
+        outcome = "config.toml is unchanged"
         try:
             keep(folder / SAVED, before)
             expected = deepcopy(old)
             expected.setdefault("steps", {}).setdefault(table.removeprefix("steps."), {}).update(keys)
             if tomllib.loads(text) != expected:
                 raise Refused("the edit would change more than the chosen keys")
-            settings.write_checked(text, refusal_for(cfg, layer, atom, end))
-            replaced = True
+            settings.write_checked(
+                text,
+                refusal_for(cfg, layer, atom, end),
+                base=base_blob,
+                actor=principals.current(),
+                source="agent",
+                note=f"optimize apply {end['champion']}",
+                fence=fence,
+            )
             if paths.CONFIG_FILE.read_bytes() != text.encode():
                 raise Refused("it read back differently from what was written")
             changed = {k: {"before": held_table(old, table).get(k), "after": v} for k, v in keys.items()}
             append(trail, {"event": "apply", "status": "applied", "table": table, "keys": changed,
                            "before_sha": sha(before), "after_sha": sha(text.encode()), "at": util.iso()})
-        except (OSError, settings.Refused, Refused) as e:
-            if replaced:
-                outcome = restored(before, folder / SAVED)
+        except (OSError, settings.Refused, Refused, configrepo.ConfigRepoError, configrepo.StaleBase) as e:
             with contextlib.suppress(OSError):
                 append(trail, {"event": "apply", "status": "failed", "why": str(e), "at": util.iso()})
             raise Refused(f"apply failed: {e}; {outcome}") from e
@@ -707,23 +701,42 @@ def roll_back(folder: Path, trail: Path, found: list[dict]) -> int:
     if applied is None:
         raise Refused("nothing applied from this trail")
     saved = folder / SAVED
-    with util.lock("config", wait=True):
-        current = paths.CONFIG_FILE.read_bytes()
+    with configrepo.writer_lock() as fence:
+        configrepo.ensure_repo(fence=fence)
+        current_text, base_blob = configrepo.read("config.toml")
+        current = current_text.encode()
         try:
             if sha(current) == applied["after_sha"] and saved.is_file():
-                put(saved.read_bytes())
+                restored_text = saved.read_bytes().decode()
+                settings.write_checked(
+                    restored_text,
+                    lambda cfg: "",
+                    base=base_blob,
+                    actor=principals.current(),
+                    source="revert",
+                    note="optimize rollback",
+                    fence=fence,
+                )
                 how = "restored the saved config.toml byte for byte"
             else:
-                table, lines = applied["table"], current.decode().splitlines(keepends=True)
+                table, lines = applied["table"], current_text.splitlines(keepends=True)
                 for key, c in applied["keys"].items():
                     write_key(lines, table, key, c["before"])
                 text = "".join(lines)
                 got = held_table(tomllib.loads(text), table)
                 if any(got.get(k) != c["before"] for k, c in applied["keys"].items()):
                     raise Refused("the keys would not read back as they were")
-                settings.write_checked(text, lambda cfg: "")
+                settings.write_checked(
+                    text,
+                    lambda cfg: "",
+                    base=base_blob,
+                    actor=principals.current(),
+                    source="revert",
+                    note="optimize rollback",
+                    fence=fence,
+                )
                 how = "config.toml changed since the apply, so only the applied keys were put back"
-        except (OSError, settings.Refused) as e:
+        except (OSError, settings.Refused, configrepo.ConfigRepoError, configrepo.StaleBase) as e:
             raise Refused(f"rollback failed: {e}; config.toml is unchanged") from e
     append(trail, {"event": "rollback", "how": how, "at": util.iso()})
     print(f"rolled back: {how}")

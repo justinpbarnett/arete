@@ -29,10 +29,10 @@ def without(*drop: str) -> dict[str, str]:
 
 
 def exposed_env_names() -> set[str]:
-    if not secretstore.configured_registry() or db.isolated_busy():
-        return set()
     names: set[str] = set()
     with contextlib.suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema, RuntimeError, ValueError):
+        if not secretstore.configured_registry() or db.isolated_busy():
+            return set()
         for row in secretstore.rows():
             for rule in secretstore.expose_rules(row):
                 names.add(rule["env"])
@@ -44,7 +44,10 @@ def role_secrets(role: str | None, *, repo: str | None = None, never: Iterable[s
         return {}
     excluded = set(never)
     found: dict[str, str] = {}
-    if secretstore.configured_registry() and not db.isolated_busy():
+    configured = False
+    with contextlib.suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema, RuntimeError, ValueError):
+        configured = bool(secretstore.configured_registry())
+    if configured and not db.isolated_busy():
         with contextlib.suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema, RuntimeError, ValueError):
             for row in secretstore.rows():
                 if row["status"] != "set":

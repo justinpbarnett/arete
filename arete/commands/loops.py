@@ -98,9 +98,9 @@ def loop_try(args) -> int:
 
 
 def loop_switched(args, enabled: bool) -> int:
-    done = client.call("POST", f"/api/loops/{quote(args.name, safe='')}/{'enable' if enabled else 'disable'}")
-    print(f"{done['name']}: {'on' if done['enabled'] else 'off'}"
-          + ("; serve is down, so it fires once serve runs again" if done["enabled"] and not done["serve_up"] else ""))
+    done = client.call("POST", f"/api/v1/loops/{quote(args.name, safe='')}/{'enable' if enabled else 'disable'}")
+    loop = client.field(done, "loop")
+    print(f"{loop['name']}: {'on' if loop['enabled'] else 'off'}")
     return 0
 
 
