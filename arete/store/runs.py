@@ -133,8 +133,6 @@ TABLES = {
 }
 
 
-OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status IN ('failed', 'stopped') AND runs.pr_url != ''))"
-
 WHOLE_RUN = "COALESCE(only_step, '') = ''"
 LIVE_RUN = "dry_run = 0 AND status != 'dry-run'"
 
@@ -254,25 +252,6 @@ def merged_runs(connect=reader) -> list[dict]:
 def runs_since(since: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]
-
-
-def runs_reading_pr_comments(rejected_since: str, limit: int = 200) -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND pr_url != '' "  # noqa: S608
-                                           f"AND ({OPEN_PR_RUN} OR (status = 'rejected' AND finished >= ?)) "
-                                           "ORDER BY started DESC LIMIT ?", (rejected_since, limit))]
-
-
-def open_runs(repo: str | int, issue: int | str | None = None) -> list[dict]:
-    with reader() as c:
-        tnum, repo_name, raw_issue = _resolve_task_target(c, repo, issue)
-        if tnum is not None:
-            return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND task_id = ? AND {OPEN_PR_RUN} "  # noqa: S608
-                                               "ORDER BY started DESC", (tnum,))]
-        if repo_name is None:
-            return []
-        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE repo = ? AND issue = ? AND {OPEN_PR_RUN} "  # noqa: S608
-                                           "ORDER BY started DESC", (repo_name, raw_issue))]
 
 
 DRAFT_READY = "run.draft-review.ready"
@@ -1104,10 +1083,13 @@ def _sync_inbox_runs(c) -> None:
 
 def insert_run(run_id: str, row: dict) -> None:
     from . import factory
+    from . import tasks as task_store
 
     with writes.atomic() as c:
-        writes.insert("runs", filter_run_fields(c, row), run_id, "run.started")
+        inserted = writes.insert("runs", filter_run_fields(c, row), run_id, "run.started")
         factory.registered_run(c, run_id, row)
+        if inserted and inserted.get("pr_url"):
+            task_store.TaskStore.sync_run_pr_refs(c, inserted)
         if row.get("kind") == "pipeline":
             _sync_inbox_runs(c)
 
@@ -1376,19 +1358,23 @@ def hold_ab(run_id: str, role: str, name: str, side: str, arm: dict) -> None:
 def note(run_id: str, *, base_version=None, **fields) -> None:
     if "status" in fields:
         raise ValueError("use move to change a run's status")
+    from . import tasks as task_store
+
     if fields.get("pid"):
         from . import factory
 
         with writes.atomic() as c:
             filtered = filter_run_fields(c, fields)
-            if filtered:
-                writes.update("runs", run_id, filtered, base_version=base_version)
+            updated = writes.update("runs", run_id, filtered, base_version=base_version) if filtered else None
+            if updated and "pr_url" in filtered and updated.get("pr_url"):
+                task_store.TaskStore.sync_run_pr_refs(c, updated)
             factory.register(c, run_id, fields["pid"], "run")
     else:
         with writes.atomic() as c:
             filtered = filter_run_fields(c, fields)
-            if filtered:
-                writes.update("runs", run_id, filtered, base_version=base_version)
+            updated = writes.update("runs", run_id, filtered, base_version=base_version) if filtered else None
+            if updated and "pr_url" in filtered and updated.get("pr_url"):
+                task_store.TaskStore.sync_run_pr_refs(c, updated)
 
 
 def checkpoint(run_id: str, active: float, verified: float, opened: float, repairs: int, at: str) -> None:
@@ -1401,11 +1387,16 @@ def move(run_id: str, to: str, expect: tuple[str, ...], *, base_version=None, **
         if base_version is not None:
             writes.check_run(run_id, base_version)
         return False
+    from . import tasks as task_store
+
     fields = {**fields, "status": to}
     with writes.atomic() as c:
         updated = writes.update("runs", run_id, fields, expect=expect, base_version=base_version)
-        if updated is not None and updated.get("kind") == "pipeline" and (to == "needs-info" or "needs-info" in expect):
-            _sync_inbox_runs(c)
+        if updated is not None:
+            if "pr_url" in fields and updated.get("pr_url"):
+                task_store.TaskStore.sync_run_pr_refs(c, updated)
+            if updated.get("kind") == "pipeline" and (to == "needs-info" or "needs-info" in expect):
+                _sync_inbox_runs(c)
         return updated is not None
 
 
@@ -1481,6 +1472,7 @@ def _close_open_steps_in_tx(c, run_id: str) -> dict[str, float | int]:
 
 def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> dict | None:
     from . import factory
+    from . import tasks as task_store
 
     with writes.atomic() as c:
         current = c.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -1493,6 +1485,8 @@ def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> 
                                 base_version=base_version, increments=increments or None)
         if not settled:
             return None
+        if "pr_url" in fields and settled.get("pr_url"):
+            task_store.TaskStore.sync_run_pr_refs(c, settled)
         factory.finish_run(c, run_id)
         if settled["kind"] == "pipeline" and settled["status"] in ("interrupted", "stopped"):
             from . import insights

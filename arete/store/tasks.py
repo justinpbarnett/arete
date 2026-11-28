@@ -1248,6 +1248,205 @@ class TaskStore:
         ).fetchall()
         return TaskStore._event_rows(conn, rows)
 
+    @staticmethod
+    def upsert_pr_ref(conn, url: str, *, run_id: str | None = None, task_id: int | str | None = None,
+                      repo: str = "", issue: str = "", ext_state: str | None = None,
+                      force_open: bool = False, actor: str = "hand",
+                      emit_event: bool = True) -> dict | None:
+        if not has_identity_expand(conn):
+            return None
+        parsed = _parse_pr_url(url)
+        if parsed is None:
+            return None
+        pr_key, clean_url = parsed
+        run_row = None
+        if run_id:
+            r = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+            run_row = dict(r) if r is not None else None
+        task_num: int | None = None
+        if task_id is not None and str(task_id).strip():
+            task_num = parse_task_num(task_id, conn)
+        if task_num is None and run_row is not None and run_row.get("task_id") is not None:
+            task_num = int(run_row["task_id"])
+        if task_num is None:
+            lookup_repo = repo or (str(run_row.get("repo") or "") if run_row else "")
+            lookup_issue = issue or (str(run_row.get("issue") or "") if run_row else "")
+            if lookup_repo and lookup_issue:
+                task_num = TaskStore.find_task_num(conn, lookup_repo, lookup_issue)
+
+        run_status = str((run_row or {}).get("status") or "")
+        default_state = (
+            "open" if force_open
+            else ext_state if ext_state is not None
+            else "merged" if run_status == "merged"
+            else "closed" if run_status == "rejected"
+            else "open"
+        )
+        event_actor = actor if actor and actor != "owner" else _db_owner_principal(conn)
+
+        existing = conn.execute(
+            "SELECT * FROM refs WHERE system = 'github' AND key = ?", (pr_key,)
+        ).fetchone()
+        if existing is None:
+            ref_dict, _ = TaskStore.ensure_ref(
+                conn,
+                "github",
+                pr_key,
+                kind="pr",
+                connector="github",
+                url=clean_url,
+                ext_state=default_state,
+                run_id=run_id,
+                sync="synced",
+                actor=event_actor,
+                emit_event=emit_event,
+            )
+        else:
+            existing_dict = dict(existing)
+            new_kind = "pr"
+            new_url = clean_url or str(existing_dict.get("url") or "")
+            new_ext_state = "open" if force_open else (str(existing_dict.get("ext_state") or "") or default_state)
+            new_run_id = existing_dict.get("run_id")
+            if run_id and _is_newer_run(conn, run_id, new_run_id):
+                new_run_id = run_id
+            if (new_kind, new_url, new_ext_state, new_run_id) != (
+                existing_dict.get("kind") or "",
+                existing_dict.get("url") or "",
+                existing_dict.get("ext_state") or "",
+                existing_dict.get("run_id"),
+            ):
+                now = util.iso()
+                conn.execute(
+                    "UPDATE refs SET kind = ?, url = ?, ext_state = ?, run_id = ?, sync = 'synced', "
+                    "version = version + 1, updated = ? WHERE id = ?",
+                    (new_kind, new_url, new_ext_state, new_run_id, now, int(existing_dict["id"])),
+                )
+                saved_row = conn.execute("SELECT * FROM refs WHERE id = ?", (int(existing_dict["id"]),)).fetchone()
+                ref_dict = _row_to_ref(saved_row)
+                if emit_event:
+                    with principals.acting(event_actor):
+                        events.emit(
+                            "ref.changed",
+                            f"ref:{ref_dict['num']}",
+                            cls="durable",
+                            ver=ref_dict["version"],
+                            data={k: v for k, v in ref_dict.items() if k != "num"},
+                            connection=conn,
+                        )
+            else:
+                ref_dict = _row_to_ref(existing_dict)
+
+        if task_num is not None and _select_task_row(conn, task_num) is not None:
+            linked = conn.execute(
+                "SELECT 1 FROM task_refs WHERE task_id = ? AND ref_id = ?",
+                (task_num, int(ref_dict["num"])),
+            ).fetchone()
+            if linked is None:
+                TaskStore.link_ref(
+                    conn,
+                    task_num,
+                    int(ref_dict["num"]),
+                    {"role": "related", "linked_by": f"run:{run_id}/pr" if run_id else event_actor},
+                    event_actor,
+                    emit_event=emit_event,
+                )
+        return ref_dict
+
+    @staticmethod
+    def sync_run_pr_refs(conn, run_row: dict, *, force_open: bool = False,
+                         actor: str | None = None, emit_event: bool = True) -> list[dict]:
+        if not has_identity_expand(conn):
+            return []
+        if run_row.get("kind") != "pipeline" and run_row.get("task_id") is None:
+            return []
+        raw_urls = str(run_row.get("pr_url") or "").split()
+        if not raw_urls:
+            return []
+        resolved_actor = actor or principals.current() or "hand"
+        out: list[dict] = []
+        for url in raw_urls:
+            saved = TaskStore.upsert_pr_ref(
+                conn,
+                url,
+                run_id=str(run_row["id"]) if run_row.get("id") else None,
+                task_id=run_row.get("task_id"),
+                repo=str(run_row.get("repo") or ""),
+                issue=str(run_row.get("issue") or ""),
+                force_open=force_open,
+                actor=resolved_actor,
+                emit_event=emit_event,
+            )
+            if saved is not None:
+                out.append(saved)
+        return out
+
+    @staticmethod
+    def update_pr_ref_state(conn, ref_id: int, *, ext_state: str, facts: dict,
+                            fetched_at: str, remote_updated: str | None = None,
+                            actor: str = "hand", emit_event: bool = True) -> dict | None:
+        if not has_identity_expand(conn):
+            return None
+        existing = conn.execute("SELECT * FROM refs WHERE id = ?", (int(ref_id),)).fetchone()
+        if existing is None:
+            return None
+        event_actor = actor if actor and actor != "owner" else _db_owner_principal(conn)
+        conn.execute(
+            "UPDATE refs SET ext_state = ?, facts = ?, fetched_at = ?, "
+            "remote_updated = COALESCE(?, remote_updated), version = version + 1, updated = ? "
+            "WHERE id = ?",
+            (ext_state, json.dumps(facts or {}, sort_keys=True), fetched_at, remote_updated, fetched_at, int(ref_id)),
+        )
+        saved = _row_to_ref(conn.execute("SELECT * FROM refs WHERE id = ?", (int(ref_id),)).fetchone())
+        if emit_event:
+            with principals.acting(event_actor):
+                events.emit(
+                    "ref.changed",
+                    f"ref:{saved['num']}",
+                    cls="durable",
+                    ver=saved["version"],
+                    data={k: v for k, v in saved.items() if k != "num"},
+                    connection=conn,
+                )
+        return saved
+
+
+def _parse_pr_url(url: str) -> tuple[str, str] | None:
+    clean = str(url or "").strip()
+    if not clean:
+        return None
+    m = GITHUB_PR_URL_RE.fullmatch(clean)
+    if not m:
+        return None
+    return f"{m.group(1)}#{int(m.group(2))}", clean
+
+
+def _run_order_col(conn) -> str:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+    return "seq" if "seq" in cols else "rowid"
+
+
+def _is_newer_run(conn, candidate_run_id: str | None, existing_run_id: str | None) -> bool:
+    if not candidate_run_id:
+        return False
+    if not existing_run_id:
+        return True
+    if candidate_run_id == existing_run_id:
+        return False
+    order_col = _run_order_col(conn)
+    cand = conn.execute(
+        f"SELECT started, {order_col} AS ord FROM runs WHERE id = ?",  # noqa: S608
+        (candidate_run_id,),
+    ).fetchone()
+    if cand is None:
+        return False
+    prev = conn.execute(
+        f"SELECT started, {order_col} AS ord FROM runs WHERE id = ?",  # noqa: S608
+        (existing_run_id,),
+    ).fetchone()
+    if prev is None:
+        return True
+    return (cand["started"] or "", int(cand["ord"] or 0)) > (prev["started"] or "", int(prev["ord"] or 0))
+
 
 def _is_local_tid(value: str) -> bool:
     s = (value or "").strip()
@@ -1578,6 +1777,318 @@ def backfill_identities(conn, cfg=None) -> dict[str, int]:
                 new_links += 1
 
     return {"refs": new_refs, "tasks": new_tasks, "links": new_links}
+
+
+def reconcile_pr_refs(conn, cfg=None) -> dict[str, int]:
+    """Idempotently reconcile PR refs and task_refs from all runs.pr_url rows and durable outbox PR receipts.
+
+    Reconciles every URL written since #584 with no run-status or age filter, applying
+    PR-ref uniqueness, role='related' task linking, and newest-run ownership while
+    preserving numeric identities, versions, and event history.
+    """
+    if not has_identity_expand(conn):
+        return {"refs": 0, "updated": 0, "links": 0}
+    if cfg is None:
+        try:
+            cfg, _ = config.load_or_problem()
+        except Exception:
+            cfg = None
+
+    order_col = _run_order_col(conn)
+    run_rows = [
+        dict(r)
+        for r in conn.execute(
+            f"SELECT id, kind, repo, issue, status, started, finished, pr_url, task_id, {order_col} AS _ord "  # noqa: S608
+            f"FROM runs WHERE COALESCE(pr_url, '') != '' AND (kind = 'pipeline' OR task_id IS NOT NULL) "
+            f"ORDER BY started ASC, {order_col} ASC"
+        ).fetchall()
+    ]
+    run_by_id: dict[str, dict] = {str(r["id"]): r for r in run_rows}
+
+    # Map pr_key -> list of (sort_key, run_id, run_status, task_num, clean_url)
+    observations: dict[str, list[tuple[tuple[str, int], str | None, str, int | None, str]]] = {}
+
+    def _resolve_run_task(rrow: dict | None, explicit_task: object = None) -> int | None:
+        if explicit_task is not None and str(explicit_task).strip():
+            tnum = parse_task_num(str(explicit_task), conn)
+            if tnum is not None:
+                return tnum
+        if rrow is not None:
+            if rrow.get("task_id") is not None:
+                return int(rrow["task_id"])
+            if rrow.get("repo") and rrow.get("issue"):
+                return TaskStore.find_task_num(conn, str(rrow["repo"]), str(rrow["issue"]), cfg=cfg)
+        return None
+
+    for rrow in run_rows:
+        tnum = _resolve_run_task(rrow)
+        sort_key = (str(rrow.get("started") or ""), int(rrow.get("_ord") or 0))
+        rid = str(rrow["id"])
+        status = str(rrow.get("status") or "")
+        for tok in str(rrow.get("pr_url") or "").split():
+            parsed = _parse_pr_url(tok)
+            if parsed is None:
+                continue
+            pr_key, clean_url = parsed
+            observations.setdefault(pr_key, []).append((sort_key, rid, status, tnum, clean_url))
+
+    has_outbox = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox'"
+    ).fetchone() is not None
+    if has_outbox:
+        receipt_rows = conn.execute(
+            "SELECT o.id, o.run_id, o.task_id, o.sent_url, o.sent_at, o.updated, "
+            "(SELECT r.body FROM outbox_revisions r WHERE r.item = o.id AND r.rev = o.rev LIMIT 1) AS body, "
+            "(SELECT da.external_url FROM delivery_attempts da "
+            " WHERE da.item = o.id AND da.outcome IN ('sent', 'found') AND COALESCE(da.external_url, '') != '' "
+            " ORDER BY da.n DESC LIMIT 1) AS attempt_url "
+            "FROM outbox o "
+            "WHERE o.kind = 'pr' AND ("
+            "  (o.state = 'sent' AND COALESCE(o.sent_url, '') != '') "
+            "  OR EXISTS ("
+            "    SELECT 1 FROM delivery_attempts da "
+            "    WHERE da.item = o.id AND da.outcome IN ('sent', 'found') AND COALESCE(da.external_url, '') != ''"
+            "  )"
+            ") ORDER BY o.id ASC"
+        ).fetchall()
+        for rec in receipt_rows:
+            body_text = str(rec["body"] or "").strip()
+            if body_text.startswith("{"):
+                try:
+                    payload = json.loads(body_text)
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict) and (payload.get("action") or "create") != "create":
+                    continue
+            raw_url = str(rec["sent_url"] or rec["attempt_url"] or "").strip()
+            parsed = _parse_pr_url(raw_url)
+            if parsed is None:
+                continue
+            pr_key, clean_url = parsed
+            rid = str(rec["run_id"]) if rec["run_id"] else None
+            rrow = run_by_id.get(rid) if rid else None
+            if rid and rrow is None:
+                fetched = conn.execute(
+                    f"SELECT id, kind, repo, issue, status, started, finished, pr_url, task_id, {order_col} AS _ord "  # noqa: S608
+                    "FROM runs WHERE id = ?",
+                    (rid,),
+                ).fetchone()
+                if fetched is not None:
+                    rrow = dict(fetched)
+                    run_by_id[rid] = rrow
+            if rrow is not None and rrow.get("kind") != "pipeline" and rrow.get("task_id") is None and not rec["task_id"]:
+                continue
+            if rrow is None and not rec["task_id"]:
+                continue
+            tnum = _resolve_run_task(rrow, rec["task_id"])
+            sort_key = (
+                (str(rrow.get("started") or ""), int(rrow.get("_ord") or 0))
+                if rrow is not None
+                else ("", 0)
+            )
+            status = str((rrow or {}).get("status") or "")
+            observations.setdefault(pr_key, []).append((sort_key, rid, status, tnum, clean_url))
+
+    new_refs = 0
+    updated_refs = 0
+    new_links = 0
+    with principals.acting("hand"):
+        for pr_key in sorted(observations):
+            obs_list = observations[pr_key]
+            obs_list.sort(key=lambda item: item[0])
+            _, newest_run_id, newest_status, _, best_url = obs_list[-1]
+            default_state = (
+                "merged" if newest_status == "merged"
+                else "closed" if newest_status == "rejected"
+                else "open"
+            )
+            existing = conn.execute(
+                "SELECT * FROM refs WHERE system = 'github' AND key = ?", (pr_key,)
+            ).fetchone()
+            if existing is None:
+                ref_dict, created = TaskStore.ensure_ref(
+                    conn,
+                    "github",
+                    pr_key,
+                    kind="pr",
+                    connector="github",
+                    url=best_url,
+                    ext_state=default_state,
+                    run_id=newest_run_id,
+                    sync="synced",
+                    actor="hand",
+                    emit_event=True,
+                )
+                ref_id = int(ref_dict["num"])
+                if created:
+                    new_refs += 1
+            else:
+                existing_dict = dict(existing)
+                ref_id = int(existing_dict["id"])
+                new_kind = "pr"
+                new_url = best_url or str(existing_dict.get("url") or "")
+                new_ext_state = str(existing_dict.get("ext_state") or "") or default_state
+                new_run_id = existing_dict.get("run_id")
+                if newest_run_id and _is_newer_run(conn, newest_run_id, new_run_id):
+                    new_run_id = newest_run_id
+                if (new_kind, new_url, new_ext_state, new_run_id) != (
+                    existing_dict.get("kind") or "",
+                    existing_dict.get("url") or "",
+                    existing_dict.get("ext_state") or "",
+                    existing_dict.get("run_id"),
+                ):
+                    now = util.iso()
+                    conn.execute(
+                        "UPDATE refs SET kind = ?, url = ?, ext_state = ?, run_id = ?, sync = 'synced', "
+                        "version = version + 1, updated = ? WHERE id = ?",
+                        (new_kind, new_url, new_ext_state, new_run_id, now, ref_id),
+                    )
+                    saved = _row_to_ref(conn.execute("SELECT * FROM refs WHERE id = ?", (ref_id,)).fetchone())
+                    events.emit(
+                        "ref.changed",
+                        f"ref:{saved['num']}",
+                        cls="durable",
+                        ver=saved["version"],
+                        data={k: v for k, v in saved.items() if k != "num"},
+                        connection=conn,
+                    )
+                    updated_refs += 1
+
+            seen_tasks: set[int] = set()
+            for _, obs_run_id, _, tnum, _ in obs_list:
+                if tnum is None or tnum in seen_tasks:
+                    continue
+                seen_tasks.add(tnum)
+                if _select_task_row(conn, tnum) is None:
+                    continue
+                linked = conn.execute(
+                    "SELECT 1 FROM task_refs WHERE task_id = ? AND ref_id = ?",
+                    (tnum, ref_id),
+                ).fetchone()
+                if linked is None:
+                    TaskStore.link_ref(
+                        conn,
+                        tnum,
+                        ref_id,
+                        {"role": "related", "linked_by": f"run:{obs_run_id}/pr" if obs_run_id else "hand"},
+                        "hand",
+                        emit_event=True,
+                    )
+                    new_links += 1
+
+    return {"refs": new_refs, "updated": updated_refs, "links": new_links}
+
+
+def pr_refs_to_sync(rejected_since: str, connect=reader) -> list[dict]:
+    with connect() as c:
+        if not has_identity_expand(c):
+            return []
+        rows = c.execute(
+            "SELECT r.*, "
+            "runs.repo AS _run_repo, runs.issue AS _run_issue, runs.issue_key AS _run_issue_key, "
+            "runs.task_id AS _run_task_id, runs.status AS _run_status, runs.finished AS _run_finished, "
+            "runs.started AS _run_started, "
+            "COALESCE("
+            "  (SELECT tr.task_id FROM task_refs tr WHERE tr.ref_id = r.id ORDER BY tr.id ASC LIMIT 1), "
+            "  runs.task_id"
+            ") AS _task_id "
+            "FROM refs r "
+            "JOIN runs ON runs.id = r.run_id "
+            "WHERE r.kind = 'pr' "
+            "  AND r.url != '' "
+            "  AND runs.kind = 'pipeline' "
+            "  AND ("
+            "    r.ext_state IN ('open', '') "
+            "    OR ("
+            "      r.ext_state = 'closed' "
+            "      AND COALESCE("
+            "        NULLIF(json_extract(r.facts, '$.closed_at'), ''), "
+            "        NULLIF(runs.finished, ''), "
+            "        NULLIF(r.fetched_at, ''), "
+            "        r.updated"
+            "      ) >= ?"
+            "    )"
+            "  ) "
+            "ORDER BY runs.started DESC, r.id ASC",
+            (rejected_since,),
+        ).fetchall()
+        out: list[dict] = []
+        for row in rows:
+            d = dict(row)
+            ref = _row_to_ref(d)
+            ref["task_id"] = int(d["_task_id"]) if d.get("_task_id") is not None else None
+            out.append(ref)
+        return out
+
+
+def run_pr_refs(run_id: str, connect=reader) -> list[dict]:
+    with connect() as c:
+        if not has_identity_expand(c):
+            return []
+        rows = c.execute(
+            "SELECT * FROM refs WHERE kind = 'pr' AND run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ).fetchall()
+        return [_row_to_ref(r) for r in rows]
+
+
+def _resolve_pr_task_num(conn, repo_or_task: str | int, issue: int | str | None = None) -> int | None:
+    if isinstance(repo_or_task, int) and not isinstance(repo_or_task, bool) and issue is None:
+        return repo_or_task
+    return TaskStore.find_task_num(conn, repo_or_task, issue if issue is not None else "")
+
+
+def open_pr_refs(repo_or_task: str | int, issue: int | str | None = None, connect=reader) -> list[dict]:
+    with connect() as c:
+        if not has_identity_expand(c):
+            return []
+        tnum = _resolve_pr_task_num(c, repo_or_task, issue)
+        if tnum is None:
+            return []
+        order_col = _run_order_col(c)
+        rows = c.execute(
+            f"SELECT r.* FROM task_refs tr "  # noqa: S608
+            "JOIN refs r ON r.id = tr.ref_id "
+            "LEFT JOIN runs ON runs.id = r.run_id "
+            "WHERE tr.task_id = ? AND r.kind = 'pr' AND r.ext_state IN ('open', '') AND r.url != '' "
+            f"ORDER BY COALESCE(runs.started, r.updated) DESC, COALESCE(runs.{order_col}, 0) DESC, r.id DESC",
+            (tnum,),
+        ).fetchall()
+        return [_row_to_ref(r) for r in rows]
+
+
+def open_pr_runs(repo_or_task: str | int, issue: int | str | None = None, connect=reader) -> list[dict]:
+    with connect() as c:
+        if not has_identity_expand(c):
+            return []
+        tnum = _resolve_pr_task_num(c, repo_or_task, issue)
+        if tnum is None:
+            return []
+        order_col = _run_order_col(c)
+        rows = c.execute(
+            f"SELECT DISTINCT runs.* FROM task_refs tr "  # noqa: S608
+            "JOIN refs r ON r.id = tr.ref_id "
+            "JOIN runs ON runs.id = r.run_id "
+            "WHERE tr.task_id = ? AND r.kind = 'pr' AND r.ext_state IN ('open', '') AND r.url != '' "
+            f"ORDER BY runs.started DESC, runs.{order_col} DESC",
+            (tnum,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_pr_ref_state(ref_id: int, *, ext_state: str, facts: dict, fetched_at: str,
+                        remote_updated: str | None = None, actor: str = "hand") -> dict | None:
+    with writes.atomic() as c:
+        return TaskStore.update_pr_ref_state(
+            c,
+            ref_id,
+            ext_state=ext_state,
+            facts=facts,
+            fetched_at=fetched_at,
+            remote_updated=remote_updated,
+            actor=actor,
+            emit_event=True,
+        )
 
 
 # ---------------------------------------------------------------------------

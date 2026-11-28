@@ -1139,7 +1139,7 @@ def route(cfg: config.Config, repo: config.Repo, tid: str | int, *, requested: s
             return _build_decision(
                 cfg, "orchestrate", "@continue" if prev else "default", continues=prev, config_dir=config_dir,
             )
-        if feedback and (source := next(iter(run_store.open_runs(repo.name, tid_s)), None)):
+        if feedback and (source := next(iter(task_store.open_pr_runs(repo.name, tid_s)), None)):
             if _earlier_adw(source["id"]) == "orchestrate":
                 prev = ("" if (force or policy_restart)
                         else (orch_store.find(source["id"]) or {}).get("current_run", source["id"]))

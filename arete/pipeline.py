@@ -88,6 +88,7 @@ from .store import orchestration as orchestration_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import specs as spec_store
+from .store import tasks as task_store
 from .store import ticket_progress as ticket_progress_store
 from .store import triage as triage_store
 from .store import workspaces
@@ -2354,7 +2355,7 @@ def dispatch_path(repo: config.Repo, tid: str) -> str:
     newest = run_store.newest_whole_run(repo.name, tid)
     if newest and newest["status"] == "interrupted":
         return recorded_path(newest["id"])
-    if pending_feedback(repo.name, tid) and (source := next(iter(run_store.open_runs(repo.name, tid)), None)):
+    if pending_feedback(repo.name, tid) and (source := next(iter(task_store.open_pr_runs(repo.name, tid)), None)):
         return recorded_path(source["id"])
     return wanted(repo)
 
@@ -6232,7 +6233,13 @@ def collect_ticket_attachments(
 
 
 def open_branch(run: Run) -> str:
-    return next((r["branch"] for r in run_store.open_runs(run.repo.name, run.tid) if r.get("branch")), "")
+    for r in task_store.open_pr_runs(run.repo.name, run.tid):
+        if r.get("branch"):
+            return str(r["branch"])
+    for ref in task_store.open_pr_refs(run.repo.name, run.tid):
+        if head_ref := (ref.get("facts") or {}).get("head_ref"):
+            return str(head_ref)
+    return ""
 
 
 def with_siblings(body: str, section: str) -> str:
@@ -6247,14 +6254,26 @@ def sibling_section(ref: str, c: workspace.Checkout, with_prs: list[workspace.Ch
 
 
 def supersede_older_runs(run: Run, urls: list[str]) -> None:
-    for r in run_store.open_runs(run.repo.name, run.tid):
-        older = (r.get("pr_url") or "").split()
-        if older and set(older) <= set(urls) and record.move(r["id"], "superseded", expect=(r["status"],)):
+    url_set = set(urls)
+    if not url_set:
+        return
+    urls_by_run: dict[str, set[str]] = {}
+    for ref in task_store.open_pr_refs(run.repo.name, run.tid):
+        rid = ref.get("run_id")
+        if rid and ref.get("url"):
+            urls_by_run.setdefault(str(rid), set()).add(str(ref["url"]))
+    for r in task_store.open_pr_runs(run.repo.name, run.tid):
+        if r["id"] == run.id or r["status"] in ("running", "superseded"):
+            continue
+        older = set((r.get("pr_url") or "").split()) | urls_by_run.get(r["id"], set())
+        if older and older <= url_set and record.move(r["id"], "superseded", expect=(r["status"],)):
             run.log(f"run {r['id']} superseded: its PRs carry on in this run")
 
 
 def pending_feedback(repo_name: str, tid: str) -> list[dict]:
-    return insights_store.open_feedback([url for r in run_store.open_runs(repo_name, tid) for url in (r.get("pr_url") or "").split()])
+    return insights_store.open_feedback(
+        [ref["url"] for ref in task_store.open_pr_refs(repo_name, tid) if ref.get("url")]
+    )
 
 
 def feedback_key(row: dict) -> tuple[str, str, int]:
