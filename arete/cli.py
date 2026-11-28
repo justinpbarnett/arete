@@ -101,6 +101,20 @@ def main(argv: list[str] | None = None) -> int:
         with client.invocation(upload_on_write=upload_on_write), principals.acting(
                 "hand" if recovery else principals.cli_actor):
             return args.fn(args) or 0
+    except foundation.LeaseFenced as e:
+        from . import util
+
+        line = f"[{util.iso()}] lease L-{e.lease_id} epoch {e.epoch} {e.code}\n"
+        if e.run_id:
+            log_file = paths.RUNS_DIR / e.run_id / "run.log"
+            try:
+                log_file.parent.mkdir(parents=True, exist_ok=True)
+                with log_file.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+            except OSError:
+                pass
+        print(line.strip(), file=sys.stderr)
+        return 3
     except client.Down as e:
         client.emit(e.answer)
         return 1

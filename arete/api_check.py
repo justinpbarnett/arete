@@ -429,7 +429,8 @@ class Check:
 
     def shapes(self):
         from . import (
-            agent, cohorts, contract, dashboard, outbox, paths, principals, private_evidence, record, replay,
+            agent, cohorts, contract, dashboard, devices, leases, outbox, paths, principals, private_evidence, record,
+            replay,
             secretstore, triage,
         )
         from .sighting import Sighting
@@ -442,6 +443,8 @@ class Check:
         record.mark(self.run, "diff", patch=(self.root / "sample/replay/build.patch").read_text())
         fixture_blob = b"fixture-contract-blob"
         fixture_sha = blobs.put(fixture_blob, "upload")
+        fixture_lease = leases.claim("local", devices.version_of("local"), run_id=self.run, start_renewer=False)
+        fixture_lease.close("", fenced=False)
         chat = chats.chat_add("")
         incident, _ = incidents.record_incident(Sighting("check", "expected", "fixture", "", "fixture incident", 1, "", ""))
         incidents.alert_set("fixture-alert", None)
@@ -503,7 +506,8 @@ class Check:
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
                       "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
                       "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}",
-                      "item": fixture_item["id"], "subscription": f"PS-{sub_id}", "sha256": fixture_sha}
+                      "item": fixture_item["id"], "subscription": f"PS-{sub_id}", "sha256": fixture_sha,
+                      "device": "local", "lease": fixture_lease.label}
         for op in self.published["operations"]:
             name, method, path = (op[key] for key in ("name", "method", "path"))
             values = op["example"]["input"].copy()

@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 15
+MINOR = 16
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -41,7 +41,7 @@ RUN_TEXT = ("id", "kind", "repo", "issue", "loop", "loop_kind", "started", "fini
             "label_pending", "wait_minutes", "config_commit", "resolved_sha", "continues", "chain", "restart",
             "started_by", "payer")
 RUN_NUMBERS = ("pid", "cost_usd", "tokens_in", "tokens_out", "active_seconds", "verify_seconds", "verify_open_seconds",
-               "repair_calls", "schema_version", "attempts", "version", "seq")
+               "repair_calls", "schema_version", "attempts", "version", "seq", "lease_id")
 RUN = obj({**{k: {"type": ["string", "null"]} for k in RUN_TEXT},
            **{k: {"type": ["number", "null"]} for k in RUN_NUMBERS}}, ["id", "status", "version"])
 RUN["properties"]["issue"] = {"type": ["integer", "string", "null"]}
@@ -120,6 +120,8 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("factory_version_conflict", 409, "Read the current factory setting before retrying."),
     ("task_version_conflict", 409, "The task was updated since the requested base version."),
     ("idempotency_in_flight", 409, "Try again with the same key after Retry-After."),
+    ("lease_fenced", 410, "This lease has been fenced by a newer epoch or release."),
+    ("lease_expired", 410, "This lease has expired."),
     ("body_too_large", 413, "The request body exceeds the route's size limit."),
     ("uri_too_long", 414, "The request target is too long."),
     ("unsupported_media_type", 415, "The route does not accept this Content-Type."),
@@ -153,14 +155,14 @@ AUTH_ERRORS = {"unauthenticated", "ambiguous_credential", "token_expired", "toke
 
 def operation(name, path, result, inputs=None, example=None, method="GET", *, errors=(), success_status=200):
     shown = sample(result)
-    if "seq" in result.get("properties", {}):
+    if isinstance(shown, dict) and "seq" in shown:
         shown["seq"] = "0.1"
     noun = name.split(".", 1)[0]
     scope = "read" if method == "GET" or noun == "batch" else f"{'task' if noun == 'comment' else noun}:write"
     optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict",
                        "secret_store_missing", "secret_internal", "already_resolved", "validation",
-                       "gate_refused", "presence_expired"}
-    if noun not in ("token", "pairing", "principal", "secret", "inbox", "push", "outbox") and name != "session.end":
+                       "gate_refused", "presence_expired", "lease_fenced", "lease_expired"}
+    if noun not in ("token", "pairing", "principal", "secret", "inbox", "push", "outbox", "device", "lease") and name != "session.end":
         optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
             "input": inputs or obj({}), "result": result, "scope": scope, "success_status": success_status,
@@ -237,6 +239,7 @@ for _error in ERRORS:
                 "factory_version_conflict": {"current": FACTORY_STATE}, "version_conflict": {"current": RUN},
                 "task_version_conflict": {"current": TASK}, "already_resolved": {"current": INBOX_ITEM},
                 "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
+                "lease_fenced": {"epoch": INTEGER}, "lease_expired": {"epoch": INTEGER},
                 "forbidden": {"reason": STRING}, "conflict": {"reason": STRING}}.get(_code, {})
     _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
                             "status": {"type": "integer", "enum": [_status]}, "detail": STRING, "error": STRING,
@@ -549,6 +552,81 @@ OPERATIONS += [
               envelope({"items": array(INBOX_ITEM),
                         "by_priority": obj({"high": array(INBOX_ITEM), "med": array(INBOX_ITEM), "low": array(INBOX_ITEM)}),
                         "counts": mapping(INTEGER)})),
+]
+DEVICE_PROBE = obj({
+    "at": STRING,
+    "ok": BOOLEAN,
+    "seconds": NUMBER,
+    "device_version": STRING,
+    "system": STRING,
+    "home": STRING,
+    "tools": array(STRING),
+    "gpus": array(STRING),
+    "detail": STRING,
+}, ["at", "ok", "seconds", "device_version", "detail"])
+DEVICE = obj({
+    "id": STRING,
+    "subject": STRING,
+    "version": STRING,
+    "kind": {**STRING, "enum": ["local", "ssh", "exe", "proxmox"]},
+    "pool": NULL_TEXT,
+    "status": {**STRING, "enum": ["ok", "fault", "unprobed"]},
+    "last_probe": {**DEVICE_PROBE, "type": ["object", "null"]},
+    "leases": array(STRING),
+    "runners": array(STRING),
+    "spec": NULL_TEXT,
+    "tools": {**array(STRING), "type": ["array", "null"]},
+    "host": STRING,
+    "note": STRING,
+})
+DEVICE_PROBE_RESULT = {"anyOf": [
+    envelope({"device": DEVICE, "probe": DEVICE_PROBE}),
+    envelope({"accepted": BOOLEAN, "watch": STRING, "device": STRING}),
+]}
+LEASE = obj({
+    "id": STRING,
+    "subject": STRING,
+    "run_id": NULL_TEXT,
+    "device": STRING,
+    "device_version": STRING,
+    "epoch": INTEGER,
+    "created": STRING,
+    "renewed": STRING,
+    "expires": STRING,
+    "released": NULL_TEXT,
+    "outcome": STRING,
+    "kept_reason": STRING,
+    "vm_name": STRING,
+    "vmid": {"type": ["integer", "null"]},
+    "ready": STRING,
+    "address": STRING,
+    "host_key_fingerprint": STRING,
+    "sweep_attempts": INTEGER,
+    "last_sweep": STRING,
+    "last_sweep_error": STRING,
+    "version": INTEGER,
+    "streams": array(mapping(JSON)),
+})
+RUN_SANDBOX = envelope({
+    "device": STRING,
+    "lease": NULL_TEXT,
+    "address": STRING,
+    "facts": {**mapping(JSON), "type": ["object", "null"]},
+})
+
+OPERATIONS += [
+    operation("device.list", "devices", envelope({"devices": array(DEVICE)})),
+    operation("device.get", "devices/{device}", envelope({"device": DEVICE}),
+              obj({"device": STRING}), {"device": "local"}),
+    {**operation("device.probe", "devices/{device}/probe", DEVICE_PROBE_RESULT,
+                 obj({"device": STRING}), {"device": "local"}, "POST"),
+     "scope": "run:start"},
+    operation("lease.list", "leases", envelope({"leases": array(LEASE)}),
+              obj({"run": STRING, "device": STRING, "open": STRING}, [])),
+    operation("lease.get", "leases/{lease}", envelope({"lease": LEASE}),
+              obj({"lease": STRING}), {"lease": "L-1"}, errors=("lease_fenced", "lease_expired")),
+    operation("run.sandbox", "runs/{run}/sandbox", RUN_SANDBOX,
+              obj({"run": STRING}), {"run": "pip-demo-1"}),
     operation("push.list", "push/subscriptions", envelope({"subscriptions": array(PUSH_SUBSCRIPTION)})),
     operation("push.subscribe", "push/subscriptions", envelope({"subscription": PUSH_SUBSCRIPTION}), PUSH_SUBSCRIBE,
               {"endpoint": "http://127.0.0.1:9999/push", "keys": {"p256dh": "examplekey", "auth": "exampleauth"}, "label": "Phone"},

@@ -1291,6 +1291,9 @@ def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider: s
         if got is None or item_digest(key, got) != change["fingerprint"]:
             raise StoreError("store readback failed the fingerprint check")
         row = save_change(c, scope, name, row, ref, change)
+        from .store import devices as device_store
+
+        device_store.clear_waits_for_blocker(c, f"secret:{scope}/{name}")
         retire_pending(item, raw, row)
         return row
 

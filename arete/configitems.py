@@ -112,6 +112,13 @@ def _engine_item(kind: str, name: str) -> dict | None:
                 **_enrich({"kind": kind, "name": name, "path": f"arete/loops/{name}/loop.toml", "engine": str(target)}),
                 "_engine_file": str(target),
             }
+    if kind == "device" and name == "local":
+        target = paths.DEFAULTS_DIR / "devices" / "local.toml"
+        if target.is_file():
+            return {
+                **_enrich({"kind": kind, "name": name, "path": "arete/defaults/devices/local.toml", "engine": str(target)}),
+                "_engine_file": str(target),
+            }
     return None
 
 

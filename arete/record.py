@@ -284,6 +284,8 @@ def settle(run_id: str, status: str, end_line: str = "", *, base_version=None, *
 def failed_on_crash(run_id: str):
     try:
         yield
+    except foundation.LeaseFenced:
+        raise
     except BaseException as e:
         why = util.first_line(f"crashed: {type(e).__name__}: {e}", 300)
         settle(run_id, "failed", end_line=f"failed: {why}", summary=why)
