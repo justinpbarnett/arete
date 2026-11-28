@@ -12,6 +12,7 @@ from pathlib import Path
 from .. import paths, record, retention, run_lines, util
 from . import approvals, devices, events, idempotency, incidents, loops, orchestration, runs, writes
 from .db import (
+    RECORD_TURNS_SCHEMA,
     RUN_RETENTION_SCHEMA,
     RUNS_LINEAGE_SCHEMA,
     SPEC_DELIVERY_SCHEMA,
@@ -22,7 +23,7 @@ from .db import (
 
 GB = 10 ** 9
 LIVE_SECONDS = 3600
-PROTECTED_STATUSES = frozenset(("running", "pr", "needs-info"))
+PROTECTED_STATUSES = frozenset(("queued", "running", "pr", "needs-info"))
 FOLDER_RELEASING_PROPOSALS = frozenset(("merged", "rejected", "skipped", "filed", "superseded"))
 RECORD_RELEASING_PROPOSALS = frozenset(approvals.RELEASING_PROPOSALS)
 
@@ -220,6 +221,7 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
 
     with tx() as c:
         has_records_purged = migration_applied(RUN_RETENTION_SCHEMA, c)
+        has_turn_index = migration_applied(RECORD_TURNS_SCHEMA, c)
         rows_removed = 0
         queued_reason: dict[str, str] = {}
         queued_bytes = 0
@@ -276,6 +278,8 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
             if rid in pinned or rid in open_asks or rid in firing_cited:
                 continue
             queue_purge(rid, "firing")
+            if has_turn_index:
+                rows_removed += c.execute("DELETE FROM turn_index WHERE run_id = ?", (rid,)).rowcount
             rows_removed += c.execute("DELETE FROM steps WHERE run_id = ?", (rid,)).rowcount
             rows_removed += c.execute("DELETE FROM feed WHERE run_id = ?", (rid,)).rowcount
             writes.update("runs", rid, {}, delete=True, kind="run.deleted")

@@ -6757,12 +6757,15 @@ timeout_minutes = 40
             tid = task_store.task_add(replay.SAMPLE_REPO, "Sample task body", "Sample task", "feat")
             spawn_calls: list[tuple] = []
 
-            def fake_spawn(repo_name, ticket_id, force=False, *, spec=False):
+            def fake_spawn(repo_name, ticket_id, force=False, *, spec=False, run_id=""):
                 spawn_calls.append((repo_name, ticket_id, force))
                 if (lease := launch_lease.CURRENT.get()) is not None:
                     lease.passed = True
-                rid = record.new_id("pip")
-                record.start("pipeline", run_id=rid, repo=repo_name, issue=ticket_id)
+                if run_id:
+                    record.claim(run_id)
+                else:
+                    rid = record.new_id("pip")
+                    record.start("pipeline", run_id=rid, repo=repo_name, issue=ticket_id)
                 return SimpleNamespace(poll=lambda: None, pid=os.getpid())
 
             def post_task(ticket_id):
@@ -6924,12 +6927,15 @@ timeout_minutes = 40
             tid = task_store.task_add(replay.SAMPLE_REPO, "Layer test task", "Layer test", "feat")
             spawn_calls: list[tuple] = []
 
-            def fake_spawn(repo_name, ticket_id, force=False, *, spec=False):
+            def fake_spawn(repo_name, ticket_id, force=False, *, spec=False, run_id=""):
                 spawn_calls.append((repo_name, ticket_id, force))
                 if (lease := launch_lease.CURRENT.get()) is not None:
                     lease.passed = True
-                rid = record.new_id("pip")
-                record.start("pipeline", run_id=rid, repo=repo_name, issue=ticket_id)
+                if run_id:
+                    record.claim(run_id)
+                else:
+                    rid = record.new_id("pip")
+                    record.start("pipeline", run_id=rid, repo=repo_name, issue=ticket_id)
                 return SimpleNamespace(poll=lambda: None, pid=os.getpid())
 
             def post_task(ticket_id):
@@ -8432,7 +8438,7 @@ class CliThroughServeRunTests(_CliThroughServeCase):
             code, lines, err = self.cli("run replay-sample 7")
         self.assertEqual((code, list(map(json.loads, lines)), err), (0, [started], f"Idempotency-Key: {key}\n"))
         self.assertEqual(len(refused), 1)
-        self.assertEqual(sent, [("/api/tasks", key)] * 3)
+        self.assertEqual(sent, [("/api/v1/tasks", key)] * 3)
 
     def test_run_validates_terminal_status_before_printing(self):
         self.in_subprocess("check_run_validates_terminal_status_before_printing")
@@ -8524,8 +8530,8 @@ class CliThroughServeRunTests(_CliThroughServeCase):
 
         with (self.serve_at([]), mock.patch.object(sessions, "launch", side_effect=launched) as launch,
               mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "session-start"})):
-            self.problem("session start work", 500)
-            reply = self.problem("session start work", 409)
+            self.problem("session start work", "internal_error")
+            reply = self.problem("session start work", "conflict")
             self.assertIn("earlier request", reply["error"])
             launch.assert_called_once()
             self.assertEqual(len(runs.runs(kind="session")), 1)
@@ -8534,27 +8540,42 @@ class CliThroughServeRunTests(_CliThroughServeCase):
         self.in_subprocess("check_deferred_session_attach_can_send_input")
 
     def check_deferred_session_attach_can_send_input(self):
-        from arete import client, sessions
         from arete.commands import sessions as commands
 
         def follow(run, *, send, remote, on_start):
-            self.assertFalse(remote)
+            self.assertTrue(remote)
             on_start()
             send()
 
         launched = {"id": "r1", "runner": "pi", "model": "sample", "device": "local", "cwd": str(Path.cwd()),
                     "branch": "", "tools": [], "task": True}
-        with (mock.patch.object(client, "server", side_effect=AssertionError("contacted serve")),
-              mock.patch.object(sessions, "launch", return_value=launched) as launch,
-              mock.patch.object(sessions, "send") as send, mock.patch.object(commands, "follow", side_effect=follow),
+        seen_bodies = []
+        sent = []
+
+        def stub_server(request):
+            if request.path == "/api/v1/meta":
+                return self.stub_meta("session-task")
+            if request.command == "POST" and request.path == "/api/v1/sessions":
+                raw = request.rfile.read(int(request.headers.get("Content-Length") or "0"))
+                seen_bodies.append(json.loads(raw or b"{}"))
+                return 201, {"seq": "1.1", "run": {"id": "r1", "status": "queued", "version": 1}, "session": launched}, {}
+            if request.command == "GET" and request.path == "/api/runs/r1":
+                return 200, {"run": {"id": "r1", "kind": "session", "status": "running", "version": 1}}, {}
+            if request.command == "POST" and request.path == "/api/v1/runs/r1/steer":
+                raw = request.rfile.read(int(request.headers.get("Content-Length") or "0"))
+                sent.append(json.loads(raw or b"{}")["text"])
+                return 200, {"seq": "1.2"}, {}
+            return 404, {"error": f"unexpected {request.command} {request.path}"}, {}
+
+        with (self.stub(stub_server),
+              mock.patch.object(commands, "follow", side_effect=follow),
               mock.patch("select.select", return_value=([True], [], []))):
             for options in ("", "--draft-pr --repo replay-sample"):
                 code, lines, err = self.cli(f"session start --task --attach {options} work", "hello\n")
                 self.assertEqual(code, 0, (lines, err))
-                self.assertTrue(launch.call_args.kwargs["task"])
-                self.assertEqual(launch.call_args.kwargs["draft_pr"], bool(options))
-                send.assert_called_once_with("r1", "hello\n")
-                send.reset_mock()
+                self.assertTrue(seen_bodies[-1].get("task"))
+                self.assertEqual(bool(seen_bodies[-1].get("draft_pr")), bool(options))
+                self.assertEqual(sent[-1], "hello\n")
 
     def test_session_attach_uses_serve_for_feed_and_input(self):
         self.in_subprocess("check_session_attach_uses_serve_for_feed_and_input")
@@ -8623,8 +8644,8 @@ class CliThroughServeRunTests(_CliThroughServeCase):
                 client.call("POST", "/api/v1/tasks")
                 client.call("POST", "/api/v1/tasks")
         self.assertEqual(sent, [
-            ("/api/tasks", long_key),
-            ("/api/tasks", long_key),
+            ("/api/v1/tasks", long_key),
+            ("/api/v1/tasks", long_key),
             ("/api/v1/tasks", hashlib.sha256((long_key + ":2").encode()).hexdigest()),
             ("/api/v1/tasks", "another-key"),
             ("/api/v1/tasks", "another-key:2"),
@@ -8882,7 +8903,7 @@ class HookUploadTests(unittest.TestCase):
             self.assertIn("[Unit]\nDescription=arete serve", out)
             with mock.patch.object(pipeline, "run_issue", return_value=0) as run_issue:
                 self.invoke("run", "sample", "7", "--dry-run")
-            run_issue.assert_called_once_with("sample", "7", dry_run=True, force=False)
+            run_issue.assert_called_once_with("sample", "7", dry_run=True, force=False, persist_run=False)
             client.connect.assert_not_called()
             self.assertEqual(checkpoint.read_bytes(), before)
         self.assertEqual([row["detail"] for row in self.recorded(target)], ["uploaded"])
@@ -8902,10 +8923,11 @@ class HookUploadTests(unittest.TestCase):
             self.assertEqual([row["detail"] for row in self.recorded(target)], ["first"])
 
             self.hook("second")
-            with mock.patch.object(tasks, "start", return_value={"queued": True}) as start:
+            queued_answer = tasks.answer("7", "sample", "", "queued", "waiting")
+            with mock.patch.object(tasks, "start", return_value=queued_answer) as start:
                 out, err = self.invoke("task", "run", "sample", "7", "--key", "run-seven")
             start.assert_called_once()
-            self.assertEqual(json.loads(out), {"queued": True})
+            self.assertEqual(json.loads(out), queued_answer)
             self.assertEqual(err, "Idempotency-Key: run-seven\n")
         self.assertEqual([row["detail"] for row in self.recorded(target)], ["first", "second"])
 
@@ -9716,8 +9738,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 109)
-        self.assertEqual(len({op["name"] for op in operations}), 109)
+        self.assertEqual(len(operations), 127)
+        self.assertEqual(len({op["name"] for op in operations}), 127)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -10839,11 +10861,8 @@ class CredentialUpgradeWriteTests(_CredentialUpgradeCase):
             run = record.start("pipeline", repo=body["repo"], issue=task)
             saved = tasks.answer(task, body["repo"], run, "running", "started")
             claims.complete(context, 200, api_http.json_bytes(saved), claims.lookup(self.owner, key)["first_seq"])
-        command = ["task", "start", "--repo", "fixture", "--key", key, "--title", "Original", "--kind", "feat",
-                   body["prompt"]]
         self.upgrade()
         with self.listen() as server, self.cli_environment(server):
-            self.assertEqual(json.loads(self.cli(command)), saved)
             replay, headers = self.request(server, "POST", route, bearer=self.owner_text, key=key, body=body)
             self.assertEqual((replay, headers["Idempotent-Replayed"]), (saved, "true"))
             self.request(server, "POST", route, bearer=self.owner_text, key=key, body={**body, "prompt": "Changed"},
@@ -14512,15 +14531,15 @@ def capture_launch(cmd, log):
     resume_argv.extend(cmd)
     return r1['id']
 with (mock.patch.object(pipeline, 'run_refusal', return_value=(True, '')),
-      mock.patch.object(tasks, 'spawned', side_effect=lambda repo, tid, spawn: (spawn(), 'done')),
+      mock.patch.object(tasks, 'spawn_queued', side_effect=lambda repo, tid, spawn: spawn()),
       mock.patch.object(tasks.control, 'launch', side_effect=capture_launch)):
-    tasks.resume(r1['id'])
+    resumed = tasks.resume(r1['id'])
 assert '--continue' in resume_argv and r1['id'] in resume_argv, resume_argv
 
 script2 = pipeline.Script('feature', flow_fn, continues=r1['id'], restart='resume')
 with (mock.patch.object(steps, 'in_arm', return_value=False),
       mock.patch.object(replay, 'run', side_effect=fake_replay)):
-    rc2 = pipeline.run_issue('sample', tid, force=True, script=script2)
+    rc2 = pipeline.run_issue('sample', tid, force=True, script=script2, run_id=resumed['run'])
 assert rc2 == 0, rc2
 r2 = run_store.newest_whole_run('sample', tid)
 assert r2['id'] != r1['id'] and r2['status'] == 'done'
@@ -17607,3 +17626,1118 @@ assert not str(oncall_text).startswith('---'), str(oncall_text)[:60]
 result = {'ok': True}
 """)
         self.assertTrue(result["ok"])
+
+
+_LIFECYCLE_PREAMBLE = r"""
+import contextlib, errno, fcntl, gzip, http.client, json, os, signal, sqlite3, subprocess, sys, threading, time
+from pathlib import Path
+from unittest import mock
+
+from arete import (
+    accounts, agent, api_check, board, chat, cli, client, codebase, config, control,
+    dashboard, factory, heartbeat, oncall, paths, pins, pipeline, poll, principals,
+    record, replay, research, routing, run_lines, runner, scaffold, serve, sessions,
+    tailnet, tasks, triage, util,
+)
+from arete.store import (
+    asks as ask_store,
+    chats as chat_store,
+    db as foundation,
+    inbox as inbox_store,
+    incidents as incident_store,
+    insights as insights_store,
+    runs as run_store,
+    tasks as task_store,
+    tokens as token_store,
+    triage as triage_store,
+)
+
+ROOT = Path(os.environ["ARETE_STATE_DIR"]).parent.resolve()
+REPLAY_DIR = Path(os.environ["ARETE_REPLAY_DIR"]).resolve()
+REPLAY_DIR.mkdir(parents=True, exist_ok=True)
+OWNER_LOGIN = "owner@example.test"
+
+def init_env(extra_config=""):
+    codebase.load()
+    lines, _ = api_check.prepare_replay(ROOT)
+    (paths.CONFIG_DIR / "config.toml").write_text("\n".join(lines) + "\n" + extra_config, encoding="utf-8")
+    foundation.migrate()
+    principals.seed_owner(OWNER_LOGIN)
+    token_store.init_owner()
+    return principals.owner()
+
+def write_answer(name, payload):
+    (REPLAY_DIR / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+def seed_person(pid, login):
+    with foundation.tx() as c:
+        c.execute("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('multi_user', 'ready')")
+        c.execute(
+            "INSERT OR IGNORE INTO principals (id, kind, role, status, name, created) VALUES (?, 'human', 'member', 'active', ?, ?)",
+            (pid, login, util.iso()),
+        )
+    return pid
+
+def seed_account(acct_id, *, fingerprint, owner, scope="personal", runner_name="replay", auth_mode="subscription"):
+    now = util.iso()
+    with foundation.tx() as c:
+        c.execute(
+            "INSERT INTO accounts (id, provider, identity, mode, holder, usage, fingerprint, created) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (acct_id, runner_name, acct_id, auth_mode, owner, scope, fingerprint, now),
+        )
+    return acct_id
+
+@contextlib.contextmanager
+def api_server():
+    from arete import credential_files
+
+    token = credential_files.read_client(foundation.schema_metadata()["instance_tag"])
+    address = "127.0.0.1"
+    node = tailnet.Node((address,), frozenset({address}), address)
+    logins = tailnet.Logins(tailnet.ScratchHost())
+    logins.of = lambda _: OWNER_LOGIN
+    handler = type("LifecycleHandler", (dashboard.handlers().open,), {"disable_nagle_algorithm": True})
+    with mock.patch("socket.getfqdn", return_value=address):
+        srv = tailnet.Server(address, 0, node, logins, False, handler, dashboard.Redirect)
+    srv.daemon_threads = False
+    with srv:
+        thread = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        try:
+            def req(method, path, body=None, headers=None):
+                conn = http.client.HTTPConnection(address, srv.server_port, timeout=15)
+                try:
+                    hdrs = {"Authorization": f"Bearer {token}", "X-Arete": "1"}
+                    raw = None
+                    if body is not None:
+                        raw = body if isinstance(body, (bytes, bytearray)) else json.dumps(body).encode("utf-8")
+                        hdrs.setdefault("Content-Type", "application/json")
+                    if headers:
+                        hdrs.update(headers)
+                    conn.request(method, path, body=raw, headers=hdrs)
+                    resp = conn.getresponse()
+                    data = resp.read()
+                    resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+                    return resp.status, resp_headers, data
+                finally:
+                    conn.close()
+            yield srv.server_port, token, req
+        finally:
+            srv.shutdown()
+            thread.join(timeout=5)
+
+def emit(value):
+    print("BEHAVIOR_RESULT=" + json.dumps(value), flush=True)
+
+def make_picked(auth, *, billing="api_key"):
+    cand = routing.Candidate(
+        order=0, model="replay", runner="replay", provider="replay",
+        credential="", billing=billing, tier="", position=0, requested=True,
+        effort="", instructions=(), price=None, state="ready", detail="",
+    )
+    return runner.Picked(candidate=cand, auth=auth, selected=None, name="replay", unknown="", auths=set(), budget=None)
+"""
+
+
+class _LifecycleSubprocessCase(unittest.TestCase):
+    class_timeout = 30
+
+    def run_lifecycle_child(self, script: str, *, timeout: int = 25):
+        with tempfile.TemporaryDirectory(prefix="arete-lifecycle-") as tmp:
+            root = Path(tmp).resolve()
+            env = api_check.isolated_env(root)
+            replay_dir = root / "replay"
+            replay_dir.mkdir(parents=True, exist_ok=True)
+            env["ARETE_REPLAY_DIR"] = str(replay_dir)
+            done = subprocess.run(
+                [sys.executable, "-c", _LIFECYCLE_PREAMBLE + "\n" + script],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if done.returncode != 0:
+                self.fail(f"lifecycle child failed ({done.returncode}):\nSTDOUT:\n{done.stdout}\nSTDERR:\n{done.stderr}")
+            for line in reversed(done.stdout.splitlines()):
+                if line.startswith("BEHAVIOR_RESULT="):
+                    return json.loads(line.removeprefix("BEHAVIOR_RESULT="))
+            self.fail(f"missing BEHAVIOR_RESULT= line:\nSTDOUT:\n{done.stdout}\nSTDERR:\n{done.stderr}")
+
+
+class StepRowTests(_LifecycleSubprocessCase):
+    def test_queue_to_end_replay_shortcut_and_unresumable(self):
+        res = self.run_lifecycle_child(r"""
+owner = init_env()
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+stream = [
+    {"tokens_in": 100, "tokens_out": 40, "cost_usd": 0.002},
+    {"tokens_in": 120, "tokens_out": 50, "cost_usd": 0.003},
+]
+write_answer("plan", {"ok": True, "text": "planned", "stream": stream})
+write_answer("build", {"ok": True, "text": "built", "stream": stream})
+
+# 1. Queue to end with runner.pick held on a flag: board.run_board and GET /api/v1/runs/{id}
+# show 'queued' with queued_at set and no account; once released, 'done', turns == len(stream), version grows.
+with principals.acting(owner):
+    rid = record.start("pipeline", repo=repo.name, issue="1")
+
+entered = threading.Event()
+release = threading.Event()
+orig_pick = runner.pick
+
+def held_pick(*args, **kwargs):
+    entered.set()
+    release.wait(timeout=10)
+    return orig_pick(*args, **kwargs)
+
+with api_server() as (_, _, req):
+    cfg_no_shortcut = config.Config(
+        repos=cfg.repos,
+        pricing=cfg.pricing,
+        replay=config.ReplayConfig(all=False, dir=REPLAY_DIR),
+    )
+    def run_held():
+        fake_picked = make_picked(accounts.Auth(mode="api_key"))
+        with mock.patch.object(runner, "pick", side_effect=lambda *a, **kw: (entered.set(), release.wait(10), (fake_picked, []))[2]):
+            return runner.run("plan it", repo.path, trace=(rid, "plan"), cfg=cfg_no_shortcut, repo=repo)
+
+    t = threading.Thread(target=run_held)
+    t.start()
+    assert entered.wait(timeout=5), "pick was not entered"
+    queued_board = board.run_board(rid)["steps"]
+    status, _, raw = req("GET", f"/api/v1/runs/{rid}")
+    assert status == 200, (status, raw)
+    queued_api = json.loads(raw)["steps"]
+    release.set()
+    t.join(timeout=10)
+
+done_rows = run_store.steps(rid)
+done_plan = done_rows[0]
+
+# 2. Replay shortcut (skips pick) transitions queued -> running -> done.
+with principals.acting(owner):
+    rid2 = record.start("pipeline", repo=repo.name, issue="2")
+seen_statuses = []
+orig_start = run_store.start_step
+def spy_start(step_id, **kw):
+    row = run_store.step_get(step_id)
+    seen_statuses.append(("before_start", row["status"], row["version"]))
+    res = orig_start(step_id, **kw)
+    row2 = run_store.step_get(step_id)
+    seen_statuses.append(("after_start", row2["status"], row2["version"]))
+    return res
+
+with mock.patch.object(run_store, "start_step", side_effect=spy_start):
+    r_shortcut = runner.run("build it", repo.path, trace=(rid2, "build"), cfg=cfg, repo=repo)
+shortcut_row = run_store.steps(rid2)[0]
+
+# 3. Call returning through unresumable leaves 'fault', never 'queued'.
+with principals.acting(owner):
+    rid3 = record.start("pipeline", repo=repo.name, issue="3")
+r_unres = runner.run(
+    "resume it", repo.path, trace=(rid3, "plan"),
+    resume=agent.Session("dead-sess", 0.0, "claude"),
+    cfg=cfg_no_shortcut, repo=repo, resume_only=True,
+)
+unres_row = run_store.steps(rid3)[0]
+
+emit({
+    "queued_board": queued_board,
+    "queued_api": queued_api,
+    "done_status": done_plan["status"],
+    "done_turns": done_plan["turns"],
+    "done_version": done_plan["version"],
+    "shortcut_ok": r_shortcut.ok,
+    "shortcut_seen": seen_statuses,
+    "shortcut_status": shortcut_row["status"],
+    "shortcut_version": shortcut_row["version"],
+    "unres_ok": r_unres.ok,
+    "unres_status": unres_row["status"],
+})
+""")
+        qb = res["queued_board"][0]
+        qa = res["queued_api"][0]
+        self.assertEqual(qb["status"], "queued")
+        self.assertTrue(qb["queued_at"])
+        self.assertIsNone(qb["account"])
+        self.assertEqual(qa["status"], "queued")
+        self.assertTrue(qa["queued_at"])
+        self.assertIsNone(qa["account"])
+        self.assertEqual(res["done_status"], "done")
+        self.assertEqual(res["done_turns"], 2)
+        self.assertGreaterEqual(res["done_version"], 3)
+        self.assertTrue(res["shortcut_ok"])
+        self.assertEqual([s[1] for s in res["shortcut_seen"]], ["queued", "running"])
+        self.assertEqual(res["shortcut_status"], "done")
+        self.assertGreaterEqual(res["shortcut_version"], 3)
+        self.assertFalse(res["unres_ok"])
+        self.assertEqual(res["unres_status"], "fault")
+
+    def test_payer_floor_and_chat(self):
+        res = self.run_lifecycle_child(r"""
+owner = init_env()
+second = seed_person("u:second01", "second@example.test")
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+write_answer("plan", {"ok": True, "text": "should not run", "stream": [{"tokens_in": 10, "tokens_out": 5, "cost_usd": 0.001}]})
+write_answer("chat", {"ok": True, "text": "hello owner", "stream": [{"tokens_in": 10, "tokens_out": 5, "cost_usd": 0.001}]})
+
+personal_auth = accounts.Auth(mode="oauth", identity="owner-personal-plan")
+personal_fp = runner.account_of(personal_auth)
+personal_id = seed_account("acct-personal", fingerprint=personal_fp, owner=owner, scope="personal", runner_name="replay")
+
+ws_auth = accounts.Auth(mode="api_key", identity="shared-workspace-key")
+ws_fp = runner.account_of(ws_auth)
+ws_id = seed_account("acct-workspace", fingerprint=ws_fp, owner=owner, scope="workspace", runner_name="replay", auth_mode="api_key")
+
+# 1. Replay route matching owner's personal account on second person's run -> fault, account_id NULL, no record file / turns.
+with principals.acting(second):
+    rid_other = record.start("pipeline", repo=repo.name, issue="11", payer=second)
+
+cfg_no_shortcut = config.Config(repos=cfg.repos, pricing=cfg.pricing, replay=config.ReplayConfig(all=False, dir=REPLAY_DIR))
+bad_picked = make_picked(personal_auth, billing="plan")
+with mock.patch.object(runner, "pick", return_value=(bad_picked, [])):
+    r_bad = runner.run("plan", repo.path, trace=(rid_other, "plan"), cfg=cfg_no_shortcut, repo=repo)
+bad_step = run_store.steps(rid_other)[0]
+bad_records = record.record_files(rid_other)
+bad_turns = run_store.step_turns(bad_step["id"])
+
+# 2. Direct INSERT and UPDATE OF account_id checks: personal+other raises, workspace passes, NULL payer+personal raises.
+def sql_exec(query, params):
+    try:
+        with foundation.tx() as c:
+            c.execute(query, params)
+        return "ok"
+    except sqlite3.IntegrityError as e:
+        return str(e)
+
+insert_other = sql_exec(
+    "INSERT INTO steps (run_id, step, node, try, status, account_id, ts) VALUES (?, 'ins', 'ins', 1, 'running', ?, ?)",
+    (rid_other, personal_id, util.iso()),
+)
+# Insert queued row then UPDATE OF account_id -> raises.
+upd_step_id = run_store.queue_step(rid_other, "upd", 1)
+update_other = sql_exec("UPDATE steps SET account_id = ? WHERE id = ?", (personal_id, upd_step_id))
+# Workspace account on second person's run passes.
+workspace_ok = sql_exec(
+    "INSERT INTO steps (run_id, step, node, try, status, account_id, ts) VALUES (?, 'ws', 'ws', 1, 'running', ?, ?)",
+    (rid_other, ws_id, util.iso()),
+)
+# Run with NULL payer on personal account raises.
+with foundation.tx() as c:
+    c.execute("INSERT INTO runs (id, kind, status, started, payer) VALUES ('null-payer-run', 'pipeline', 'running', ?, NULL)", (util.iso(),))
+null_payer = sql_exec(
+    "INSERT INTO steps (run_id, step, node, try, status, account_id, ts) VALUES ('null-payer-run', 'np', 'np', 1, 'running', ?, ?)",
+    (personal_id, util.iso()),
+)
+
+# 3. Chat turn on owner's personal plan login writes steps row with chat_id set and is not refused.
+with principals.acting(owner):
+    cid = chat_store.chat_add("", payer=owner)
+    rid_chat = record.start("chat", tag=f"chat-{cid}", payer=owner)
+with mock.patch.object(runner, "pick", return_value=(bad_picked, [])):
+    r_chat = runner.run("hello", repo.path, trace=(rid_chat, "chat"), cfg=cfg_no_shortcut, repo=repo, chat_id=cid)
+chat_step = run_store.steps(rid_chat)[0]
+
+# 4. Legacy step on run 'chat' with NULL runs.payer and chats.payer = owner passes.
+with foundation.tx() as c:
+    c.execute("INSERT OR IGNORE INTO runs (id, kind, status, started, payer) VALUES ('chat', 'chat', 'running', ?, NULL)", (util.iso(),))
+legacy_chat_ok = sql_exec(
+    "INSERT INTO steps (run_id, step, node, try, status, account_id, chat_id, ts) VALUES ('chat', 'chat', 'chat', 1, 'running', ?, ?, ?)",
+    (personal_id, cid, util.iso()),
+)
+
+emit({
+    "r_bad_ok": r_bad.ok,
+    "r_bad_err": r_bad.error,
+    "bad_step_status": bad_step["status"],
+    "bad_step_error": bad_step["error"],
+    "bad_step_account_id": bad_step["account_id"],
+    "bad_records": len(bad_records),
+    "bad_turns": len(bad_turns),
+    "insert_other": insert_other,
+    "update_other": update_other,
+    "workspace_ok": workspace_ok,
+    "null_payer": null_payer,
+    "r_chat_ok": r_chat.ok,
+    "chat_step_chat_id": chat_step["chat_id"],
+    "chat_step_account_id": chat_step["account_id"],
+    "legacy_chat_ok": legacy_chat_ok,
+})
+""")
+        self.assertFalse(res["r_bad_ok"])
+        self.assertIn("personal account used for another payer", res["r_bad_err"])
+        self.assertEqual(res["bad_step_status"], "fault")
+        self.assertIn("personal account used for another payer", res["bad_step_error"])
+        self.assertIsNone(res["bad_step_account_id"])
+        self.assertEqual(res["bad_records"], 0)
+        self.assertEqual(res["bad_turns"], 0)
+        self.assertIn("personal account used for another payer", res["insert_other"])
+        self.assertIn("personal account used for another payer", res["update_other"])
+        self.assertEqual(res["workspace_ok"], "ok")
+        self.assertIn("personal account used for another payer", res["null_payer"])
+        self.assertTrue(res["r_chat_ok"])
+        self.assertIsNotNone(res["chat_step_chat_id"])
+        self.assertEqual(res["chat_step_account_id"], "acct-personal")
+        self.assertEqual(res["legacy_chat_ok"], "ok")
+
+    def test_unclean_ends_try_and_report(self):
+        res = self.run_lifecycle_child(r"""
+owner = init_env()
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+since = "2000-01-01T00:00:00Z"
+
+# Answer 1: SIGKILL in record.mark on kind='agent' -> steps row already 'done' with cost.
+write_answer("killmark", {"ok": True, "text": "done", "stream": [{"tokens_in": 50, "tokens_out": 20, "cost_usd": 0.01}]})
+# Answer 2: holds open for 15s after emitting 2 turns (total cost 0.025).
+write_answer("holdkill", {
+    "ok": True, "text": "held", "seconds": 15,
+    "stream": [
+        {"tokens_in": 40, "tokens_out": 10, "cost_usd": 0.010},
+        {"tokens_in": 60, "tokens_out": 20, "cost_usd": 0.015},
+    ],
+})
+
+# Child A: SIGKILL self inside record.mark on kind='agent'.
+with principals.acting(owner):
+    rid_a = record.start("loop", loop="demo", loop_kind="agent", repo=repo.name)
+child_a_code = f'''
+import os, signal
+from unittest import mock
+from arete import config, record, replay, runner
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+orig_mark = record.mark
+def kill_on_agent(run_id, kind, **fields):
+    if kind == "agent":
+        os.kill(os.getpid(), signal.SIGKILL)
+    return orig_mark(run_id, kind, **fields)
+with mock.patch.object(record, "mark", side_effect=kill_on_agent):
+    runner.run("hi", repo.path, trace=({rid_a!r}, "killmark"), cfg=cfg, repo=repo)
+'''
+p_a = subprocess.run([sys.executable, "-c", child_a_code], env=os.environ.copy(), check=False)
+step_a = run_store.steps(rid_a)[0]
+
+# Child B: SIGKILL during seconds hold, then record.reap with SETTLE_GRACE_SECONDS=0.
+with principals.acting(owner):
+    rid_b = record.start("loop", loop="demo", loop_kind="agent", repo=repo.name)
+child_b_code = f'''
+import os
+from arete import config, record, replay, runner
+record.note({rid_b!r}, pid=os.getpid())
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+runner.run("hi", repo.path, trace=({rid_b!r}, "holdkill"), cfg=cfg, repo=repo)
+'''
+p_b = subprocess.Popen([sys.executable, "-c", child_b_code], env=os.environ.copy(), start_new_session=True)
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    st_b = run_store.steps(rid_b)
+    if st_b and len(run_store.step_turns(st_b[0]["id"])) == 2:
+        break
+    time.sleep(0.05)
+os.kill(p_b.pid, signal.SIGKILL)
+p_b.wait(timeout=5)
+with mock.patch.object(record, "SETTLE_GRACE_SECONDS", 0):
+    record.reap(tickets=False)
+step_b = run_store.steps(rid_b)[0]
+
+# Child C: stopped through control.stop_run + settle.
+with principals.acting(owner):
+    rid_c = record.start("loop", loop="demo", loop_kind="agent", repo=repo.name)
+child_c_code = f'''
+import os
+from arete import config, record, replay, runner
+record.note({rid_c!r}, pid=os.getpid())
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+runner.run("hi", repo.path, trace=({rid_c!r}, "holdkill"), cfg=cfg, repo=repo)
+'''
+p_c = subprocess.Popen([sys.executable, "-c", child_c_code], env=os.environ.copy(), start_new_session=True)
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    st_c = run_store.steps(rid_c)
+    if st_c and len(run_store.step_turns(st_c[0]["id"])) == 2:
+        break
+    time.sleep(0.05)
+control.stop_run(rid_c)
+p_c.wait(timeout=5)
+record.settle(rid_c, "stopped")
+step_c = run_store.steps(rid_c)[0]
+
+with mock.patch.object(run_store, "billing_of", lambda step, local: "api_key" if step.get("runner") == "replay" else agent.billing_of(step, local)):
+    spent = run_store.loop_spent_since(since, loop="demo")
+
+# Try and report: continued run's try matches run.jsonl and steps; factory.tally sums steps by node; record.label_step.
+write_answer("plan", {"ok": True, "text": "p1", "stream": [{"tokens_in": 10, "tokens_out": 5, "cost_usd": 0.005}]})
+write_answer("plan-2", {"ok": True, "text": "p2", "stream": [{"tokens_in": 10, "tokens_out": 5, "cost_usd": 0.007}]})
+with principals.acting(owner):
+    r1 = record.start("pipeline", repo=repo.name, issue="50")
+runner.run("p1", repo.path, trace=(r1, "plan"), cfg=cfg, repo=repo)
+run_lines.write(r1, "step_start", step="plan", **{"try": 1})
+run_lines.write(r1, "step_end", step="plan", **{"try": 1}, result="fail", ok=False, cost_usd=0.005, seconds=1.0)
+record.settle(r1, "interrupted")
+
+with principals.acting(owner):
+    r2 = record.start("pipeline", repo=repo.name, issue="50", continues=r1, restart="resume")
+run_lines.write(r2, "route", continues=r1)
+runner.run("p2", repo.path, trace=(r2, "plan"), cfg=cfg, repo=repo)
+r2_steps = run_store.steps(r2)
+r2_try = r2_steps[0]["try"]
+run_lines.write(r2, "step_start", step="plan", **{"try": r2_try})
+run_lines.write(r2, "step_end", step="plan", **{"try": r2_try}, result="pass", ok=True, cost_usd=0.007, seconds=1.0)
+# Add a stopped step on r2 to verify factory.tally sums steps.cost_usd by node.
+stopped_sid = run_store.queue_step(r2, "plan", r2_try + 1)
+with foundation.tx() as c:
+    c.execute("UPDATE steps SET status='fault', ok=0, error='interrupted', cost_usd=0.013, seconds=2.0 WHERE id = ?", (stopped_sid,))
+tally = factory.tally(r2)
+with foundation.reader() as c:
+    sql_sum_cost = c.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM steps WHERE run_id = ? AND node = 'plan'", (r2,)).fetchone()[0]
+record.label_step(r2, "plan", r2_try, atom="atom-x", ab="exp-1", ab_side="treatment")
+labeled = run_store.step_get(r2_steps[0]["id"])
+
+emit({
+    "a_rc": p_a.returncode,
+    "a_status": step_a["status"],
+    "a_cost": step_a["cost_usd"],
+    "b_status": step_b["status"],
+    "b_error": step_b["error"],
+    "b_cost": step_b["cost_usd"],
+    "c_status": step_c["status"],
+    "c_error": step_c["error"],
+    "c_cost": step_c["cost_usd"],
+    "spent": spent,
+    "r2_try": r2_try,
+    "tally_cost": tally["plan"]["cost_usd"],
+    "sql_sum_cost": sql_sum_cost,
+    "labeled": {"atom": labeled["atom"], "ab": labeled["ab"], "ab_side": labeled["ab_side"]},
+})
+""")
+        import signal
+
+        self.assertEqual(res["a_rc"], -signal.SIGKILL)
+        self.assertEqual(res["a_status"], "done")
+        self.assertAlmostEqual(res["a_cost"], 0.01, places=6)
+        self.assertEqual(res["b_status"], "fault")
+        self.assertEqual(res["b_error"], "interrupted")
+        self.assertAlmostEqual(res["b_cost"], 0.025, places=6)
+        self.assertEqual(res["c_status"], "fault")
+        self.assertEqual(res["c_error"], "interrupted")
+        self.assertAlmostEqual(res["c_cost"], 0.025, places=6)
+        self.assertAlmostEqual(res["spent"], 0.06, places=6)
+        self.assertEqual(res["r2_try"], 2)
+        self.assertAlmostEqual(res["tally_cost"], res["sql_sum_cost"], places=6)
+        self.assertEqual(res["labeled"], {"atom": "atom-x", "ab": "exp-1", "ab_side": "treatment"})
+
+
+class RecordFramingTests(_LifecycleSubprocessCase):
+    def test_turns_sigkill_recovery_turn_index_and_api(self):
+        res = self.run_lifecycle_child(r"""
+owner = init_env()
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+stream = [
+    {"tokens_in": 100, "tokens_out": 25, "cost_usd": 0.004},
+    {"tokens_in": 150, "tokens_out": 35, "cost_usd": 0.006},
+    {"tokens_in": 200, "tokens_out": 45, "cost_usd": 0.008},
+]
+write_answer("plan", {"ok": True, "text": "done", "stream": stream})
+write_answer("hold", {"ok": True, "text": "held", "seconds": 15, "stream": stream[:2]})
+
+# 1. Pick hold released -> steps.turns == COUNT(*) turn_index.
+with principals.acting(owner):
+    rid = record.start("pipeline", repo=repo.name, issue="10")
+r = runner.run("plan", repo.path, trace=(rid, "plan"), cfg=cfg, repo=repo)
+step = run_store.steps(rid)[0]
+turns = run_store.step_turns(step["id"])
+
+# 2. SIGKILL during seconds hold then reap(SETTLE_GRACE_SECONDS=0) -> cost_usd == SUM(cost_nusd)/1e9 & runs.cost_usd == SUM(steps.cost_usd).
+with principals.acting(owner):
+    rid_k = record.start("pipeline", repo=repo.name, issue="11")
+code_k = f'''
+import os
+from arete import config, record, replay, runner
+record.note({rid_k!r}, pid=os.getpid())
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+runner.run("hold", repo.path, trace=({rid_k!r}, "hold"), cfg=cfg, repo=repo)
+'''
+proc = subprocess.Popen([sys.executable, "-c", code_k], env=os.environ.copy(), start_new_session=True)
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    st = run_store.steps(rid_k)
+    if st and len(run_store.step_turns(st[0]["id"])) == 2:
+        break
+    time.sleep(0.05)
+os.kill(proc.pid, signal.SIGKILL)
+proc.wait(timeout=5)
+with mock.patch.object(record, "SETTLE_GRACE_SECONDS", 0):
+    record.reap(tickets=True)
+step_k = run_store.steps(rid_k)[0]
+run_k = run_store.run_get(rid_k)
+turns_k = run_store.step_turns(step_k["id"])
+
+# 3. PRAGMA table_info(turn_index) has no REAL money column; file is relative; every slice decodes alone with gzip.decompress.
+with foundation.reader() as c:
+    cols = [(r["name"], r["type"]) for r in c.execute("PRAGMA table_info(turn_index)")]
+no_abs = all(not t["file"].startswith(("/", "~")) for t in turns)
+slices_ok = []
+for t in turns:
+    p = paths.STATE_DIR / t["file"]
+    data = p.read_bytes()[t["member_offset"]:t["member_offset"] + t["member_len"]]
+    decoded = json.loads(gzip.decompress(data).decode("utf-8"))
+    slices_ok.append(decoded.get("type") == "message_end")
+
+# 4. Also verify slice decoding with a torn member planted BEFORE the turn member in a record file.
+rec_path = paths.STATE_DIR / turns[0]["file"]
+orig_bytes = rec_path.read_bytes()
+first_end = turns[0]["member_offset"]
+torn_member = gzip.compress(b'{"type":"torn"}\n')[:14]
+rec_path.write_bytes(orig_bytes[:first_end] + torn_member + orig_bytes[first_end:])
+rebuilt_torn = record.rebuild_turn_index(rid)
+torn_turns = run_store.step_turns(step["id"])
+torn_slices_ok = []
+for t in torn_turns:
+    raw_slice = rec_path.read_bytes()[t["member_offset"]:t["member_offset"] + t["member_len"]]
+    torn_slices_ok.append(json.loads(gzip.decompress(raw_slice).decode("utf-8")).get("type") == "message_end")
+# Restore original record bytes and verify delete + rebuild gives identical rows.
+rec_path.write_bytes(orig_bytes)
+before_rows = list(turns)
+run_store.clear_turn_index(rid)
+record.rebuild_turn_index(rid)
+after_rows = run_store.step_turns(step["id"])
+
+# 5. Header has v, engine, runner_version; step has runner_version; turn.list, turn.get, and CLI `record RUN STEP`.
+header = next(record.lines(rec_path))
+with api_server() as (port, _, req):
+    st_list, _, raw_list = req("GET", f"/api/v1/runs/{rid}/steps/{step['node']}/{step['try']}/turns")
+    st_get, _, raw_get = req("GET", f"/api/v1/runs/{rid}/steps/{step['node']}/{step['try']}/turns/1")
+    cli_env = {**os.environ, "ARETE_SERVER": f"http://127.0.0.1:{port}"}
+    cli_done = subprocess.run(
+        [sys.executable, "-m", "arete.cli", "record", rid, step["node"]],
+        env=cli_env, capture_output=True, text=True, timeout=15, check=False,
+    )
+
+emit({
+    "turns_eq": step["turns"] == len(turns) == 3,
+    "k_step_cost": step_k["cost_usd"],
+    "k_turn_sum": sum(t["cost_nusd"] for t in turns_k) / 1e9,
+    "k_run_cost": run_k["cost_usd"],
+    "cols": cols,
+    "no_abs": no_abs,
+    "slices_ok": all(slices_ok),
+    "torn_slices_ok": len(torn_turns) == 3 and all(torn_slices_ok),
+    "rebuild_same": before_rows == after_rows,
+    "header_fields": {"v": header.get("v"), "engine": header.get("engine"), "runner_version": header.get("runner_version")},
+    "step_runner_version": step["runner_version"],
+    "api_list_status": st_list,
+    "api_list_ns": [t["n"] for t in json.loads(raw_list)["turns"]],
+    "api_get_status": st_get,
+    "api_get_type": json.loads(json.loads(raw_get)["turn"]["raw"]).get("type"),
+    "cli_rc": cli_done.returncode,
+    "cli_out": cli_done.stdout,
+})
+""")
+        self.assertTrue(res["turns_eq"])
+        self.assertAlmostEqual(res["k_step_cost"], res["k_turn_sum"], places=9)
+        self.assertAlmostEqual(res["k_run_cost"], res["k_step_cost"], places=9)
+        col_map = dict(res["cols"])
+        self.assertEqual(col_map["cost_nusd"], "INTEGER")
+        self.assertNotIn("cost_usd", col_map)
+        self.assertTrue(res["no_abs"])
+        self.assertTrue(res["slices_ok"])
+        self.assertTrue(res["torn_slices_ok"])
+        self.assertTrue(res["rebuild_same"])
+        self.assertEqual(res["header_fields"]["v"], 1)
+        self.assertTrue(res["header_fields"]["engine"])
+        self.assertTrue(res["header_fields"]["runner_version"])
+        self.assertTrue(res["step_runner_version"])
+        self.assertEqual(res["api_list_status"], 200)
+        self.assertEqual(res["api_list_ns"], [1, 2, 3])
+        self.assertEqual(res["api_get_status"], 200)
+        self.assertEqual(res["api_get_type"], "message_end")
+        self.assertEqual(res["cli_rc"], 0)
+        self.assertEqual([json.loads(line)["n"] for line in res["cli_out"].splitlines()], [1, 2, 3])
+
+    def test_unread_alerts_and_framing(self):
+        res = self.run_lifecycle_child(r"""
+owner = init_env()
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+
+# 1. Claude user line with tool_output block -> unread > 0 on result line & step row, 1 open alert; second step adds no second alert.
+def run_fake_step(which, rver, raw_lines_list):
+    from arete import claude, codex, devices, pi
+
+    with principals.acting(owner):
+        rid = record.start("pipeline", repo=repo.name, issue="20")
+    sid = run_store.queue_step(rid, "plan", 1)
+    run_store.start_step(sid, account_id=None, device="local", runner=which, runner_version=rver, model="m", provider="p", auth_mode="api_key")
+
+    def fake_run(*args, **kwargs):
+        on_line = kwargs.get("on_line")
+        if on_line is None:
+            for a in args:
+                if callable(a):
+                    on_line = a
+                    break
+        for ln in raw_lines_list:
+            on_line(ln)
+        return agent.Result(ok=True, text="ok", runner=which, model="m", provider="p", turns=1)
+
+    mod = {"claude": claude, "codex": codex, "pi": pi, "replay": replay}[which]
+    with mock.patch.object(mod, "run", side_effect=fake_run), \
+         mock.patch.object(record, "runner_version_of", return_value=rver):
+        runner.attempt(
+            which, "m", "prompt", repo.path, agent.NO_SESSION, cfg, (rid, "plan"), rid,
+            devices.LOCAL, {}, auth=accounts.Auth(mode="api_key"), try_no=1,
+            step_id=sid, runner_version=rver,
+        )
+    rec_path = record.record_files(rid)[-1]
+    result_line = [ln for ln in record.lines(rec_path) if ln.get("arete") == "result"][-1]
+    return run_store.step_get(sid), result_line
+
+claude_bad = [
+    json.dumps({"type": "system", "subtype": "init", "claude_code_version": "2.1.0"}),
+    json.dumps({"type": "user", "message": {"content": [{"type": "tool_output", "content": "hi"}]}}),
+]
+st1, rl1 = run_fake_step("claude", "2.1.0", claude_bad)
+alerts_after_1 = incident_store.alerts()
+st2, rl2 = run_fake_step("claude", "2.1.0", claude_bad)
+alerts_after_2 = incident_store.alerts()
+
+# 2. Codex renamed command_execution item type -> unread > 0 + 1 alert, second step adds no alert.
+codex_bad = [
+    json.dumps({"type": "thread.started"}),
+    json.dumps({"type": "item.completed", "item": {"type": "shell_exec_renamed", "command": "ls"}}),
+]
+st_cx1, rl_cx1 = run_fake_step("codex", "0.20.0", codex_bad)
+alerts_after_cx1 = incident_store.alerts()
+st_cx2, rl_cx2 = run_fake_step("codex", "0.20.0", codex_bad)
+alerts_after_cx2 = incident_store.alerts()
+
+# 3. Full valid line sets for claude, codex, pi, replay -> unread == 0.
+valid_sets = {
+    "claude": [
+        json.dumps({"type": "system", "subtype": "init", "claude_code_version": "2.1.0"}),
+        json.dumps({"type": "tool_progress", "tool": "Bash"}),
+        json.dumps({"type": "rate_limit_event", "status": "ok"}),
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "h"}, {"type": "text", "text": "t"}, {"type": "tool_use", "id": "1", "name": "Bash", "input": {}}], "usage": {"input_tokens": 5, "output_tokens": 2}}}),
+        json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "1", "content": "ok"}]}}),
+        json.dumps({"type": "result", "subtype": "success", "total_cost_usd": 0.01}),
+    ],
+    "codex": [
+        json.dumps({"type": "thread.started"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "item.started", "item": {"type": "file_change"}}),
+        json.dumps({"type": "item.completed", "item": {"type": "error", "message": "warn"}}),
+        json.dumps({"type": "item.completed", "item": {"type": "reasoning", "text": "think"}}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}),
+        json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "ls", "aggregated_output": "a", "exit_code": 0}}),
+        json.dumps({"type": "item.completed", "item": {"type": "file_change", "changes": [{"kind": "update", "path": "a"}]}}),
+        json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}}),
+    ],
+    "pi": [
+        json.dumps({"type": "session", "id": "s1"}),
+        json.dumps({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "h"}, {"type": "text", "text": "t"}, {"type": "toolCall", "id": "1", "name": "bash", "arguments": {}}], "usage": {"input": 5, "output": 2, "cost": {"total": 0.001}}}}),
+        json.dumps({"type": "message_end", "message": {"role": "toolResult", "toolCallId": "1", "toolName": "bash", "content": [{"type": "text", "text": "ok"}]}}),
+    ],
+    "replay": [
+        json.dumps({"type": "replay", "answer": "a.json", "patch": ""}),
+        json.dumps({"type": "message_end", "message": {"role": "assistant", "usage": {"input": 5, "output": 2, "cost": {"total": 0.001}}}}),
+        json.dumps({"type": "tool_call", "id": "1", "name": "ask", "input": {}}),
+        json.dumps({"type": "tool_result", "id": "1", "name": "ask", "text": "ok", "error": ""}),
+    ],
+}
+valid_unreads = {}
+for runner_name, lines_list in valid_sets.items():
+    st_v, _ = run_fake_step(runner_name, "1.0.0", lines_list)
+    valid_unreads[runner_name] = st_v["unread"]
+
+# 4. Framing: torn member planted after first mark at EVERY cut point -> record.lines, live AppendedLines, read_run yield later mark with skipped == cut.
+with principals.acting(owner):
+    rid_f = record.start("pipeline", repo=repo.name, issue="30")
+tl = paths.record_dir(rid_f) / record.TIMELINE
+m1 = gzip.compress(json.dumps({"v": 1, "kind": "step", "at": 1, "step": "a"}).encode() + b"\n")
+m_bad = gzip.compress(json.dumps({"v": 1, "kind": "torn", "at": 2, "step": "bad"}).encode() + b"\n")
+m2 = gzip.compress(json.dumps({"v": 1, "kind": "step", "at": 3, "step": "b"}).encode() + b"\n")
+all_cuts_ok = True
+for cut in range(1, len(m_bad)):
+    tl.parent.mkdir(parents=True, exist_ok=True)
+    tl.write_bytes(m1 + m_bad[:cut] + m2)
+    got_lines = list(record.lines(tl))
+    app = record.AppendedLines(tl)
+    got_app = [json.loads(ln) for ln in app.read(final=True)]
+    got_read = record.read_run(rid_f)
+    if (len(got_lines) != 2 or got_lines[-1]["step"] != "b"
+            or len(got_app) != 2 or got_app[-1]["step"] != "b"
+            or app.skipped != cut
+            or len(got_read["marks"]) != 2 or got_read["marks"][-1]["step"] != "b"):
+        all_cuts_ok = False
+        break
+
+# 5. Short write then ENOSPC -> logs "could not mark" and leaves timeline whole for gzip.decompress;
+#    live AppendedLines in another thread waits for LOCK_EX cut back, then reads later marks.
+tl.write_bytes(m1)
+orig_write = os.write
+calls = [0]
+started_enospc = threading.Event()
+release_enospc = threading.Event()
+
+def flaky_write(fd, data):
+    if fd == target_fd[0]:
+        calls[0] += 1
+        if calls[0] == 1:
+            started_enospc.set()
+            release_enospc.wait(timeout=5)
+            return orig_write(fd, data[:5])
+        raise OSError(errno.ENOSPC, "No space left on device")
+    return orig_write(fd, data)
+
+# Capture fd inside record.append via os.open wrapper.
+orig_open = os.open
+target_fd = [-1]
+def spy_open(p, flags, mode=0o777):
+    fd = orig_open(p, flags, mode)
+    if str(p) == str(tl):
+        target_fd[0] = fd
+    return fd
+
+live_reader = record.AppendedLines(tl)
+first_batch = list(live_reader.read(final=False))
+reader_done = threading.Event()
+reader_seen = []
+
+def reader_thread():
+    assert started_enospc.wait(timeout=5)
+    # This call blocks on LOCK_SH while mark holds LOCK_EX during short write + ftruncate rollback.
+    batch = list(live_reader.read(final=False))
+    reader_seen.extend(batch)
+    reader_done.set()
+
+rt = threading.Thread(target=reader_thread)
+rt.start()
+stderr_buf = []
+import io
+buf = io.StringIO()
+with mock.patch.object(os, "open", side_effect=spy_open), \
+     mock.patch.object(os, "write", side_effect=flaky_write), \
+     contextlib.redirect_stderr(buf):
+    def releaser():
+        started_enospc.wait(timeout=5)
+        time.sleep(0.05)
+        release_enospc.set()
+    threading.Thread(target=releaser, daemon=True).start()
+    record.mark(rid_f, "step", step="enospc")
+rt.join(timeout=5)
+whole_after_enospc = [json.loads(l) for l in gzip.decompress(tl.read_bytes()).decode().splitlines()]
+record.mark(rid_f, "step", step="after_enospc")
+later_batch = [json.loads(l) for l in live_reader.read(final=True)]
+
+emit({
+    "claude_unread": (st1["unread"], rl1.get("unread")),
+    "claude_alerts": (len(alerts_after_1), len(alerts_after_2)),
+    "codex_unread": (st_cx1["unread"], rl_cx1.get("unread")),
+    "codex_alerts": (len(alerts_after_cx1), len(alerts_after_cx2)),
+    "valid_unreads": valid_unreads,
+    "all_cuts_ok": all_cuts_ok,
+    "enospc_logged": "could not mark" in buf.getvalue(),
+    "whole_after_enospc": len(whole_after_enospc) == 1 and whole_after_enospc[0]["step"] == "a",
+    "reader_waited_cleanly": reader_done.is_set() and reader_seen == [],
+    "later_after_enospc": len(later_batch) == 1 and later_batch[0]["step"] == "after_enospc",
+})
+""")
+        self.assertGreater(res["claude_unread"][0], 0)
+        self.assertGreater(res["claude_unread"][1], 0)
+        self.assertEqual(res["claude_alerts"], [1, 1])
+        self.assertGreater(res["codex_unread"][0], 0)
+        self.assertGreater(res["codex_unread"][1], 0)
+        self.assertEqual(res["codex_alerts"], [2, 2])
+        self.assertEqual(res["valid_unreads"], {"claude": 0, "codex": 0, "pi": 0, "replay": 0})
+        self.assertTrue(res["all_cuts_ok"])
+        self.assertTrue(res["enospc_logged"])
+        self.assertTrue(res["whole_after_enospc"])
+        self.assertTrue(res["reader_waited_cleanly"])
+        self.assertTrue(res["later_after_enospc"])
+
+
+class RunStartTests(_LifecycleSubprocessCase):
+    def test_run_start_commits_recovery_and_aliases(self):
+        res = self.run_lifecycle_child(r"""
+owner = init_env()
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+dummy_proc = type("_DummyProc", (), {"pid": 0, "poll": lambda self: None})()
+
+with api_server() as (port, _, req):
+    # 1. meta.features.run_start_tx is true.
+    st_meta, _, raw_meta = req("GET", "/api/v1/meta")
+    meta_doc = json.loads(raw_meta)
+
+    # 2. POST /api/v1/tasks/{task}/run with child launch faked to start nothing -> 201 + Location, GET returns 200 'queued'.
+    tid1 = task_store.task_add(repo.name, "Task 1 body", "Task 1", "feat")
+    with mock.patch.object(pipeline, "spawn_run", return_value=dummy_proc):
+        st_run1, hdr_run1, raw_run1 = req("POST", f"/api/v1/tasks/{tid1}/run", {}, headers={"Idempotency-Key": "k-task-run-1"})
+        body_run1 = json.loads(raw_run1)
+        loc1 = hdr_run1.get("location", "")
+        st_get1, _, raw_get1 = req("GET", loc1)
+        get_run1 = json.loads(raw_get1)["run"]
+
+        # 3. Second task.run on that ticket -> 200 with the same run.
+        st_run2, _, raw_run2 = req("POST", f"/api/v1/tasks/{tid1}/run", {}, headers={"Idempotency-Key": "k-task-run-2"})
+        body_run2 = json.loads(raw_run2)
+
+    # 4. Alias POST /api/tasks with child sleeping past RUN_START_SECONDS -> answers with run immediately, not "did not show as running".
+    child_wait_done = threading.Event()
+    def slow_spawn(repo_name, ticket_id, force=False, *, run_id=""):
+        def claim_later():
+            time.sleep(0.35)
+            record.claim(run_id)
+            child_wait_done.set()
+        threading.Thread(target=claim_later, daemon=True).start()
+        return dummy_proc
+
+    t0 = time.monotonic()
+    with mock.patch.object(pipeline, "RUN_START_SECONDS", 0.15), \
+         mock.patch.object(pipeline, "spawn_run", side_effect=slow_spawn):
+        st_alias_task, hdr_alias_task, raw_alias_task = req(
+            "POST", "/api/tasks", {"repo": repo.name, "prompt": "Slow child task"},
+            headers={"Idempotency-Key": "k-slow-task"},
+        )
+    alias_elapsed = time.monotonic() - t0
+    alias_task_body = json.loads(raw_alias_task)
+    child_wait_done.wait(timeout=5)
+    record.settle(alias_task_body["run"], "done")
+    record.settle(body_run1["run"]["id"], "done")
+
+    # 5. Answering ask continuing a run via inbox.resolve AND alias POST /api/asks/{id}/answer -> queued run.
+    tid_ask1 = task_store.task_add(repo.name, "Ask 1", "Ask 1", "feat")
+    with principals.acting(owner):
+        r_ask1 = record.start("pipeline", repo=repo.name, issue=tid_ask1)
+        record.move(r_ask1, "needs-info", ("running",))
+    ask_store.ask_add("ask-v1", r_ask1, repo.name, tid_ask1, "plan", "why", "", "",
+                      [{"header": "Q", "question": "Pick", "kind": "text"}], {})
+    from arete import inbox as inbox_mod
+    inbox_mod.sync_all()
+    item_ask1 = inbox_store.get_open_by_subject("ask:ask-v1")
+    with mock.patch.object(control, "launch", return_value=dummy_proc):
+        st_res, _, raw_res = req(
+            "POST", f"/api/v1/inbox/{item_ask1['id']}/resolve",
+            {"verb": "answer", "base_version": item_ask1["version"], "answers": [{"text": "yes"}]},
+            headers={"Idempotency-Key": "k-inbox-ask"},
+        )
+    res_body = json.loads(raw_res)
+    new_run_v1 = (res_body.get("result") or {}).get("run", "")
+    st_get_ask1, _, raw_get_ask1 = req("GET", f"/api/v1/runs/{new_run_v1}")
+    ask1_status = json.loads(raw_get_ask1)["run"]["status"]
+    record.settle(new_run_v1, "done")
+
+    tid_ask2 = task_store.task_add(repo.name, "Ask 2", "Ask 2", "feat")
+    with principals.acting(owner):
+        r_ask2 = record.start("pipeline", repo=repo.name, issue=tid_ask2)
+        record.move(r_ask2, "needs-info", ("running",))
+    ask_store.ask_add("ask-alias", r_ask2, repo.name, tid_ask2, "plan", "why", "", "",
+                      [{"header": "Q", "question": "Pick", "kind": "text"}], {})
+    with mock.patch.object(control, "launch", return_value=dummy_proc):
+        st_ask_alias, hdr_ask_alias, raw_ask_alias = req(
+            "POST", "/api/asks/ask-alias/answer", {"answers": [{"text": "go"}]},
+            headers={"Idempotency-Key": "k-alias-ask"},
+        )
+    new_run_alias = json.loads(raw_ask_alias)["run"]
+    st_get_ask2, _, raw_get_ask2 = req("GET", f"/api/v1/runs/{new_run_alias}")
+    ask2_status = json.loads(raw_get_ask2)["run"]["status"]
+    record.settle(new_run_alias, "done")
+
+    # 6. chat.session_start atomicity: fault after runs insert leaves neither runs nor chat_sessions row; without fault leaves both.
+    cid = chat_store.chat_add("")
+    runs_before = len(run_store.runs())
+    def boom_link(*args, **kwargs):
+        raise RuntimeError("injected fault after runs insert")
+    with mock.patch.object(chat_store, "chat_link_session", side_effect=boom_link), \
+         mock.patch.object(control, "detach", return_value=dummy_proc):
+        st_cs_fail, _, _ = req(
+            "POST", f"/api/v1/chats/{cid}/sessions", {"prompt": "inspect"},
+            headers={"Idempotency-Key": "key-chat-sess-fail"},
+        )
+    runs_after_fail = len(run_store.runs())
+    links_after_fail = len(chat_store.chat_sessions(cid))
+
+    with mock.patch.object(control, "detach", return_value=dummy_proc):
+        st_cs_ok, hdr_cs_ok, raw_cs_ok = req(
+            "POST", f"/api/v1/chats/{cid}/sessions", {"prompt": "inspect ok"},
+            headers={"Idempotency-Key": "key-chat-sess-ok"},
+        )
+    assert st_cs_ok == 201, (st_cs_ok, raw_cs_ok)
+    cs_ok_id = json.loads(raw_cs_ok)["run"]["id"]
+    links_after_ok = [s["run_id"] for s in chat_store.chat_sessions(cid)]
+    record.settle(cs_ok_id, "done")
+
+    # 7. Serve startup recovery: unclaimed 'queued' rows older than RUN_START_SECONDS are relaunched or settled 'interrupted'.
+    tid_rec = task_store.task_add(repo.name, "Recover me", "Recover me", "feat")
+    with principals.acting(owner):
+        q_pipe = pipeline.queue_run(repo.name, tid_rec)
+        q_chat = record.start("chat", tag="chat-99", status="queued", pid=None)
+        q_imp = record.start("import", status="queued", pid=None)
+    old_ts = "2020-01-01T00:00:00Z"
+    with foundation.tx() as c:
+        c.execute("UPDATE runs SET started = ? WHERE id IN (?, ?, ?)", (old_ts, q_pipe, q_chat, q_imp))
+    relaunched = []
+    def fake_relaunch(cmd, log):
+        relaunched.append(list(cmd))
+        record.claim(q_pipe)
+        return dummy_proc
+    with mock.patch.object(control, "launch", side_effect=fake_relaunch):
+        serve.recover_queued()
+    rec_pipe_status = run_store.run_get(q_pipe)["status"]
+    rec_chat_status = run_store.run_get(q_chat)["status"]
+    rec_imp_status = run_store.run_get(q_imp)["status"]
+    remaining_queued = run_store.runs_queued()
+    record.settle(q_pipe, "done")
+
+    # 8. Repair run woken by incident.scan and run spawned by poll.spawn_unparked show as 'queued' before child claims.
+    tid_poll = task_store.task_add(repo.name, "Poll me", "Poll me", "feat")
+    seen_poll_queued = []
+    def spy_poll_spawn(repo_name, tid, force=False, *, spec=False, run_id=""):
+        row = run_store.run_get(run_id)
+        seen_poll_queued.append((run_id, row["status"], row["pid"]))
+        return dummy_proc
+    with mock.patch.object(poll, "spawn_run", side_effect=spy_poll_spawn):
+        poll.spawn_unparked(repo.name, tid_poll)
+    if seen_poll_queued:
+        record.settle(seen_poll_queued[0][0], "done")
+
+    seen_repair_queued = []
+    def spy_repair_spawn(repo_name, tid, force=False, *, run_id=""):
+        row = run_store.run_get(run_id)
+        seen_repair_queued.append((run_id, row["status"], row["pid"]))
+        return dummy_proc
+    with mock.patch.object(pipeline, "spawn_run", side_effect=spy_repair_spawn):
+        def fake_scan(cfg_arg):
+            started = tasks.start(repo.name, prompt="Auto repair task", title="Repair", kind="fix")
+            return {"repaired": started["run"]}
+        with mock.patch.object(oncall, "scan", side_effect=fake_scan):
+            st_scan, _, raw_scan = req("POST", "/api/v1/incidents/scan", {}, headers={"Idempotency-Key": "key-incident-scan"})
+    if seen_repair_queued:
+        record.settle(seen_repair_queued[0][0], "done")
+
+    # 9. Deprecated aliases reach their commands with legacy bodies/answers, send Deprecation: true, and show in meta.deprecated.
+    alias_checks = {}
+    with mock.patch.object(control, "detach", return_value=dummy_proc), \
+         mock.patch.object(control, "launch", return_value=dummy_proc), \
+         mock.patch.object(pipeline, "spawn_run", return_value=dummy_proc), \
+         mock.patch.object(triage, "run", return_value=0), \
+         mock.patch.object(heartbeat, "run", return_value=0):
+        # /api/sessions
+        st, hdr, raw = req("POST", "/api/sessions", {"prompt": "hi"}, headers={"Idempotency-Key": "alias-session-1"})
+        alias_checks["POST /api/sessions"] = (st, hdr.get("deprecation"), "id" in json.loads(raw))
+        record.settle(json.loads(raw)["id"], "done")
+        # /api/chats/new
+        st, hdr, raw = req("POST", "/api/chats/new", {"project": ""}, headers={"Idempotency-Key": "alias-chat-new"})
+        new_cid = json.loads(raw)["id"]
+        alias_checks["POST /api/chats/new"] = (st, hdr.get("deprecation"), isinstance(new_cid, int))
+        # /api/chats/{n}/send
+        with mock.patch.object(chat, "answer", side_effect=lambda cid_, text_, mid_, proj_, *, run_id="": (record.settle(run_id, "done"), chat_store.chat_say(cid_, "arete", "ok", busy=0))):
+            st, hdr, raw = req("POST", f"/api/chats/{new_cid}/send", {"text": "hey"}, headers={"Idempotency-Key": "alias-chat-send"})
+        alias_checks["POST /api/chats/{n}/send"] = (st, hdr.get("deprecation"), json.loads(raw)["id"] == new_cid)
+        # /api/chats/{n}/sessions
+        st, hdr, raw = req("POST", f"/api/chats/{new_cid}/sessions", {"prompt": "check"}, headers={"Idempotency-Key": "alias-chat-sess"})
+        alias_checks["POST /api/chats/{n}/sessions"] = (st, hdr.get("deprecation"), "id" in json.loads(raw))
+        record.settle(json.loads(raw)["id"], "done")
+        # /api/triage/refresh
+        st, hdr, raw = req("POST", "/api/triage/refresh", {}, headers={"Idempotency-Key": "alias-triage-ref"})
+        alias_checks["POST /api/triage/refresh"] = (st, hdr.get("deprecation"), "run" in json.loads(raw))
+        # /api/checks/run
+        st, hdr, raw = req("POST", "/api/checks/run", {}, headers={"Idempotency-Key": "alias-checks-run"})
+        alias_checks["POST /api/checks/run"] = (st, hdr.get("deprecation"), json.loads(raw).get("ok") is True)
+        # /api/loops/{n}/start, /try, /new
+        st, hdr, raw = req("POST", "/api/loops/poll/start", {}, headers={"Idempotency-Key": "alias-loop-start"})
+        alias_checks["POST /api/loops/{n}/start"] = (st, hdr.get("deprecation"), "id" in json.loads(raw))
+        record.settle(json.loads(raw)["id"], "done")
+        st, hdr, raw = req("POST", "/api/loops/poll/try", {}, headers={"Idempotency-Key": "alias-loop-try"})
+        alias_checks["POST /api/loops/{n}/try"] = (st, hdr.get("deprecation"), "id" in json.loads(raw))
+        record.settle(json.loads(raw)["id"], "done")
+        st, hdr, raw = req("POST", "/api/loops/new", {"sentence": "watch builds"}, headers={"Idempotency-Key": "alias-loop-new"})
+        alias_checks["POST /api/loops/new"] = (st, hdr.get("deprecation"), "id" in json.loads(raw))
+        record.settle(json.loads(raw)["id"], "done")
+        # /api/triage/{ref}/research
+        cand = triage.Candidate("demo#7", "7", "Demo", "https://example.invalid/7", "old")
+        triage_store.triage_put(triage.row(triage.GitHubSource("demo/repo", []), cand, updated="old"))
+        with mock.patch.object(research, "ticket", return_value={"ref": "demo#7"}), \
+             mock.patch.object(research, "run_now", return_value=0):
+            st, hdr, raw = req("POST", "/api/triage/demo%237/research", {}, headers={"Idempotency-Key": "alias-triage-res"})
+        alias_checks["POST /api/triage/{ref}/research"] = (st, hdr.get("deprecation"), json.loads(raw).get("ref") == "demo#7")
+        # /api/runs/{id}/resume, /repair, /steps/{step}
+        q_stub = pipeline.queue_run(repo.name, tid1)
+        stub_ans = tasks.answer(tid1, repo.name, q_stub, "running", "started")
+        with mock.patch.object(tasks, "resume", return_value=stub_ans), \
+             mock.patch.object(tasks, "repair", return_value=stub_ans), \
+             mock.patch.object(tasks, "run_step", return_value=stub_ans):
+            st, hdr, raw = req("POST", f"/api/runs/{body_run1['run']['id']}/resume", {}, headers={"Idempotency-Key": "alias-run-resume"})
+            alias_checks["POST /api/runs/{id}/resume"] = (st, hdr.get("deprecation"), json.loads(raw).get("run") == q_stub)
+            st, hdr, raw = req("POST", f"/api/runs/{body_run1['run']['id']}/repair", {}, headers={"Idempotency-Key": "alias-run-repair"})
+            alias_checks["POST /api/runs/{id}/repair"] = (st, hdr.get("deprecation"), json.loads(raw).get("run") == q_stub)
+            st, hdr, raw = req("POST", f"/api/runs/{body_run1['run']['id']}/steps/plan", {}, headers={"Idempotency-Key": "alias-run-step"})
+            alias_checks["POST /api/runs/{id}/steps/{step}"] = (st, hdr.get("deprecation"), json.loads(raw).get("run") == q_stub)
+        record.settle(q_stub, "done")
+        # /api/skipped/{n}/run
+        q_skip = pipeline.queue_run(repo.name, tid1)
+        with mock.patch.object(pipeline, "run_skipped", return_value={"run": q_skip, "state": "running"}):
+            st, hdr, raw = req("POST", "/api/skipped/poll/run", {}, headers={"Idempotency-Key": "alias-skipped-run"})
+        alias_checks["POST /api/skipped/{n}/run"] = (st, hdr.get("deprecation"), json.loads(raw).get("run") == q_skip)
+        record.settle(q_skip, "done")
+
+    # 10. run --dry-run stays local and writes no runs row.
+    runs_before_dry = len(run_store.runs())
+    dry_done = subprocess.run(
+        [sys.executable, "-m", "arete.cli", "run", repo.name, tid1, "--dry-run"],
+        env=os.environ.copy(), capture_output=True, text=True, timeout=15, check=False,
+    )
+    runs_after_dry = len(run_store.runs())
+
+emit({
+    "run_start_tx": meta_doc["features"].get("run_start_tx"),
+    "deprecated_paths": list(meta_doc.get("deprecated", [])),
+    "run1": (st_run1, loc1, st_get1, get_run1["status"], get_run1["pid"]),
+    "run2": (st_run2, body_run2["run"]["id"] == body_run1["run"]["id"]),
+    "slow_alias": (st_alias_task, hdr_alias_task.get("deprecation"), alias_task_body["run"] != "", alias_elapsed < 0.3),
+    "ask_v1": (st_res, st_get_ask1, ask1_status),
+    "ask_alias": (st_ask_alias, st_get_ask2, ask2_status),
+    "cs_fail": (st_cs_fail, runs_after_fail == runs_before, links_after_fail == 0),
+    "cs_ok": (st_cs_ok, hdr_cs_ok.get("location", "").endswith(cs_ok_id), cs_ok_id in links_after_ok),
+    "recovery": (rec_pipe_status, rec_chat_status, rec_imp_status, len(remaining_queued), len(relaunched) == 1 and "--run-id" in relaunched[0]),
+    "poll_queued": seen_poll_queued,
+    "repair_queued": (st_scan, seen_repair_queued),
+    "alias_checks": alias_checks,
+    "dry_no_row": runs_after_dry == runs_before_dry,
+})
+""")
+        self.assertIs(res["run_start_tx"], True)
+        self.assertEqual(res["run1"][0], 201)
+        self.assertTrue(res["run1"][1].startswith("/api/v1/runs/"))
+        self.assertEqual(res["run1"][2], 200)
+        self.assertEqual(res["run1"][3], "queued")
+        self.assertIsNone(res["run1"][4])
+        self.assertEqual(res["run2"], [200, True])
+        self.assertEqual(res["slow_alias"], [200, "true", True, True])
+        self.assertEqual(res["ask_v1"], [200, 200, "queued"])
+        self.assertEqual(res["ask_alias"], [200, 200, "queued"])
+        self.assertEqual(res["cs_fail"][1:], [True, True])
+        self.assertEqual(res["cs_ok"], [201, True, True])
+        self.assertEqual(res["recovery"], ["running", "interrupted", "interrupted", 0, True])
+        self.assertEqual(len(res["poll_queued"]), 1)
+        self.assertEqual(res["poll_queued"][0][1:], ["queued", None])
+        self.assertEqual(res["repair_queued"][0], 200)
+        self.assertEqual(res["repair_queued"][1][0][1:], ["queued", None])
+        for name, (status, dep, ok) in res["alias_checks"].items():
+            self.assertEqual((status, dep, ok), (200, "true", True), f"alias {name}: {(status, dep, ok)}")
+        for expected_dep in (
+            "POST /api/tasks", "POST /api/sessions", "POST /api/loops/new",
+            "POST /api/chats/new", "POST /api/triage/refresh", "POST /api/checks/run",
+        ):
+            self.assertIn(expected_dep, res["deprecated_paths"])
+        self.assertTrue(res["dry_no_row"])

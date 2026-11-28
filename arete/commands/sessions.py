@@ -87,27 +87,32 @@ def attached(session_id: str, *, remote=True, summary="") -> int:
 
 @chat_routed
 def session_start(args) -> int:
-    from .. import sessions
-
     tools = [t.strip() for t in args.tools.split(",") if t.strip()] if args.tools is not None else None
     prompt = " ".join(args.prompt)
-    if args.task or args.draft_pr:
-        s = sessions.launch(prompt, device=args.device, model=args.model, run_with=args.runner,
-                            tools=tools, repo=args.repo or "", budget_usd=args.budget, task=args.task,
-                            draft_pr=args.draft_pr)
-    else:
-        s = client.call("POST", "/api/sessions", {"prompt": prompt, "device": args.device, "model": args.model,
-                                                "runner": args.runner, "tools": tools, "repo": args.repo or "",
-                                                "budget_usd": args.budget})
-    identity, task = s["id"], s["task"]
-    summary = (f"session {identity}: {s['runner']} {s['model']} on {s['device']} in {paths.short_path(s['cwd'])}"
-               + (f" on {s['branch']}" if s["branch"] else "") + f"; tools {', '.join(s['tools']) or 'none'}")
+    payload: dict[str, object] = {
+        "prompt": prompt, "device": args.device, "model": args.model,
+        "runner": args.runner, "repo": args.repo or "", "budget_usd": args.budget,
+    }
+    if tools is not None:
+        payload["tools"] = tools
+    if args.task:
+        payload["task"] = True
+    if args.draft_pr:
+        payload["draft_pr"] = True
+    res = client.call("POST", "/api/v1/sessions", payload)
+    s = res["session"] if isinstance(res.get("session"), dict) else res
+    identity = client.field(s, "id")
+    task = bool(client.field(s, "task"))
+    summary = (f"session {identity}: {client.field(s, 'runner')} {client.field(s, 'model')} on {client.field(s, 'device')} "
+               f"in {paths.short_path(client.field(s, 'cwd'))}"
+               + (f" on {s['branch']}" if client.field(s, "branch") else "")
+               + f"; tools {', '.join(client.field(s, 'tools', kind=list)) or 'none'}")
     if not args.attach:
         print(summary)
         print(f"`arete session report {identity}` prints its report when it ends" if task
               else f"`arete session attach {identity}` follows it and sends what you type")
         return 0
-    return attached(identity, remote=not (args.task or args.draft_pr), summary=summary)
+    return attached(identity, remote=True, summary=summary)
 
 
 @local_only

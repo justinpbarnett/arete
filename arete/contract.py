@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 21
+MINOR = 22
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -42,6 +42,16 @@ RUN_TEXT = ("id", "kind", "repo", "issue", "loop", "loop_kind", "started", "fini
             "restart", "started_by", "payer", "adw", "adw_version", "adw_rule")
 RUN_NUMBERS = ("pid", "cost_usd", "tokens_in", "tokens_out", "active_seconds", "verify_seconds", "verify_open_seconds",
                "repair_calls", "schema_version", "attempts", "version", "seq", "lease_id")
+RUN_STEP_SUMMARY = obj({
+    "id": INTEGER,
+    "node": STRING,
+    "try": INTEGER,
+    "status": STRING,
+    "queued_at": {"type": ["string", "null"]},
+    "model": STRING,
+    "account": {"type": ["string", "null"]},
+    "cost_usd": NUMBER,
+}, ["node", "try", "status"])
 RUN = obj({**{k: {"type": ["string", "null"]} for k in RUN_TEXT},
            **{k: {"type": ["number", "null"]} for k in RUN_NUMBERS}}, ["id", "status", "version"])
 RUN["properties"]["issue"] = {"type": ["integer", "string", "null"]}
@@ -88,7 +98,11 @@ RESOURCE = {
                  "inputs": {"type": ["array", "null"], "items": mapping(JSON)},
                  "prompt_version": NULL_TEXT,
                  "prompt_level": NULL_TEXT,
-                 "schema_version": NULL_TEXT},
+                 "schema_version": NULL_TEXT,
+                 "node": STRING, "try": INTEGER, "status": STRING, "queued_at": NULL_TEXT,
+                 "waiting_since": NULL_TEXT, "device": NULL_TEXT, "account": NULL_TEXT,
+                 "chat_id": {"type": ["integer", "null"]}, "version": INTEGER,
+                 "runner_version": NULL_TEXT, "unread": INTEGER},
                 ["id", "run_id", "name", "model", "runner", "cost_usd", "seconds"]),
     "loop": obj({"id": STRING, "enabled": BOOLEAN, "detail": LOOP}),
     "incident": obj({"id": STRING, "detail": INCIDENT}),
@@ -258,9 +272,10 @@ META = envelope({"api": obj({"version": STRING, "minor": INTEGER, "contract_sha"
                  "instance": obj(dict.fromkeys(("id", "tag", "name", "created"), STRING)),
                  "schema": obj({"version": INTEGER, "oldest_writer": {"type": ["integer", "null"]}}),
                  "stream": obj({"complete": BOOLEAN, "head": STRING, "trim": mapping(STRING)}),
-                 "features": obj({"inbox": BOOLEAN, "outbox": BOOLEAN}, ["inbox"]),
+                 "features": obj({"inbox": BOOLEAN, "outbox": BOOLEAN, "run_start_tx": BOOLEAN}, ["inbox"]),
+                 "deprecated": array(STRING),
                  "push": obj({"vapid_public_key": STRING})})
-META["required"] = [k for k in META["required"] if k not in ("features", "push")]
+META["required"] = [k for k in META["required"] if k not in ("features", "deprecated", "push")]
 ROLE_ENUM = {**STRING, "enum": list(configkinds.ROLE_NAMES)}
 ROLE_LEVEL = {"type": ["string", "null"],
               "enum": ["inherit", "engine", "config", "config kind", "layer", "layer kind", "arm", "run", None]}
@@ -380,9 +395,13 @@ PLURALS.update(research="research", triage="triage")
 for _name, _shape in RESOURCE.items():
     _plural = PLURALS[_name]
     _selectors = {"run": STRING} if _name == "step" else {}
+    _get_envelope = (
+        envelope({_name: _shape, "steps": array(RUN_STEP_SUMMARY)}, ["seq", _name])
+        if _name == "run" else envelope({_name: _shape})
+    )
     OPERATIONS += [operation(f"{_name}.list", _plural, envelope({_plural: array(_shape)}),
                              obj(_selectors, list(_selectors)), dict.fromkeys(_selectors, "example")),
-                   operation(f"{_name}.get", _plural + "/{id}", envelope({_name: _shape}),
+                   operation(f"{_name}.get", _plural + "/{id}", _get_envelope,
                              obj({"id": STRING, **_selectors}), {"id": "example", **dict.fromkeys(_selectors, "example")})]
 CONFIG_KIND = {"type": "string", "enum": list(configkinds.REGISTRY)}
 CONFIG_NAME = {**STRING, "pattern": f"^(?:{configkinds.NAME_PATTERN}|{configkinds.DEFAULTS_LAYER_ADDRESS})$",
@@ -483,8 +502,10 @@ OPERATIONS += [
     operation("health.get", "health", envelope({"health": HEALTH})),
     operation("status.get", "status", envelope({"snapshot": mapping(JSON), "loops": array(mapping(JSON)),
               "records": PANEL}), obj({"limit": STRING}, [])),
-    operation("task.create", "tasks", envelope({"task": TASK}),
-              obj({"repo": STRING, "body": STRING, "title": STRING, "kind": STRING}, ["repo", "body"]),
+    operation("task.create", "tasks", envelope({"task": TASK, "run": {"anyOf": [RUN, {"type": "null"}]},
+                                                "state": STRING, "why": STRING}, ["seq", "task"]),
+              obj({"repo": STRING, "body": STRING, "title": STRING, "kind": STRING, "ticket": STRING,
+                   "start": BOOLEAN, "force": BOOLEAN}, ["repo"]),
               {"repo": "example", "body": "Work to do"}, "POST"),
     operation("task.update", "tasks/{id}", envelope({"task": TASK}),
               obj({"id": STRING, "base_version": {**INTEGER, "minimum": 1}, "title": STRING, "body": STRING,
@@ -686,6 +707,110 @@ OPERATIONS += [
               {"item": "OB-1", "base_version": 1}, "POST", errors=("invalid_state",)),
     operation("outbox.history", "outbox/{item}/history", envelope({"events": array(INBOX_EVENT)}),
               obj({"item": STRING}), {"item": "OB-1"}),
+]
+TURN = obj({
+    "step_id": INTEGER,
+    "n": INTEGER,
+    "run_id": STRING,
+    "at": STRING,
+    "status": STRING,
+    "tool": STRING,
+    "excerpt": STRING,
+    "seconds": NUMBER,
+    "tokens_in": INTEGER,
+    "cache_read": INTEGER,
+    "tokens_out": INTEGER,
+    "cost_nusd": NULL_INT,
+    "file": STRING,
+    "member_offset": INTEGER,
+    "member_len": INTEGER,
+})
+TURN_DETAIL = obj({
+    **TURN["properties"],
+    "raw": STRING,
+    "lines": array(mapping(JSON)),
+    "events": array(mapping(JSON)),
+})
+NULL_RUN = {"anyOf": [RUN, {"type": "null"}]}
+EVENTS_INPUT = {"anyOf": [array(mapping(JSON)), STRING]}
+OPERATIONS += [
+    operation("turn.list", "runs/{run}/steps/{node}/{try}/turns",
+              envelope({"turns": array(TURN)}),
+              obj({"run": STRING, "node": STRING, "try": STRING}),
+              {"run": "pip-demo-1", "node": "plan", "try": "1"}),
+    operation("turn.get", "runs/{run}/steps/{node}/{try}/turns/{n}",
+              envelope({"turn": TURN_DETAIL}),
+              obj({"run": STRING, "node": STRING, "try": STRING, "n": STRING}),
+              {"run": "pip-demo-1", "node": "plan", "try": "1", "n": "1"}),
+    operation("task.run", "tasks/{task}/run",
+              envelope({"run": NULL_RUN, "task": STRING, "repo": STRING, "state": STRING, "why": STRING}, ["seq", "run"]),
+              obj({"task": STRING, "repo": STRING, "force": BOOLEAN}, ["task"]),
+              {"task": "t-a1b2"}, "POST", success_status=201),
+    operation("session.start", "sessions",
+              envelope({"run": RUN, "session": mapping(JSON)}, ["seq", "run"]),
+              obj({"prompt": STRING, "device": STRING, "model": STRING, "runner": STRING,
+                   "tools": {"anyOf": [array(STRING), {"type": "null"}]}, "repo": STRING,
+                   "budget_usd": {"type": ["number", "null"]}, "task": BOOLEAN, "draft_pr": BOOLEAN}, ["prompt"]),
+              {"prompt": "Check the build"}, "POST", success_status=201),
+    operation("run.resume", "runs/{run}/resume",
+              envelope({"run": RUN}, ["seq", "run"]),
+              obj({"run": STRING, "step": STRING, "node": STRING, "base_version": {**INTEGER, "minimum": 1}}, ["run"]),
+              {"run": "pip-demo-1"}, "POST", success_status=201),
+    operation("run.repair", "runs/{run}/repair",
+              envelope({"run": RUN}, ["seq", "run"]),
+              obj({"run": STRING, "base_version": {**INTEGER, "minimum": 1}}, ["run"]),
+              {"run": "pip-demo-1"}, "POST", success_status=201),
+    operation("run.step", "runs/{run}/step",
+              envelope({"run": RUN}, ["seq", "run"]),
+              obj({"run": STRING, "node": STRING, "set": mapping(JSON),
+                   "base_version": {**INTEGER, "minimum": 1}}, ["run", "node"]),
+              {"run": "pip-demo-1", "node": "plan"}, "POST", success_status=201),
+    operation("run.import", "runs",
+              envelope({"run": RUN}, ["seq", "run"]),
+              obj({"kind": STRING, "repo": STRING, "issue": {"type": ["integer", "string", "null"]},
+                   "summary": STRING, "branch": STRING, "pr_url": STRING}, ["kind"]),
+              {"kind": "import", "summary": "Imported run"}, "POST", success_status=201),
+    operation("loop.start", "loops/{loop}/start",
+              envelope({"run": RUN}, ["seq", "run"]),
+              obj({"loop": STRING, "events": EVENTS_INPUT}, ["loop"]),
+              {"loop": "poll"}, "POST", success_status=201),
+    operation("loop.try", "loops/{loop}/try",
+              envelope({"run": RUN}, ["seq", "run"]),
+              obj({"loop": STRING, "events": EVENTS_INPUT}, ["loop"]),
+              {"loop": "poll"}, "POST", success_status=201),
+    operation("loop.draft", "loops",
+              envelope({"run": RUN}, ["seq", "run"]),
+              obj({"sentence": STRING, "name": STRING, "repo": STRING, "model": STRING}, ["sentence"]),
+              {"sentence": "Watch the build logs"}, "POST", success_status=201),
+    operation("chat.create", "chats",
+              envelope({"chat": CHAT, "run": NULL_RUN}, ["seq", "chat"]),
+              obj({"project": STRING, "text": STRING}, []),
+              {"project": ""}, "POST", success_status=201),
+    operation("chat.send", "chats/{chat}/messages",
+              envelope({"chat": CHAT, "run": NULL_RUN}, ["seq", "chat", "run"]),
+              obj({"chat": STRING, "text": STRING}, ["chat", "text"]),
+              {"chat": "1", "text": "Hello"}, "POST", success_status=201),
+    operation("chat.session_start", "chats/{chat}/sessions",
+              envelope({"run": RUN, "session": mapping(JSON)}, ["seq", "run"]),
+              obj({"chat": STRING, "prompt": STRING, "repo": NULL_TEXT, "device": STRING, "model": STRING,
+                   "runner": STRING, "budget_usd": {"type": ["number", "null"]}}, ["chat", "prompt"]),
+              {"chat": "1", "prompt": "Inspect tests"}, "POST", success_status=201),
+    operation("triage.refresh", "triage/refresh",
+              envelope({"ok": BOOLEAN, "code": INTEGER, "run": NULL_TEXT}, ["seq", "ok"]),
+              obj({"dry_run": BOOLEAN}, []),
+              {}, "POST"),
+    operation("triage.research", "triage/{ticket}/research",
+              envelope({"ref": STRING, "code": INTEGER, "run": NULL_TEXT}, ["seq", "ref"]),
+              obj({"ticket": STRING, "force": BOOLEAN, "dry_run": BOOLEAN, "next": BOOLEAN}, ["ticket"]),
+              {"ticket": "demo#7"}, "POST"),
+    operation("health.check", "health/check",
+              envelope({"ok": BOOLEAN, "code": INTEGER}, ["seq", "ok"]),
+              obj({"dry_run": BOOLEAN, "force_probes": BOOLEAN, "quiet": BOOLEAN}, []),
+              {}, "POST"),
+    operation("incident.scan", "incidents/scan",
+              envelope({"summary": {"anyOf": [mapping(JSON), {"type": "null"}]}}, ["seq", "summary"]),
+              obj({}, []),
+              {}, "POST"),
 ]
 for _op in OPERATIONS:
     if _op["name"] in ("run.stop", "serve.install"):
@@ -929,9 +1054,24 @@ ALIAS_VARIANTS = {"post_run": ("stop", "answer", "resume", "repair", "steps/{ste
                   "post_proposal": ("done", "approve", "reject"), "post_skipped": ("run",),
                   "post_ask": ("answer",), "post_capture_evidence": ("drop",),
                   "get_chat": ("sessions", "sessions/{session}/report")}
+DEPRECATED_ALIASES = frozenset((
+    ("POST", "/api/skipped/*"),
+    ("POST", "/api/tasks"),
+    ("POST", "/api/sessions"),
+    ("POST", "/api/runs/*"),
+    ("POST", "/api/asks/*"),
+    ("POST", "/api/loops/new"),
+    ("POST", "/api/loops/*"),
+    ("POST", "/api/chats/new"),
+    ("POST", "/api/chats/*"),
+    ("POST", "/api/triage/refresh"),
+    ("POST", "/api/triage/*"),
+    ("POST", "/api/checks/run"),
+))
 ALIASES.extend({"method": method, "path": path, "provider": provider, "adapter": "frozen-v0",
                 "input": alias_input(provider, "") if method == "POST" else obj({}),
-                "actions": {action: alias_input(provider, "id/" + action) for action in ALIAS_VARIANTS.get(provider, ())}}
+                "actions": {action: alias_input(provider, "id/" + action) for action in ALIAS_VARIANTS.get(provider, ())},
+                **({"deprecated": True} if (method, path) in DEPRECATED_ALIASES else {})}
                for method, path, provider in ALIAS_ROUTES)
 ALIASES[:0] = [{"method": method, "path": path, "provider": provider, "adapter": "identity", "transport": True,
                "input": mapping(STRING) if method == "POST" else obj({})} for method, path, provider in (

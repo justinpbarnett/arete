@@ -548,9 +548,29 @@ def cleanup(folder: Path) -> None:
         folder.rmdir()
 
 
+_VERSION: str | None = None
+
+
 def binary() -> str:
     installed = sorted((paths.HOME / ".nvm" / "versions" / "node").glob("v*/bin/pi"), key=lambda p: p.parent.parent.name)
     return shutil.which("pi") or (str(installed[-1]) if installed else "pi")
+
+
+def version() -> str:
+    global _VERSION
+    if _VERSION is not None:
+        return _VERSION
+    try:
+        found = util.sh([binary(), "--version"], timeout=10)
+    except OSError:
+        _VERSION = ""
+        return _VERSION
+    if found.returncode != 0:
+        _VERSION = ""
+        return _VERSION
+    words = found.stdout.strip().split()
+    _VERSION = next((w for w in words if w and w[0].isdigit()), words[-1] if words else "")
+    return _VERSION
 
 
 def is_pattern_rule(rule: str) -> bool:

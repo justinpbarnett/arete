@@ -3276,13 +3276,32 @@ class PollFixture(Isolated):
             return pipeline.run_issue(repo, tid, script=script, force=force)
 
     def poll_with(self, cfg, spawn, *, dry_run=False):
+        pending_run_id: list[str] = []
+        orig_run_issue = pipeline.run_issue
+
         def launch_pending(repo, tid, launch):
             with launch_lease.acquiring(repo, tid):
                 return launch()
 
+        def wrap_spawn(repo, tid, *args, run_id="", **kwargs):
+            if run_id:
+                pending_run_id.append(run_id)
+            try:
+                return spawn(repo, tid, *args, **kwargs)
+            finally:
+                if run_id and pending_run_id and pending_run_id[-1] == run_id:
+                    pending_run_id.pop()
+
+        def wrap_run_issue(*args, **kwargs):
+            if pending_run_id and not kwargs.get("run_id"):
+                kwargs["run_id"] = pending_run_id.pop()
+            return orig_run_issue(*args, **kwargs)
+
         with patch.object(config, "load", return_value=cfg), patch.object(poll, "runnable", return_value=True), \
                 patch.object(tasks, "spawn_pending", side_effect=launch_pending), \
-                patch.object(poll, "spawn_run", side_effect=spawn), \
+                patch.object(tasks, "spawn_queued", side_effect=launch_pending), \
+                patch.object(poll, "spawn_run", side_effect=wrap_spawn), \
+                patch.object(pipeline, "run_issue", side_effect=wrap_run_issue), \
                 patch.object(poll, "network_up_or_skip", return_value=True), \
                 patch.object(poll, "settle_abandoned_runs"), patch.object(outcomes, "sync_outcomes"), \
                 patch.object(outcomes, "sync_moves"), patch.object(outcomes, "sync_landings"), \
@@ -4040,14 +4059,17 @@ class AnswerContinuationBudgetTests(OwnerAnswerBudgetFixture):
             return "interrupted", "stopped before the answer was consumed", ""
 
         def launch(command, log):
-            self.assertEqual(command[-5:], ["--force", "--continue", asked.id, "--restart", "answer"])
+            self.assertEqual(command[-7:-2], ["--force", "--continue", asked.id, "--restart", "answer"])
+            self.assertEqual(command[-2], "--run-id")
+            queued_id = command[-1]
             script = pipeline.Script("feature", work, continues=asked.id)
-            self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, force=True, script=script), 1)
-            return run_store.newest_whole_run(self.repo.name, self.ticket)["id"]
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, force=True, script=script,
+                                                run_id=queued_id), 1)
+            return SimpleNamespace(pid=0)
 
         with patch.object(config, "load", return_value=self.cfg), \
                 patch.object(pipeline, "run_refusal", return_value=(True, "")), \
-                patch.object(tasks, "spawned", side_effect=lambda repo, tid, spawn: (spawn(), "interrupted")), \
+                patch.object(tasks, "spawn_queued", side_effect=lambda repo, tid, spawn: spawn()), \
                 patch.object(tasks.control, "launch", side_effect=launch):
             started = tasks.answer_ask("ask-fixture", {"answers": [{"text": "See the attached log."}]})
             answered = started["run"]
@@ -5992,7 +6014,9 @@ class BudgetReadmissionTests(ReadmissionFixture):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(self.poll_with(self.cfg, spawn), 0)
             self.assertIn(f"parked after run {parked.id}", output.getvalue())
-            self.assertEqual([row["id"] for row in run_store.ticket_runs(self.repo.name, self.ticket)], [parked.id])
+            claimed_runs = [row["id"] for row in run_store.ticket_runs(self.repo.name, self.ticket)
+                            if row["pid"] is not None]
+            self.assertEqual(claimed_runs, [parked.id])
 
     def test_poll_does_not_repeat_a_launch_that_exits_before_registration(self):
         self.park_ticket()
@@ -6000,6 +6024,9 @@ class BudgetReadmissionTests(ReadmissionFixture):
 
         def spawn(repo, tid):
             starts.append(tid)
+            for row in run_store.runs_queued():
+                if row["repo"] == repo and str(row["issue"]) == str(tid):
+                    record.settle(row["id"], "stopped", summary="exited before claim")
 
         for body in ("First edit", "Second edit"):
             with foundation.db() as connection:
@@ -6247,6 +6274,12 @@ class EnvironmentRequeueTests(Isolated):
         self.authority = self.root / "authority"
         api = support.parentless_github_issue(self.repo.github, self.issue, self.issue_view)
         self.patches.enter_context(patch.object(gh, "gh_json", side_effect=api))
+        def record_queued_start(repo, tid, launch):
+            self.started.append(tid)
+            for row in run_store.runs_queued():
+                if row["repo"] == repo and str(row["issue"]) == str(tid):
+                    record.settle(row["id"], "stopped", summary="fixture stub")
+
         for module, name, func in (
             (config, "load", lambda: self.cfg),
             (codebase, "STAMP", "old-engine"),
@@ -6270,6 +6303,7 @@ class EnvironmentRequeueTests(Isolated):
             (pipeline, "SKIPPED_FILE", self.root / "skipped.json"),
             (pipeline, "wanted", lambda repo: "classic"),
             (tasks, "spawn_pending", lambda repo, tid, launch: self.started.append(tid)),
+            (tasks, "spawn_queued", record_queued_start),
         ):
             self.patches.enter_context(patch.object(module, name, func))
         with scratch.authority_fd(create=True) as fd:

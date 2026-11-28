@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import json
 import math
+import re
 import sqlite3
 
 from .. import refusals, util
@@ -10,10 +11,12 @@ from ..agent import billing_of
 from . import events, writes
 from ._rows import json_dict, validate_columns
 from .db import (
+    RECORD_TURNS_SCHEMA,
     RUNS_ADW_SCHEMA,
     RUNS_LINEAGE_SCHEMA,
     RUNS_PINS_SCHEMA,
     RUNS_PROMPT_BINDING_SCHEMA,
+    STEPS_LIFECYCLE_SCHEMA,
     db,
     migration_applied,
     reader,
@@ -24,6 +27,7 @@ STEP_LABEL_FIELDS = frozenset(("atom", "ab", "ab_side", "effort", "tier", "kind"
 PINS_RUN_FIELDS = frozenset(("config_commit", "resolved_sha"))
 LINEAGE_RUN_FIELDS = frozenset(("continues", "chain", "restart", "started_by", "payer", "seq"))
 ADW_RUN_FIELDS = frozenset(("adw", "adw_version", "adw_rule"))
+_CHAT_STEP_RE = re.compile(r"^chat (\d+)(?: (.+))?$")
 
 
 def has_pins(c) -> bool:
@@ -40,6 +44,28 @@ def has_lineage(c) -> bool:
 
 def has_adw(c) -> bool:
     return migration_applied(RUNS_ADW_SCHEMA, c)
+
+
+def has_steps_lifecycle(c) -> bool:
+    return migration_applied(STEPS_LIFECYCLE_SCHEMA, c)
+
+
+def has_record_turns(c) -> bool:
+    return migration_applied(RECORD_TURNS_SCHEMA, c)
+
+
+def step_node_and_chat(step_name: str, chat_id: int | None = None) -> tuple[str, int | None]:
+    name = step_name or ""
+    if chat_id is not None:
+        prefix = f"chat {chat_id}"
+        if name == prefix:
+            return "chat", chat_id
+        if name.startswith(prefix + " "):
+            return "chat " + name[len(prefix) + 1:], chat_id
+        return name, chat_id
+    if m := _CHAT_STEP_RE.fullmatch(name):
+        return (f"chat {m.group(2)}" if m.group(2) else "chat"), int(m.group(1))
+    return name, None
 
 
 def seq_col(c, alias: str = "") -> str:
@@ -79,6 +105,7 @@ TABLES = {
     "pr_gate_refreshes": "until refreshed or the PR head changes",
     "step_inputs": "kept",
     "settings_snapshots": "kept",
+    "turn_index": "derived from record files",
 }
 
 
@@ -439,9 +466,206 @@ def steps(run_id: str, connect=reader) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (run_id,))]
 
 
+def step_get(step_id: int, connect=reader) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM steps WHERE id = ?", (step_id,)).fetchone()
+        return dict(r) if r else None
+
+
+def open_steps(run_id: str, connect=reader) -> list[dict]:
+    with connect() as c:
+        if not has_steps_lifecycle(c):
+            return []
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM steps WHERE run_id = ? AND status IN ('queued', 'waiting', 'running') ORDER BY id",
+            (run_id,),
+        )]
+
+
 def step_tries(run_id: str, step: str) -> int:
+    node, _ = step_node_and_chat(step)
     with reader() as c:
-        return c.execute("SELECT COALESCE(MAX(try), 0) FROM steps WHERE run_id = ? AND step = ?", (run_id, step)).fetchone()[0]
+        lifecycle = has_steps_lifecycle(c)
+        if has_lineage(c):
+            chain_row = c.execute("SELECT chain FROM runs WHERE id = ?", (run_id,)).fetchone()
+            chain = chain_row["chain"] if chain_row and chain_row["chain"] else None
+            if chain:
+                if lifecycle:
+                    return c.execute(
+                        "SELECT COALESCE(MAX(s.try), 0) FROM steps s JOIN runs r ON r.id = s.run_id "
+                        "WHERE r.chain = ? AND (s.node = ? OR s.step = ?)",
+                        (chain, node, step),
+                    ).fetchone()[0]
+                return c.execute(
+                    "SELECT COALESCE(MAX(s.try), 0) FROM steps s JOIN runs r ON r.id = s.run_id "
+                    "WHERE r.chain = ? AND s.step = ?",
+                    (chain, step),
+                ).fetchone()[0]
+        if lifecycle:
+            return c.execute(
+                "SELECT COALESCE(MAX(try), 0) FROM steps WHERE run_id = ? AND (node = ? OR step = ?)",
+                (run_id, node, step),
+            ).fetchone()[0]
+        return c.execute(
+            "SELECT COALESCE(MAX(try), 0) FROM steps WHERE run_id = ? AND step = ?",
+            (run_id, step),
+        ).fetchone()[0]
+
+
+def step_version(run_id: str, node: str, try_no: int, connect=reader) -> int | None:
+    norm_node, _ = step_node_and_chat(node)
+    with connect() as c:
+        if not has_steps_lifecycle(c):
+            return None
+        row = c.execute(
+            "SELECT version FROM steps WHERE run_id = ? AND (node = ? OR step = ?) AND try = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (run_id, norm_node, node, try_no),
+        ).fetchone()
+        return int(row["version"]) if row and row["version"] is not None else None
+
+
+def has_accounts(connect=reader) -> bool:
+    with connect() as c:
+        if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounts'").fetchone():
+            return False
+        return c.execute("SELECT 1 FROM accounts LIMIT 1").fetchone() is not None
+
+
+def account_id_for_fingerprint(fingerprint: str, connect=reader) -> str | None:
+    if not fingerprint:
+        return None
+    with connect() as c:
+        if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounts'").fetchone():
+            return None
+        row = c.execute("SELECT id FROM accounts WHERE fingerprint = ? LIMIT 1", (fingerprint,)).fetchone()
+        return str(row["id"]) if row else None
+
+
+def queue_step(run_id: str, step_name: str, try_no: int, *, chat_id: int | None = None,
+               effort: str = "", tier: str = "", kind: str = "") -> int | None:
+    if not run_id:
+        return None
+    node, resolved_chat_id = step_node_and_chat(step_name, chat_id)
+    now = util.iso()
+    with writes.atomic() as c:
+        if not has_steps_lifecycle(c):
+            return None
+        cur = c.execute(
+            "INSERT INTO steps (run_id, step, node, status, queued_at, ts, try, chat_id, effort, tier, kind, ok, version) "
+            "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, 0, 1)",
+            (run_id, step_name, node, now, now, try_no, resolved_chat_id, effort or "", tier or "", kind or ""),
+        )
+        return cur.lastrowid
+
+
+def wait_step(step_id: int | None) -> None:
+    if step_id is None:
+        return
+    with writes.atomic() as c:
+        if not has_steps_lifecycle(c):
+            return
+        c.execute(
+            "UPDATE steps SET status = 'waiting', waiting_since = ?, version = version + 1 WHERE id = ?",
+            (util.iso(), step_id),
+        )
+
+
+def start_step(step_id: int | None, *, account_id: str | None, device: str, runner: str, model: str,
+               provider: str, auth_mode: str, runner_version: str = "") -> None:
+    if step_id is None:
+        return
+    with writes.atomic() as c:
+        if not has_steps_lifecycle(c):
+            return
+        if has_record_turns(c):
+            c.execute(
+                "UPDATE steps SET status = 'running', waiting_since = NULL, account_id = ?, device = ?, "
+                "runner = ?, runner_version = ?, model = ?, provider = ?, auth_mode = ?, version = version + 1 "
+                "WHERE id = ?",
+                (account_id, device or "", runner or "", runner_version or "", model or "", provider or "",
+                 auth_mode or "", step_id),
+            )
+        else:
+            c.execute(
+                "UPDATE steps SET status = 'running', waiting_since = NULL, account_id = ?, device = ?, "
+                "runner = ?, model = ?, provider = ?, auth_mode = ?, version = version + 1 WHERE id = ?",
+                (account_id, device or "", runner or "", model or "", provider or "", auth_mode or "", step_id),
+            )
+
+
+def fail_step(step_id: int | None, error: str, *, runner: str = "", model: str = "", provider: str = "") -> None:
+    if step_id is None:
+        return
+    with writes.atomic() as c:
+        if not has_steps_lifecycle(c):
+            return
+        c.execute(
+            "UPDATE steps SET status = 'fault', ok = 0, error = ?, ts = ?, "
+            "runner = COALESCE(NULLIF(runner, ''), ?), model = COALESCE(NULLIF(model, ''), ?), "
+            "provider = COALESCE(NULLIF(provider, ''), ?), version = version + 1 WHERE id = ?",
+            ((error or "")[:500], util.iso(), runner or "", model or "", provider or "", step_id),
+        )
+
+
+def insert_turn(step_id: int, n: int, run_id: str, *, at: str, status: str, tool: str, excerpt: str,
+                seconds: float, tokens_in: int, cache_read: int, tokens_out: int, cost_nusd: int | None,
+                file: str, member_offset: int, member_len: int) -> None:
+    with db() as c:
+        if not has_record_turns(c):
+            return
+        c.execute(
+            "INSERT OR REPLACE INTO turn_index "
+            "(step_id, n, run_id, at, status, tool, excerpt, seconds, tokens_in, cache_read, tokens_out, "
+            "cost_nusd, file, member_offset, member_len) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (step_id, n, run_id, at, status, tool, excerpt, seconds, tokens_in, cache_read, tokens_out,
+             cost_nusd, file, member_offset, member_len),
+        )
+
+
+def step_turns(step_id: int, connect=reader) -> list[dict]:
+    with connect() as c:
+        if not has_record_turns(c):
+            return []
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM turn_index WHERE step_id = ? ORDER BY n", (step_id,)
+        )]
+
+
+def run_step_turns(run_id: str, node: str, try_no: int, connect=reader) -> tuple[list[dict], list[dict]]:
+    norm_node, _ = step_node_and_chat(node)
+    with connect() as c:
+        if has_steps_lifecycle(c):
+            matched_steps = [dict(r) for r in c.execute(
+                "SELECT * FROM steps WHERE run_id = ? AND (node = ? OR step = ?) AND try = ? ORDER BY id",
+                (run_id, norm_node, node, try_no),
+            )]
+        else:
+            matched_steps = [dict(r) for r in c.execute(
+                "SELECT * FROM steps WHERE run_id = ? AND step = ? AND try = ? ORDER BY id",
+                (run_id, node, try_no),
+            )]
+        if not matched_steps or not has_record_turns(c):
+            return matched_steps, []
+        step_ids = [s["id"] for s in matched_steps]
+        placeholders = ",".join("?" * len(step_ids))
+        rows = [dict(r) for r in c.execute(
+            f"SELECT * FROM turn_index WHERE step_id IN ({placeholders}) ORDER BY step_id, n",  # noqa: S608
+            step_ids,
+        )]
+        return matched_steps, rows
+
+
+def clear_turn_index(run_id: str | None = None, *, step_id: int | None = None) -> None:
+    with db() as c:
+        if not has_record_turns(c):
+            return
+        if step_id is not None:
+            c.execute("DELETE FROM turn_index WHERE step_id = ?", (step_id,))
+        elif run_id is not None:
+            c.execute("DELETE FROM turn_index WHERE run_id = ?", (run_id,))
+        else:
+            c.execute("DELETE FROM turn_index")
 
 
 def steps_since(since: str, connect=reader) -> list[dict]:
@@ -485,12 +709,29 @@ def runs_marked_running(connect=reader) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
 
 
+def runs_queued(connect=reader) -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'queued' ORDER BY started")]
+
+
+def live_chat_run(chat_id: int, connect=reader) -> dict | None:
+    with connect() as c:
+        r = c.execute(
+            f"SELECT * FROM runs WHERE kind = 'chat' AND id LIKE ? AND status IN ('running', 'queued') "  # noqa: S608
+            f"ORDER BY started DESC, {seq_col(c)} DESC LIMIT 1",
+            (f"%-chat-{chat_id}",),
+        ).fetchone()
+        return dict(r) if r else None
+
+
 def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=reader, whole: bool = False,
-                live: bool = False) -> list[dict]:
+                live: bool = False, *, include_queued: bool | None = None) -> list[dict]:
+    show_queued = (not whole and not live) if include_queued is None else include_queued
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
                                            + (f"AND {WHOLE_RUN} " if whole else "")
                                            + (f"AND {LIVE_RUN} " if live else "")
+                                           + ("" if show_queued else "AND status != 'queued' AND NOT (pid IS NULL AND status = 'stopped' AND stop_asked IS NULL) ")
                                            + f"ORDER BY started DESC, {seq_col(c)} DESC LIMIT ?", (repo, issue, limit))]
 
 
@@ -626,6 +867,7 @@ def interrupted_tickets(repo: str) -> list[str]:
         rows = c.execute(f"SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "  # noqa: S608
                          f"AND {k} = (SELECT r2.{k} FROM runs r2 WHERE r2.kind = 'pipeline' "
                          f"AND r2.repo = runs.repo AND r2.issue = runs.issue AND {WHOLE_RUN} AND {LIVE_RUN} "
+                         f"AND r2.status != 'queued' "
                          f"ORDER BY r2.started DESC, r2.{k} DESC LIMIT 1) "
                          f"ORDER BY started, {k}", (repo,))
         return [str(r["issue"]) for r in rows if r["status"] == "interrupted"]
@@ -639,8 +881,10 @@ def last_pipeline_starts() -> dict[str, str]:
 
 def running_run(repo: str, issue: int | str, connect=reader) -> dict | None:
     with connect() as c:
-        r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND status = 'running' "  # noqa: S608
-                      f"ORDER BY started DESC, {seq_col(c)} DESC LIMIT 1", (repo, issue)).fetchone()
+        r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
+                      f"AND status IN ('running', 'queued') "
+                      f"ORDER BY status = 'running' DESC, started DESC, {seq_col(c)} DESC LIMIT 1",
+                      (repo, issue)).fetchone()
         return dict(r) if r else None
 
 
@@ -657,7 +901,7 @@ def pending_label(repo: str, issue: int | str) -> str:
 
 def issue_running(repo: str, issue: int | str) -> bool:
     with reader() as c:
-        return c.execute("SELECT 1 FROM runs WHERE repo = ? AND issue = ? AND status = 'running' LIMIT 1",
+        return c.execute("SELECT 1 FROM runs WHERE repo = ? AND issue = ? AND status IN ('running', 'queued') LIMIT 1",
                          (repo, issue)).fetchone() is not None
 
 
@@ -786,74 +1030,181 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                  try_no: int = 0, auth_mode: str = "", *, inputs: tuple[dict, ...] | list[dict] = (),
                  settings_sha: str = "", settings_snapshots: dict[str, str] | None = None,
                  blob_rows: tuple[tuple[str, str, int], ...] = (),
-                 prompt_version: str = "", prompt_level: str = "", schema_version: str = "") -> None:
+                 prompt_version: str = "", prompt_level: str = "", schema_version: str = "",
+                 step_id: int | None = None, chat_id: int | None = None, device: str = "",
+                 account_id: str | None = None, runner_version: str = "", unread: int = 0) -> None:
     from . import blobs as blob_store
 
+    node, resolved_chat_id = step_node_and_chat(name, chat_id)
     with writes.atomic() as c:
         pinned = has_pins(c)
         bound = has_prompt_binding(c)
+        lifecycle = has_steps_lifecycle(c)
+        turns_schema = has_record_turns(c)
         if pinned:
             for sha, blob_kind, size in blob_rows:
                 blob_store.record_row(c, sha, blob_kind, size)
             if settings_snapshots:
                 save_settings_snapshots(c, settings_snapshots)
-        for res, seconds in calls:
-            if bound:
-                cur = c.execute(
-                    "INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
-                    " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
-                    " api_seconds, auth_mode, settings_sha, prompt_version, prompt_level, schema_version) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                    "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
-                    "?,?,?,?,?,?,?,?,?)",
-                    (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
-                     res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
-                     res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
-                     res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode, settings_sha or None,
-                     prompt_version or None, prompt_level or None, schema_version or None))
-            elif pinned:
-                cur = c.execute(
-                    "INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
-                    " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
-                    " api_seconds, auth_mode, settings_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                    "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
-                    "?,?,?,?,?,?)",
-                    (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
-                     res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
-                     res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
-                     res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode, settings_sha or None))
+        for index, (res, seconds) in enumerate(calls):
+            now = util.iso()
+            status = "done" if res.ok else "fault"
+            if index == 0 and step_id is not None and lifecycle:
+                existing = c.execute(
+                    "SELECT cost_usd, tokens_in, tokens_out, device, account_id, chat_id FROM steps WHERE id = ?",
+                    (step_id,),
+                ).fetchone()
+                if existing is not None:
+                    prev_cost = float(existing["cost_usd"] or 0.0)
+                    prev_tin = int(existing["tokens_in"] or 0)
+                    prev_tout = int(existing["tokens_out"] or 0)
+                    if not device:
+                        device = existing["device"] or ""
+                    if account_id is None:
+                        account_id = existing["account_id"]
+                    if resolved_chat_id is None:
+                        resolved_chat_id = existing["chat_id"]
+                    if turns_schema:
+                        c.execute(
+                            "UPDATE steps SET runner=?, model=?, provider=?, ok=?, status=?, cost_usd=?, tokens_in=?, "
+                            "tokens_out=?, turns=?, seconds=?, error=?, ts=?, first_context_tokens=?, effort=?, "
+                            "tier=?, kind=?, cache_read=?, cache_write=?, api_seconds=?, auth_mode=?, settings_sha=?, "
+                            "prompt_version=?, prompt_level=?, schema_version=?, "
+                            "unread=?, runner_version=COALESCE(NULLIF(?, ''), runner_version), "
+                            "waiting_since=NULL, version=version+1 WHERE id=?",
+                            (res.runner, res.model, res.provider, int(res.ok), status, res.cost_usd, res.tokens_in,
+                             res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
+                             res.first_context_tokens, effort or "", tier or "", kind or "", res.cache_read,
+                             res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode,
+                             settings_sha or None, prompt_version or None, prompt_level or None,
+                             schema_version or None, int(unread or 0), runner_version or "", step_id),
+                        )
+                    else:
+                        c.execute(
+                            "UPDATE steps SET runner=?, model=?, provider=?, ok=?, status=?, cost_usd=?, tokens_in=?, "
+                            "tokens_out=?, turns=?, seconds=?, error=?, ts=?, first_context_tokens=?, effort=?, "
+                            "tier=?, kind=?, cache_read=?, cache_write=?, api_seconds=?, auth_mode=?, settings_sha=?, "
+                            "prompt_version=?, prompt_level=?, schema_version=?, "
+                            "waiting_since=NULL, version=version+1 WHERE id=?",
+                            (res.runner, res.model, res.provider, int(res.ok), status, res.cost_usd, res.tokens_in,
+                             res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
+                             res.first_context_tokens, effort or "", tier or "", kind or "", res.cache_read,
+                             res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode,
+                             settings_sha or None, prompt_version or None, prompt_level or None,
+                             schema_version or None, step_id),
+                        )
+                    written_step_id = step_id
+                    delta_cost = res.cost_usd - prev_cost
+                    delta_tin = res.tokens_in - prev_tin
+                    delta_tout = res.tokens_out - prev_tout
+                else:
+                    written_step_id = None
             else:
-                cur = c.execute(
-                    "INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
-                    " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
-                    " api_seconds, auth_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                    "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
-                    "?,?,?,?,?)",
-                    (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
-                     res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
-                     res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
-                     res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode))
-            step_id = cur.lastrowid
-            if pinned and inputs and step_id is not None:
+                written_step_id = None
+            if written_step_id is None:
+                call_unread = int(unread or 0) if index == 0 else 0
+                if lifecycle and turns_schema:
+                    cur = c.execute(
+                        "INSERT INTO steps (run_id, step, node, status, queued_at, device, account_id, chat_id, "
+                        "runner, runner_version, unread, model, provider, ok, cost_usd, tokens_in, tokens_out, "
+                        "turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, "
+                        "cache_write, api_seconds, auth_mode, settings_sha, prompt_version, prompt_level, "
+                        "schema_version, version) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                        "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
+                        "?,?,?,?,?,?,?,?,?,1)",
+                        (run_id, name, node, status, now, device or "", account_id, resolved_chat_id,
+                         res.runner, runner_version or "", call_unread, res.model, res.provider, int(res.ok),
+                         res.cost_usd, res.tokens_in, res.tokens_out, res.turns, round(seconds, 2),
+                         (res.error or "")[:500], now, res.first_context_tokens, effort or "", tier or "",
+                         try_no, run_id, name, kind or "", res.cache_read, res.cache_write,
+                         round(res.api_seconds, 2), auth_mode or res.auth_mode, settings_sha or None,
+                         prompt_version or None, prompt_level or None, schema_version or None),
+                    )
+                elif lifecycle:
+                    cur = c.execute(
+                        "INSERT INTO steps (run_id, step, node, status, queued_at, device, account_id, chat_id, "
+                        "runner, model, provider, ok, cost_usd, tokens_in, tokens_out, turns, seconds, error, ts, "
+                        "first_context_tokens, effort, tier, try, kind, cache_read, cache_write, api_seconds, "
+                        "auth_mode, settings_sha, prompt_version, prompt_level, schema_version, version) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                        "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
+                        "?,?,?,?,?,?,?,?,?,1)",
+                        (run_id, name, node, status, now, device or "", account_id, resolved_chat_id,
+                         res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
+                         res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
+                         res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "",
+                         res.cache_read, res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode,
+                         settings_sha or None, prompt_version or None, prompt_level or None, schema_version or None),
+                    )
+                elif bound:
+                    cur = c.execute(
+                        "INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
+                        " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
+                        " api_seconds, auth_mode, settings_sha, prompt_version, prompt_level, schema_version) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                        "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
+                        "?,?,?,?,?,?,?,?,?)",
+                        (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
+                         res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
+                         res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "",
+                         res.cache_read, res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode,
+                         settings_sha or None, prompt_version or None, prompt_level or None, schema_version or None),
+                    )
+                elif pinned:
+                    cur = c.execute(
+                        "INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
+                        " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
+                        " api_seconds, auth_mode, settings_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                        "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
+                        "?,?,?,?,?,?)",
+                        (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
+                         res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
+                         res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
+                         res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode, settings_sha or None))
+                else:
+                    cur = c.execute(
+                        "INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
+                        " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
+                        " api_seconds, auth_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                        "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
+                        "?,?,?,?,?)",
+                        (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
+                         res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
+                         res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
+                         res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode))
+                written_step_id = cur.lastrowid
+                delta_cost = res.cost_usd
+                delta_tin = res.tokens_in
+                delta_tout = res.tokens_out
+            if pinned and inputs and written_step_id is not None:
                 c.executemany(
                     "INSERT INTO step_inputs (step_id, role, name, version, level, sha256, call) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    [(step_id, str(item.get("role") or ""), str(item.get("name") or ""),
+                    [(written_step_id, str(item.get("role") or ""), str(item.get("name") or ""),
                       str(item.get("version") or ""), str(item.get("level") or ""),
                       str(item.get("sha256") or ""), int(item.get("call") or 0))
                      for item in inputs],
                 )
-            writes.update("runs", run_id, {}, increments={"cost_usd": res.cost_usd, "tokens_in": res.tokens_in,
-                                                         "tokens_out": res.tokens_out})
+            writes.update("runs", run_id, {}, increments={"cost_usd": delta_cost, "tokens_in": delta_tin,
+                                                         "tokens_out": delta_tout})
 
 
 def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
     validate_columns(labels, STEP_LABEL_FIELDS, "steps")
     if not labels:
         return
+    node, _ = step_node_and_chat(step)
     with db() as c:
-        c.execute(f"UPDATE steps SET {', '.join(f'{k} = ?' for k in labels)} WHERE run_id = ? AND step = ? AND try = ?",  # noqa: S608
-                  (*labels.values(), run_id, step, try_no))
+        if has_steps_lifecycle(c):
+            c.execute(
+                f"UPDATE steps SET {', '.join(f'{k} = ?' for k in labels)}, version = version + 1 "  # noqa: S608
+                "WHERE run_id = ? AND (node = ? OR step = ?) AND try = ?",
+                (*labels.values(), run_id, node, step, try_no),
+            )
+        else:
+            c.execute(f"UPDATE steps SET {', '.join(f'{k} = ?' for k in labels)} WHERE run_id = ? AND step = ? AND try = ?",  # noqa: S608
+                      (*labels.values(), run_id, step, try_no))
 
 
 def hold_ab(run_id: str, role: str, name: str, side: str, arm: dict) -> None:
@@ -902,7 +1253,7 @@ def move(run_id: str, to: str, expect: tuple[str, ...], *, base_version=None, **
 def ask_stop(run_id: str, base_version=None) -> dict | None:
     with writes.atomic():
         row = writes.check_run(run_id, base_version, for_stop=True)
-        if not row or row["status"] != "running":
+        if not row or row["status"] not in ("running", "queued"):
             return row
         if row["stop_asked"]:
             if not events.reuse_receipt(f"run:{run_id}", row["version"]):
@@ -911,14 +1262,76 @@ def ask_stop(run_id: str, base_version=None) -> dict | None:
                                         "be acknowledged with an audit receipt.")
             return row
         return writes.update("runs", run_id, {"stop_asked": util.iso()}, base_version=row["version"],
-                             expect=("running",))
+                             expect=("running", "queued"))
+
+
+def _close_open_steps_in_tx(c, run_id: str) -> dict[str, float | int]:
+    if not has_steps_lifecycle(c):
+        return {}
+    rows = c.execute(
+        "SELECT id, cost_usd, tokens_in, tokens_out, cache_read, turns, ts FROM steps "
+        "WHERE run_id = ? AND status IN ('queued', 'waiting', 'running') ORDER BY id",
+        (run_id,),
+    ).fetchall()
+    if not rows:
+        return {}
+    turns_available = has_record_turns(c)
+    now = util.iso()
+    delta_cost = 0.0
+    delta_tin = 0
+    delta_tout = 0
+    for row in rows:
+        prev_cost = float(row["cost_usd"] or 0.0)
+        prev_tin = int(row["tokens_in"] or 0)
+        prev_tout = int(row["tokens_out"] or 0)
+        prev_cr = int(row["cache_read"] or 0)
+        prev_turns = int(row["turns"] or 0)
+        new_cost, new_tin, new_tout, new_cr, new_turns = prev_cost, prev_tin, prev_tout, prev_cr, prev_turns
+        if turns_available:
+            agg = c.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(tokens_in), 0) AS tin, COALESCE(SUM(cache_read), 0) AS cr, "
+                "COALESCE(SUM(tokens_out), 0) AS tout, COALESCE(SUM(cost_nusd), 0) AS cnusd "
+                "FROM turn_index WHERE step_id = ?",
+                (row["id"],),
+            ).fetchone()
+            if agg and agg["n"]:
+                recovered_cost = agg["cnusd"] / 1_000_000_000
+                new_cost = max(prev_cost, recovered_cost)
+                new_tin = max(prev_tin, int(agg["tin"]))
+                new_tout = max(prev_tout, int(agg["tout"]))
+                new_cr = max(prev_cr, int(agg["cr"]))
+                new_turns = max(prev_turns, int(agg["n"]))
+        c.execute(
+            "UPDATE steps SET status = 'fault', ok = 0, error = 'interrupted', "
+            "ts = COALESCE(NULLIF(ts, ''), ?), cost_usd = ?, tokens_in = ?, tokens_out = ?, "
+            "cache_read = ?, turns = ?, waiting_since = NULL, version = version + 1 WHERE id = ?",
+            (now, new_cost, new_tin, new_tout, new_cr, new_turns, row["id"]),
+        )
+        delta_cost += new_cost - prev_cost
+        delta_tin += new_tin - prev_tin
+        delta_tout += new_tout - prev_tout
+    increments: dict[str, float | int] = {}
+    if delta_cost:
+        increments["cost_usd"] = delta_cost
+    if delta_tin:
+        increments["tokens_in"] = delta_tin
+    if delta_tout:
+        increments["tokens_out"] = delta_tout
+    return increments
 
 
 def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> dict | None:
     from . import factory
 
     with writes.atomic() as c:
-        settled = writes.update("runs", run_id, fields, expect=("running",), kind="run.ended", base_version=base_version)
+        current = c.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if not current or current["status"] not in ("running", "queued"):
+            if base_version is not None:
+                writes.check_run(run_id, base_version)
+            return None
+        increments = _close_open_steps_in_tx(c, run_id)
+        settled = writes.update("runs", run_id, fields, expect=("running", "queued"), kind="run.ended",
+                                base_version=base_version, increments=increments or None)
         if not settled:
             return None
         factory.finish_run(c, run_id)
@@ -935,7 +1348,7 @@ def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> 
 
 def finished_runs_since(since: str, until: str = "9999") -> list[dict]:
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status != 'running' "
+        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status NOT IN ('running', 'queued') "
                                            "AND COALESCE(finished, started) >= ? AND COALESCE(finished, started) < ? "
                                            "ORDER BY started", (since, until))]
 

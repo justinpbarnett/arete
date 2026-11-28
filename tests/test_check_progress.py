@@ -154,7 +154,7 @@ class CheckProgressTests(ProgressFixture):
             for start, end in zip(starts, completed, strict=True):
                 scope = {k: start[k] for k in ("suite", "check_no", "step", "try", "name")}
                 self.fields(end, **scope)
-                self.assertEqual(set(start), {"kind", "at", *scope})
+                self.assertEqual(set(start), {"v", "kind", "at", *scope})
             saved = json.dumps([starts, completed, self.progress(mode, *expected)])
             for text in (DIAGNOSTIC, other, STDOUT, "arete-parallel-", *SECRETS):
                 self.assertNotIn(text, saved)

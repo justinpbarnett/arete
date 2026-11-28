@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from collections import Counter
-import concurrent.futures
+import json
 import re
 import secrets
+import zlib
+from collections import Counter
+import concurrent.futures
 from urllib.parse import quote, unquote
 
 from . import (
@@ -72,13 +74,15 @@ def meta():
     with foundation.reader() as conn:
         data = foundation.metadata(conn)
         stream = events.metadata(conn)
+    deprecated = sorted(f"{entry['method']} {entry['path']}" for entry in contract.ALIASES if entry.get("deprecated"))
     return {"api": {"version": contract.VERSION, "minor": contract.MINOR, "contract_sha": contract.digest()},
             "server": {"engine_sha": codebase.STAMP}, "oldest_client": contract.OLDEST_CLIENT,
             "instance": {k: data[f"instance_{k}"] for k in ("id", "tag", "name", "created")},
             "schema": {"version": int(data["schema_version"]),
                        "oldest_writer": int(data["oldest_writer"]) if data["oldest_writer"] is not None else None},
             "stream": stream,
-            "features": {"inbox": True, "outbox": True},
+            "features": {"inbox": True, "outbox": True, "run_start_tx": True},
+            "deprecated": deprecated,
             "push": {"vapid_public_key": _vapid_public_key()}}
 
 
@@ -130,6 +134,17 @@ def resources(name, values):
                 "prompt_version": r.get("prompt_version") or None,
                 "prompt_level": r.get("prompt_level") or None,
                 "schema_version": r.get("schema_version") or None,
+                "node": r.get("node") or r["step"] or "",
+                "try": int(r.get("try") or 0),
+                "status": r.get("status") or ("done" if r.get("ok") else "fault"),
+                "queued_at": r.get("queued_at") or r.get("ts"),
+                "waiting_since": r.get("waiting_since"),
+                "device": r.get("device"),
+                "account": r.get("account_id"),
+                "chat_id": r.get("chat_id"),
+                "version": int(r.get("version") or 1),
+                "runner_version": r.get("runner_version"),
+                "unread": int(r.get("unread") or 0),
             })
         return out
     if name == "loop":
@@ -487,11 +502,40 @@ def read(name, values, handler):
         task = needed(task_store.task_get(identity), identity)
         return {"comments": task_store.versioned_comments(identity),
                 "runs": [run_object(r) for r in runs.ticket_runs(task["repo"], identity, limit=500)]}
+    if name == "turn.list":
+        raw_try = values["try"]
+        if not raw_try.isascii() or not raw_try.isdecimal() or int(raw_try) < 1:
+            raise contract.Problem("invalid_input", "try must be a positive integer")
+        matched_steps, turn_rows = runs.run_step_turns(values["run"], values["node"], int(raw_try))
+        if not matched_steps:
+            raise contract.Problem("not_found", f"No step {values['node']} try {raw_try} on run {values['run']}")
+        return {"turns": [serialize(row, contract.TURN) for row in turn_rows]}
+    if name == "turn.get":
+        raw_try, raw_n = values["try"], values["n"]
+        if not raw_try.isascii() or not raw_try.isdecimal() or int(raw_try) < 1:
+            raise contract.Problem("invalid_input", "try must be a positive integer")
+        if not raw_n.isascii() or not raw_n.isdecimal() or int(raw_n) < 1:
+            raise contract.Problem("invalid_input", "n must be a positive integer")
+        matched_steps, turn_rows = runs.run_step_turns(values["run"], values["node"], int(raw_try))
+        if not matched_steps:
+            raise contract.Problem("not_found", f"No step {values['node']} try {raw_try} on run {values['run']}")
+        target_n = int(raw_n)
+        turn_row = next((row for row in turn_rows if int(row["n"]) == target_n), None)
+        if turn_row is None:
+            raise contract.Problem("not_found", f"No turn {target_n} on step {values['node']} try {raw_try}")
+        try:
+            decoded = record.decode_turn(turn_row)
+        except (OSError, ValueError, zlib.error) as error:
+            raise contract.Problem("unavailable", f"Turn {target_n} cannot be decoded: {error}") from None
+        return {"turn": serialize(decoded, contract.TURN_DETAIL)}
     if name == "task.list":
         return {"tasks": task_rows()}
     resource, action = name.split(".")
     if action == "get" and resource == "run":
-        return {"run": run_object(projection("run", identity)["run"])}
+        proj = projection("run", identity)
+        run_view = run_object(proj["run"])
+        steps = [serialize(s, contract.RUN_STEP_SUMMARY) for s in proj.get("steps", ())]
+        return {"run": run_view, "steps": steps}
     if action == "get" and resource == "task":
         needed(task_store.task_get(identity), identity)
         return {"task": serialize(projection("task", identity), contract.TASK)}
@@ -598,19 +642,66 @@ def dispatch(handler, op, path_values, query):
         raise
 
 
+_NON_ATOMIC_COMMANDS = frozenset((
+    "run.stop", "serve.install", "inbox.resolve", "settings.update", "loop.enable", "loop.disable",
+    "device.probe", "outbox.approve", "outbox.retry", "outbox.reject", "chat.file",
+    "task.create", "task.run", "session.start", "run.resume", "run.repair", "run.step",
+    "loop.start", "loop.try", "loop.draft", "chat.create", "chat.send", "chat.session_start",
+    "triage.refresh", "triage.research", "health.check", "incident.scan",
+))
+
+
 def command(handler, op, values, path_values, *, claim=None):
     name = op["name"]
     read_only = op["method"] == "GET" or name == "batch.run"
     action = (lambda: mutation(name, values, handler)) if contract.keyed_write(op) else (
         lambda: execute(name, values, handler))
     return handler.keyed_action(op["method"], op["path"], path_values, action,
-                                atomic=not read_only and name not in ("run.stop", "serve.install", "inbox.resolve",
-                                                                      "settings.update", "loop.enable", "loop.disable",
-                                                                      "device.probe", "outbox.approve",
-                                                                      "outbox.retry", "outbox.reject", "chat.file"),
+                                atomic=not read_only and name not in _NON_ATOMIC_COMMANDS,
                                 status=op["success_status"],
                                 redact=name in ("token.issue", "token.rotate", "webhook.rotate"),
                                 claim=claim, read_only=read_only)
+
+
+def _set_run_location(handler, run_id: str, *, created: bool) -> None:
+    if handler is None:
+        return
+    if created and run_id:
+        handler.success_status = 201
+        handler.location = f"/api/v1/runs/{quote(run_id, safe='')}"
+    else:
+        handler.success_status = 200
+        handler.location = None
+
+
+def _resolve_events_input(raw_events):
+    if raw_events is None:
+        return None
+    if isinstance(raw_events, list):
+        return raw_events
+    if isinstance(raw_events, str):
+        found = blobs.get(raw_events)
+        if found is None:
+            raise contract.Problem("not_found", f"No blob {raw_events}")
+        _, raw = found
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise contract.Problem("invalid_input", f"Events blob {raw_events} is not valid JSON: {error}") from None
+        if isinstance(parsed, dict):
+            return [parsed]
+        if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
+            return parsed
+        raise contract.Problem("invalid_input", f"Events blob {raw_events} must be a JSON object or list of objects")
+    raise contract.Problem("invalid_input", "events must be a list of objects or a blob sha256")
+
+
+def _task_placeholder(repo: str, tid: str, kind: str = "feat") -> dict:
+    now = util.iso()
+    return {
+        "id": str(tid), "repo": repo, "title": "", "body": "", "kind": kind or "feat",
+        "state": "todo", "parent": "", "created": now, "updated": now, "version": 1,
+    }
 
 
 def remove_secret(scope, name):
@@ -645,8 +736,186 @@ def mutation(name, values, handler):
         result = {"text": webhooks.rotate(values["loop"], principals.current())}
     elif name.startswith(("token.", "pairing.")) or name in ("principal.revoke", "session.end"):
         result = credential_http.write_operation(name, values, handler)
+    elif name == "task.create" and values.get("start"):
+        ticket = (values.get("ticket") or "").strip()
+        body = (values.get("body") or "").strip()
+        started = tasks.start(
+            values["repo"],
+            prompt=body,
+            title=values.get("title", ""),
+            kind=values.get("kind", ""),
+            ticket=ticket,
+            force=values.get("force") is not False,
+        )
+        run_id = started.get("run", "")
+        run_row = runs.run_get(run_id) if run_id else None
+        tid = started.get("task") or ticket or ""
+        repo_name = started.get("repo") or values["repo"]
+        task_row = (task_store.task_get(tid) if tid else None) or _task_placeholder(
+            repo_name, tid, values.get("kind") or "feat")
+        _set_run_location(handler, run_id, created=bool(run_id) and started.get("why") != "already running")
+        result = {
+            "task": serialize(task_row, contract.TASK),
+            "run": run_object(run_row),
+            "state": started.get("state", ""),
+            "why": started.get("why", ""),
+        }
+    elif name == "task.run":
+        tid = values["task"].strip()
+        repo_name = (values.get("repo") or "").strip()
+        if not repo_name:
+            found_task = task_store.task_get(tid.lower())
+            if found_task is None:
+                raise control.NotFound(f"no task {tid}")
+            repo_name, tid = found_task["repo"], found_task["id"]
+        started = tasks.start(repo_name, ticket=tid, force=values.get("force") is not False)
+        run_id = started.get("run", "")
+        run_row = runs.run_get(run_id) if run_id else None
+        _set_run_location(handler, run_id, created=bool(run_id) and started.get("why") != "already running")
+        result = {
+            "run": run_object(run_row), "task": started["task"], "repo": started["repo"],
+            "state": started["state"], "why": started["why"],
+        }
     elif name.startswith("task.") or name == "comment.create":
         result = {"task": change_task(name, values)}
+    elif name == "session.start":
+        from . import sessions
+
+        sess = sessions.launch(
+            values["prompt"],
+            device=values.get("device") or "local",
+            model=values.get("model", ""),
+            run_with=values.get("runner", ""),
+            tools=values.get("tools"),
+            repo=values.get("repo", ""),
+            budget_usd=values.get("budget_usd"),
+            task=bool(values.get("task", False)),
+            draft_pr=bool(values.get("draft_pr", False)),
+        )
+        _set_run_location(handler, sess["id"], created=True)
+        result = {"run": run_object(runs.run_get(sess["id"])), "session": sess}
+    elif name == "run.resume":
+        started = tasks.resume(values["run"], values.get("node") or values.get("step") or "",
+                               values.get("base_version"))
+        _set_run_location(handler, started["run"], created=True)
+        result = {"run": run_object(runs.run_get(started["run"]))}
+    elif name == "run.repair":
+        started = tasks.repair(values["run"], values.get("base_version"))
+        _set_run_location(handler, started["run"], created=started.get("state") == "queued")
+        result = {"run": run_object(runs.run_get(started["run"]))}
+    elif name == "run.step":
+        started = tasks.run_step(values["run"], values["node"], values.get("set") or {},
+                                 values.get("base_version"))
+        _set_run_location(handler, started["run"], created=True)
+        result = {"run": run_object(runs.run_get(started["run"]))}
+    elif name == "run.import":
+        run_id = record.start(
+            values["kind"],
+            status="queued",
+            pid=None,
+            repo=values.get("repo") or None,
+            issue=values.get("issue"),
+            summary=values.get("summary") or "",
+            branch=values.get("branch") or None,
+            pr_url=values.get("pr_url") or None,
+        )
+        _set_run_location(handler, run_id, created=True)
+        result = {"run": run_object(runs.run_get(run_id))}
+    elif name == "loop.start":
+        from . import loop_run
+
+        ev_list = _resolve_events_input(values.get("events"))
+        row = loop_run.launch(values["loop"], events=ev_list, wait=False)
+        _set_run_location(handler, row["id"], created=True)
+        result = {"run": run_object(row)}
+    elif name == "loop.try":
+        from . import scaffold
+
+        ev_list = _resolve_events_input(values.get("events"))
+        row = scaffold.start_try(values["loop"], events=ev_list, wait=False)
+        _set_run_location(handler, row["id"], created=True)
+        result = {"run": run_object(row)}
+    elif name == "loop.draft":
+        from . import scaffold
+
+        row = scaffold.start_draft(scaffold.DraftRequest(
+            values["sentence"], values.get("name", ""), values.get("repo", ""), values.get("model", ""),
+        ))
+        _set_run_location(handler, row["id"], created=True)
+        result = {"run": run_object(row)}
+    elif name == "chat.create":
+        from . import chat
+
+        shown = chat.new(values.get("project", ""))
+        run_row = None
+        if text := (values.get("text") or "").strip():
+            shown, run_row, created = chat.send_v1(shown["id"], text, queue_if_busy=True)
+            _set_run_location(handler, run_row["id"] if run_row else "", created=created)
+        elif handler is not None:
+            handler.success_status = 201
+        result = {"chat": serialize(shown, contract.CHAT), "run": run_object(run_row)}
+    elif name == "chat.send":
+        from . import chat
+
+        cid = dashboard.whole_number(values["chat"])
+        text = values["text"].strip()
+        if not text:
+            raise contract.Problem("invalid_input", "Write a message first.")
+        try:
+            shown, run_row, created = chat.send_v1(cid, text, queue_if_busy=True)
+        except chat.NoChat as error:
+            raise contract.Problem("not_found", str(error)) from None
+        except chat.Busy as error:
+            raise contract.Problem("conflict", str(error)) from None
+        _set_run_location(handler, run_row["id"] if run_row else "", created=created)
+        result = {"chat": serialize(shown, contract.CHAT), "run": run_object(run_row)}
+    elif name == "chat.session_start":
+        from . import chat
+
+        cid = dashboard.whole_number(values["chat"])
+        try:
+            sess = chat.start_session(
+                cid,
+                values["prompt"],
+                repo=values.get("repo"),
+                device=values.get("device", ""),
+                model=values.get("model", ""),
+                runner=values.get("runner", ""),
+                budget_usd=values.get("budget_usd"),
+            )
+        except chat.NoChat as error:
+            raise contract.Problem("not_found", str(error)) from None
+        _set_run_location(handler, sess["id"], created=True)
+        result = {"run": run_object(runs.run_get(sess["id"])), "session": sess}
+    elif name == "triage.refresh":
+        code = triage.run(dry_run=bool(values.get("dry_run", False)))
+        result = {"ok": code == 0, "code": code, "run": None}
+    elif name == "triage.research":
+        from . import research
+
+        if values.get("next"):
+            code = research.next_due(dry_run=bool(values.get("dry_run", False)))
+            result = {"ref": values["ticket"], "code": code, "run": None}
+        else:
+            found_row = research.ticket(values["ticket"])
+            if not found_row:
+                raise control.NotFound(f"{values['ticket']} is not a research ticket on the triage board")
+            code = research.run_now(found_row["ref"], force=bool(values.get("force", False)),
+                                    dry_run=bool(values.get("dry_run", False)))
+            result = {"ref": found_row["ref"], "code": code, "run": None}
+    elif name == "health.check":
+        from . import heartbeat
+
+        code = heartbeat.run(
+            dry_run=bool(values.get("dry_run", False)),
+            force_probes=bool(values.get("force_probes", False)),
+            quiet=bool(values.get("quiet", True)),
+        )
+        result = {"ok": code == 0, "code": code}
+    elif name == "incident.scan":
+        from . import oncall
+
+        result = {"summary": oncall.scan(config.load())}
     elif name == "run.stop":
         result = dashboard.stop_run(handler, values["run"], values["base_version"], public=True)
     elif name == "run.steer":
@@ -770,7 +1039,7 @@ def change_task(name, values):
 
     body = values.get("body", "").strip()
     kind = values.get("kind", "feat")
-    if ("kind" in values and kind not in config.KINDS) or ("body" in values and not body):
+    if ("kind" in values and kind not in config.KINDS) or (name == "task.create" and not body) or ("body" in values and not body):
         raise contract.Problem("invalid_input", "A task needs a body and a supported kind")
     if name == "task.create":
         repo = tasks.repo_named(config.load(), values["repo"])

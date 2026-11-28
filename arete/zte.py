@@ -261,7 +261,7 @@ def admit_run(cfg: config.Config, repo: config.Repo, tid: str) -> store.Delivery
     pilot.require(delivery and delivery.repo == repo.name and delivery.phase == "dispatching"
                   and principals.current() == "rule:poll"
                   and orchestration.digest(os.environ.get(launch_lease.ENV, "")) == delivery.data["dispatch"]
-                  and not runs.ticket_runs(repo.name, tid, limit=1), "ZTE requires its reserved scheduled launch")
+                  and not runs.ticket_runs(repo.name, tid, limit=1, include_queued=False), "ZTE requires its reserved scheduled launch")
     launch_lease.verify(repo.name, tid)
     policy = active(delivery)
     current, _, digest = settings(cfg, policy)

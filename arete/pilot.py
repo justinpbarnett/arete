@@ -215,7 +215,7 @@ def live_receipt(tid: str, repo: str) -> dict:
 
 def task_admission(tid: str, repo: str) -> dict:
     receipt = live_receipt(tid, repo)
-    require(not runs.ticket_runs(repo, tid, limit=1), "the one-shot task already has a run")
+    require(not runs.ticket_runs(repo, tid, limit=1, include_queued=False), "the one-shot task already has a run")
     require(task_matches(tid, repo, Signal(**receipt["signal"]), "todo"), "the one-shot task is no longer queued")
     return receipt
 

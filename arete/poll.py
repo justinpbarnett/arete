@@ -26,6 +26,7 @@ from . import (
     pr_recovery,
     private_evidence,
     queueing,
+    record,
     requeue,
     retention,
     routing,
@@ -377,7 +378,7 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
 def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmission | None = None, *,
                    spec: bool = False, source: tracker.Tracker | None = None, continues: str = "") -> bool | None:
     """Return True for a spawn, None for existing work, False for an oncall refusal."""
-    from . import control, tasks
+    from . import control, principals, tasks
 
     with util.lock("oncall") as got:
         if not got or str(tid) in oncall.parked(repo_name):
@@ -394,9 +395,20 @@ def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmi
                     return None
                 command = pipeline.adw_command(repo_name, str(tid), "--continue", continues)
 
-            def spawn():
-                from . import principals
+            with principals.acting("rule:poll"):
+                run_id = pipeline.queue_run(
+                    repo_name,
+                    str(tid),
+                    continues=continues or None,
+                    restart="resume" if continues else "",
+                )
+            if command:
+                full_command = [*command, "--run-id", run_id]
+                record.write_launch(run_id, full_command, pipeline.RUNS_LOG)
+            else:
+                full_command = None
 
+            def spawn():
                 lease = launch_lease.CURRENT.get()
                 lease.poll = True
                 if zte.reserved(str(tid)):
@@ -405,9 +417,13 @@ def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmi
                     lease.readmission = json.dumps(asdict(readmission))
                     readmission.attempted(record=True)
                 with principals.acting("rule:poll"):
-                    return control.launch(command, pipeline.RUNS_LOG) if command else spawn_run(repo_name, tid, **({"spec": True} if spec else {}))
+                    return (
+                        control.launch(full_command, pipeline.RUNS_LOG)
+                        if full_command
+                        else spawn_run(repo_name, tid, **({"spec": True} if spec else {}), run_id=run_id)
+                    )
 
-            tasks.spawn_pending(repo_name, str(tid), spawn)
+            tasks.spawn_queued(repo_name, str(tid), spawn)
             return True
 
 

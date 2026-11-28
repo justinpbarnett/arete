@@ -2332,9 +2332,10 @@ def dispatch_path(repo: config.Repo, tid: str) -> str:
 
 
 def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False, *,
-                spec: bool = False) -> list[str]:
+                spec: bool = False, run_id: str = "") -> list[str]:
     cfg = config.load()
-    flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else [])]
+    flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else []),
+             *(["--run-id", run_id] if run_id else [])]
     repo = cfg.repo(repo_name)
     if not tracker.is_task_id(tid) and (spec or spec_store.find(repo.name, str(tid))):
         return adw_command(repo.name, str(tid), "--adw", "orchestrate", *flags)
@@ -2563,7 +2564,11 @@ def crash_failure(error: Exception) -> dict:
 
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
               script: Script | None = None, admission: Callable | None = None,
-              launch_done: Callable | None = None, closed_context: tuple[str, ...] = ()) -> int:
+              launch_done: Callable | None = None, closed_context: tuple[str, ...] = (), *,
+              run_id: str = "", persist_run: bool = True) -> int:
+    given_run_id = run_id
+    if dry_run and os.environ.get("ARETE_DRY_RUN_NO_PERSIST") == "1":
+        persist_run = False
     from .store import factory as factory_state
 
     factory_state.admit()
@@ -2609,6 +2614,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if not got:
             print(f"{name} is already running")
             return 0
+        if given_run_id and persist_run:
+            def _release_unclaimed(rid: str = given_run_id) -> None:
+                row = run_store.run_get(rid)
+                if row and row["status"] == "queued":
+                    record.settle(rid, "stopped", summary="not started")
+
+            pin_stack.callback(_release_unclaimed)
         from . import adw as adw_mod
         from . import pins
 
@@ -2762,7 +2774,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         raise tracker.TaskError("continue must name this spec's current delivery lineage")
                 elif script.continues or run_store.newest_live_whole_run(repo.name, tid):
                     raise tracker.TaskError("a spec cannot adopt the ordinary builder's history")
-            budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
+            budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of),
+                                                   include_queued=False)
             latest = budget_history[0] if budget_history else None
             may_revise = not (zte_grant or retry_of or reconciling_catch_up or only) and (
                 script is None or not script.repairs and script.path in ("orchestrate", "revise"))
@@ -2913,6 +2926,16 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             layer = pin_res.layer or layer
 
             def start():
+                if not persist_run:
+                    return given_run_id or record.new_id("pip", f"{repo.name}-{tid}")
+                if given_run_id:
+                    if not record.claim(
+                        given_run_id, lock=lock, only_step=only, dry_run=int(dry_run),
+                        resolution=pin_res, continues=continues_id, restart=restart_kind, **retry_of,
+                    ):
+                        raise RuntimeError(f"run {given_run_id} could not be claimed")
+                    launch_lease.registered(repo.name, str(tid))
+                    return given_run_id
                 return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
                                     only_step=only, dry_run=int(dry_run), resolution=pin_res,
                                     continues=continues_id, restart=restart_kind,
@@ -6964,13 +6987,37 @@ def held_back(cfg: config.Config, repo_name: str, going: Counter, free_slots: in
     return slots.no_free_slot(cfg.max_parallel) if free_slots <= 0 else ""
 
 
-def spawn_run(repo_name: str, tid: str, force: bool = False, *, spec: bool = False) -> subprocess.Popen:
+def queue_run(repo_name: str, tid: str | int, *, only_step: str = "", dry_run: int = 0,
+              continues: str | None = None, restart: str = "", **extra) -> str:
+    lock = run_store.run_lock("pipeline", repo_name, tid)
+    return record.start(
+        "pipeline",
+        tag=f"{repo_name}-{tid}",
+        lock=lock,
+        repo=repo_name,
+        issue=tid,
+        status="queued",
+        pid=None,
+        only_step=only_step,
+        dry_run=dry_run,
+        continues=continues,
+        restart=restart,
+        **extra,
+    )
+
+
+def spawn_run(repo_name: str, tid: str, force: bool = False, *, spec: bool = False,
+              run_id: str = "") -> subprocess.Popen:
     cfg, problem = config.load_or_problem()
     if problem:
         raise control.Refused(problem)
     if why := config.repo_paused(cfg, repo_name):
         raise control.Refused(why)
-    return control.launch(run_command(repo_name, tid, force, **({"spec": True} if spec else {})), RUNS_LOG)
+    cmd = run_command(repo_name, tid, force, **({"spec": True} if spec else {}),
+                      **({"run_id": run_id} if run_id else {}))
+    if run_id:
+        record.write_launch(run_id, cmd, RUNS_LOG)
+    return control.launch(cmd, RUNS_LOG)
 
 
 def run_skipped(name: str) -> dict:
@@ -6983,23 +7030,18 @@ def run_skipped(name: str) -> dict:
         raise control.Refused(f"{name} names no repo to run in; a ticket the pipeline routes to a repo gets one at "
                               "the next poll")
     cfg = config.load()
+    repo_name, tid = entry["repo"], str(entry["id"])
     with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
-        if run_store.issue_running(entry["repo"], entry["id"]):
+        if run_store.issue_running(repo_name, tid):
             raise control.Busy(name)
-        if not tasks.pending_start(entry["repo"], str(entry["id"])):
-            if slots.slots_free_to_start(cfg.max_parallel) <= 0:
-                raise slots.NoFreeSlot(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}; wait for a run "
-                                      "to finish or raise max_parallel in Settings")
-            _, state = tasks.spawned(entry["repo"], str(entry["id"]),
-                                     lambda: spawn_run(entry["repo"], entry["id"], force=True))
-            if state == tasks.SLOT_QUEUE_FAILED:
-                repo = cfg.repo(entry["repo"])
-                return {"ticket": name, "id": entry["id"],
-                        **tasks.queued(repo, str(entry["id"]), tasks.NO_SLOT_AT_START, repo.pipeline)}
-            if state == "exited":
-                raise control.Refused(f"{name} ended before it showed as running; the end of "
-                                      f"{paths.short_path(paths.LOG_DIR / RUNS_LOG)} says why")
-    return {"ticket": name, "repo": entry["repo"], "id": entry["id"]}
+        if slots.slots_free_to_start(cfg.max_parallel) <= 0:
+            raise slots.NoFreeSlot(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}; wait for a run "
+                                   "to finish or raise max_parallel in Settings")
+        run_id = queue_run(repo_name, tid)
+        cmd = run_command(repo_name, tid, force=True, run_id=run_id)
+        record.write_launch(run_id, cmd, RUNS_LOG)
+        tasks.spawn_queued(repo_name, tid, lambda: control.launch(cmd, RUNS_LOG))
+    return {"ticket": name, "repo": repo_name, "id": entry["id"], "run": run_id}
 
 
 def answered_run(repo_name: str, tid: str) -> dict | None:

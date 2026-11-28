@@ -440,7 +440,7 @@ def lineage_runs(run_id: str) -> dict[str, list[dict]]:
     if not row or not row.get("repo") or not row.get("issue"):
         return whole
     known, found = set(whole), {}
-    for other in reversed(run_store.ticket_runs(row["repo"], row["issue"], limit=STEP_RUNS_READ)):
+    for other in reversed(run_store.ticket_runs(row["repo"], row["issue"], limit=STEP_RUNS_READ, include_queued=False)):
         source = other["id"]
         if source in whole:
             found[source] = whole[source]

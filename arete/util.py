@@ -961,6 +961,12 @@ def https_upgrade(resp: http.client.HTTPResponse, port: int | None) -> SplitResu
         return None
 
 
+def nusd(usd: float | int | None) -> int | None:
+    if usd is None:
+        return None
+    return round(usd * 1_000_000_000)
+
+
 def write_bytes_atomic(path: Path, data: bytes) -> None:
     write_durably(path, data, 0o600)
 

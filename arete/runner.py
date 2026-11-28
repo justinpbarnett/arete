@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 import shlex
+import sqlite3
 import sys
 import time
 from collections.abc import Callable
@@ -244,6 +245,51 @@ def admitted(kw: dict, limits: dict | None) -> dict:
                     for key, value in limits.items()}}
 
 
+def _resolve_account_id(auth: accounts.Auth) -> str | None:
+    if not run_store.has_accounts():
+        return None
+    try:
+        fp = account_of(auth)
+    except Exception:
+        fp = ""
+    if fp:
+        return run_store.account_id_for_fingerprint(fp)
+    return None
+
+
+def _default_provider(which: str, name: str, auth_mode: str, explicit: str = "") -> str:
+    if explicit:
+        return explicit
+    return routing.provider_of(name) or (
+        "anthropic" if which == "claude" else
+        ("openai" if auth_mode == "api_key" else "chatgpt") if which == "codex" else ""
+    )
+
+
+def _begin_step_row(step_id: int | None, auth: accounts.Auth, *, device: str, which: str, model: str,
+                    provider: str, auth_mode: str, resume: Session) -> tuple[str | None, str, Result | None]:
+    rver = record.runner_version_of(which)
+    if step_id is None:
+        return None, rver, None
+    acct_id = _resolve_account_id(auth) if paths.DB_FILE.exists() else None
+    try:
+        run_store.start_step(
+            step_id,
+            account_id=acct_id,
+            device=device,
+            runner=which,
+            runner_version=rver,
+            model=model,
+            provider=provider,
+            auth_mode=auth_mode,
+        )
+    except sqlite3.IntegrityError as error:
+        msg = str(error)
+        run_store.fail_step(step_id, msg, runner=which, model=model, provider=provider)
+        return None, rver, Result(ok=False, error=msg, runner=which, model=model, provider=provider, session=resume)
+    return acct_id, rver, None
+
+
 @factory_control.work
 def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trace: tuple[str, str] = ("", ""),
         resume: Session = NO_SESSION, cfg: config.Config | None = None, device: devices.Device | str = "local",
@@ -255,7 +301,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         route: dict | None = None, refusal: str = "", mode: str = "", layer: config.RepoLayer | None = None,
         scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None,
         hard_cap: bool = False, needs_server: bool = False, codex_headroom: dict | None = None,
-        max_steps: int | None = None, claude_tools: tuple[str, ...] = (), **kw) -> Result:
+        max_steps: int | None = None, claude_tools: tuple[str, ...] = (), chat_id: int | None = None, **kw) -> Result:
     if cfg is None:
         from . import pins
 
@@ -275,157 +321,225 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     target = devices.LOCAL if which == REPLAY else devices.resolve(device)
     trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
     record_id = trace[0] or record.new_id("call")
-    try_no = try_no or (run_store.step_tries(trace[0], trace[1]) + 1 if trace[0] else 1)
+    _, resolved_chat_id = run_store.step_node_and_chat(trace[1], chat_id)
+    from .store import db as db_store
+
+    if not try_no:
+        if trace[0] and paths.DB_FILE.exists():
+            try:
+                try_no = run_store.step_tries(trace[0], trace[1]) + 1
+            except (db_store.NoDatabase, db_store.IncompatibleSchema):
+                try_no = 1
+        else:
+            try_no = 1
+
+    def queue_row() -> int | None:
+        if not trace[0] or not paths.DB_FILE.exists() or os.environ.get("ARETE_DRY_RUN_NO_PERSIST") == "1":
+            return None
+        try:
+            return run_store.queue_step(
+                trace[0], trace[1], try_no, chat_id=resolved_chat_id,
+                effort=kw.get("effort", ""), tier=tier, kind=kind,
+            )
+        except (sqlite3.Error, db_store.NoDatabase, db_store.IncompatibleSchema):
+            return None
+
+    step_id = queue_row()
     prior = route
     chosen_by = {"launch": 1, "selection": prior} if prior else None
     atom = settings.step if settings else ""
-    refusal = refusal or guard.launch_refusal(trace[0], cwd, kw.get("add_dirs") or [])
-    if refusal:
-        return refused(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind,
-                       chosen_by, try_no, refusal, atom)
-    if which == REPLAY and (cfg.replay.all or not (settings and settings.requires.declared)):
-        if resume_only and not kept.id:
-            return unresumable(which, name, resume)
-        if remaining_tokens:
-            stood = routing.stands_for(model, run_with)[0]
-            verdict, why = codex_refusal(stood, codex_headroom, remaining_tokens,
-                                         remaining_budget() if remaining_budget else kw.get("max_budget_usd"))
-            if why:
-                skipped = [{"runner": stood, "model": name, "credential": "replay", "state": verdict, "detail": why,
-                            "until": ""}]
-                return Result(ok=False, runner=which, model=name, session=resume, skipped=skipped,
-                              error=" ".join(f"{NO_ROUTE}: {route_reasons(skipped)}".split()))
-        kw = admitted(kw, on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [],
-                       "launch": 1, "env": env_names(model, run_with, cfg, repo, trace[0], kw.get("extra_env"))}))
-        text = fresh_prompt(which) if fresh_prompt and not kept.id else prompt
-        if remaining_tokens:
-            remaining = remaining_tokens()
-            kw = {**kw, "max_tokens": min(kw.get("max_tokens") or remaining, remaining)}
-        return attempt(which, name, text, cwd, kept, cfg, trace, record_id, target, kw, tier, kind,
-                       accounts.Auth(), {"launch": 1, **({"selection": route} if route else {})}, try_no,
-                       atom)
-    if not target.remote:
-        repo = repo or cfg.repo_for_work_dir(cwd)
-    size = routing.routing_size(prompt, settings, kw)
-    active = layer if layer is not None else routing.layer_of(repo)
-    from . import pins
-    from .store import db as db_store
+    try:
+        refusal = refusal or guard.launch_refusal(trace[0], cwd, kw.get("add_dirs") or [])
+        if refusal:
+            sid, step_id = step_id, None
+            return refused(which, name, prompt, cwd, resume, cfg, trace, record_id, target, kw, tier, kind,
+                           chosen_by, try_no, refusal, atom, step_id=sid, chat_id=resolved_chat_id)
+        if which == REPLAY and (cfg.replay.all or not (settings and settings.requires.declared)):
+            if resume_only and not kept.id:
+                res = unresumable(which, name, resume)
+                run_store.fail_step(step_id, res.error, runner=which, model=name)
+                step_id = None
+                return res
+            if remaining_tokens:
+                stood = routing.stands_for(model, run_with)[0]
+                verdict, why = codex_refusal(stood, codex_headroom, remaining_tokens,
+                                             remaining_budget() if remaining_budget else kw.get("max_budget_usd"))
+                if why:
+                    skipped = [{"runner": stood, "model": name, "credential": "replay", "state": verdict, "detail": why,
+                                "until": ""}]
+                    res = Result(ok=False, runner=which, model=name, session=resume, skipped=skipped,
+                                 error=" ".join(f"{NO_ROUTE}: {route_reasons(skipped)}".split()))
+                    run_store.fail_step(step_id, res.error, runner=which, model=name)
+                    step_id = None
+                    return res
+            replay_auth = accounts.Auth()
+            acct_id, rver, floor_err = _begin_step_row(
+                step_id, replay_auth, device=target.name, which=which, model=name,
+                provider=_default_provider(which, name, replay_auth.mode), auth_mode=replay_auth.mode, resume=resume,
+            )
+            if floor_err is not None:
+                step_id = None
+                return floor_err
+            kw = admitted(kw, on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [],
+                           "launch": 1, "env": env_names(model, run_with, cfg, repo, trace[0], kw.get("extra_env"))}))
+            text = fresh_prompt(which) if fresh_prompt and not kept.id else prompt
+            if remaining_tokens:
+                remaining = remaining_tokens()
+                kw = {**kw, "max_tokens": min(kw.get("max_tokens") or remaining, remaining)}
+            sid, step_id = step_id, None
+            return attempt(which, name, text, cwd, kept, cfg, trace, record_id, target, kw, tier, kind,
+                           replay_auth, {"launch": 1, **({"selection": route} if route else {})}, try_no,
+                           atom, step_id=sid, chat_id=resolved_chat_id, account_id=acct_id, runner_version=rver)
+        if not target.remote:
+            repo = repo or cfg.repo_for_work_dir(cwd)
+        size = routing.routing_size(prompt, settings, kw)
+        active = layer if layer is not None else routing.layer_of(repo)
+        from . import pins
 
-    run_payer: str | None | object = routing._UNSET
-    if (active_pin := pins.current()) is not None:
-        run_payer = active_pin.payer
-    elif trace[0] and paths.DB_FILE.exists():
-        try:
-            if (run_row := run_store.run_get(trace[0])) is not None:
-                run_payer = run_row.get("payer")
-        except (db_store.NoDatabase, db_store.IncompatibleSchema):
-            pass
-    trip = Trip(cfg, repo, target,
-                routing.request_for(cfg, repo, which, name, settings, fallback, kw, size, active), resume,
-                remaining_budget, kw.get("max_budget_usd"), layer=active, scratch=scratch,
-                tokens=remaining_tokens, structured=kw.get("json_schema") is not None,
-                hard_cap=hard_cap, needs_server=needs_server, headroom=codex_headroom,
-                private_worker=bool(kw.get("private_worker")), payer=run_payer)
-    limited: list[Result] = []
-    previous: Stopped | None = None
-    launches, measured = 0, size
-    while True:
-        if hard_cap and kw.get("max_budget_usd") is not None:
-            trip.max_budget = kw["max_budget_usd"] - sum(r.paid_usd for r in limited)
-        picked, skipped = pick(trip)
-        if not picked:
-            wake = wake_up(skipped)
-            if wait_out_limits and wake:
-                say(f"{NO_ROUTE}, waiting until {routing.local_time(util.iso(wake))}: {route_reasons(skipped)}")
-                with waits("limit"):
-                    wait_until(trip, wake)
-                continue
-            done = exhausted(trip, skipped, limited, which, name, wake)
-            if trip.request.requires.declared:
-                given = {"launch": launches + 1, "skipped": skipped, "requested_effort": trip.request.effort,
-                         "selection": launched_selection(trip, prior, skipped, measured, error=done.error)}
-                res = refused(which, name, prompt, cwd, done.session, cfg, trace, record_id, target, kw, tier, kind,
-                              given, try_no, done.error, atom)
-                res.skipped, res.usage_limit = done.skipped, done.usage_limit
-                return with_spent(res, limited)
-            return with_spent(done, limited)
-        chosen_route = picked.candidate
-        if kw.get("native_observation") and (target.remote or chosen_route.runner != "pi"
-                                             or picked.auth.mode != "subscription"):
-            return Result(ok=False, runner=chosen_route.runner, model=name,
-                          error="native observation requires local Pi subscription")
-        text, session = session_for(trip, picked, prompt, fresh_prompt, previous, kw, record_id)
-        launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say, cwd=cwd, claude_tools=claude_tools)
-        openrouter = routing.claude_openrouter(chosen_route.runner, chosen_route.provider)
-        config_run = session.openrouter_run or record_id
-        if openrouter:
-            launch_kw["openrouter_config"] = paths.RUNS_DIR / config_run / "claude-openrouter"
-        final_size = routing.routing_size(text, settings, launch_kw)
-        measured = max(measured, final_size)
-        if (trip.request.requires.declared and final_size > trip.request.size
-                and (why := outgrown(trip, chosen_route, final_size))):
-            trip.barred[routing.route_key(chosen_route)] = why
-            continue
-        if resume_only and not session.id:
-            return with_spent(unresumable(chosen_route.runner, picked.name, trip.resume), limited)
-        launches += 1
-        trip.launched = True
-        selection = launched_selection(trip, prior, skipped, final_size, chosen_route, picked.name)
-        route = {**({"selection": selection} if selection else {}),
-                 "runner": chosen_route.runner, "model": picked.name,
-                 "provider": picked.selected.provider if picked.selected else chosen_route.provider,
-                 "auth_mode": picked.auth.mode, "credential": chosen_route.credential, "billing": chosen_route.billing,
-                 "effort": chosen_route.effort, "requested_effort": trip.request.effort, "tier": chosen_route.tier,
-                 "position": chosen_route.position, "requested": chosen_route.requested,
-                 "env": launch_env(picked, cfg, repo, trace[0], launch_kw.get("extra_env"),
-                                   launch_kw.get("ask_owner", False),
-                                   openrouter_config=launch_kw.get("openrouter_config")),
-                 "skipped": skipped, "launch": launches,
-                 **({"request_tokens": final_size} if trip.request.requires.declared else {})}
-        launch_kw = admitted(launch_kw, on_launch(route))
-        has_account = bool(picked.auth.identity or picked.auth.credential)
-        with ExitStack() as after_attempt:
-            if has_account and (picked.selected is None or picked.selected.using_login or picked.selected.key_available):
-                local_claude = sys.platform == "linux" and chosen_route.runner == "claude" and not target.remote
-                if accounts.record_resolved(picked.auth, defer_unconfigured=local_claude):
-                    after_attempt.callback(enroll_after_attempt, picked)
-            started = util.iso()
-            with verification_scratch.producing(launch_kw.pop("verification_attempt", None)):
-                res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target,
-                              launch_kw, tier, kind, picked.auth, route, try_no, atom,
-                              openrouter_quote=chosen_route.price if openrouter else None)
-        res.credential, res.effort, res.requested_effort, res.skipped = (
-            chosen_route.credential, chosen_route.effort, trip.request.effort, skipped)
-        if res.session.id:
-            res.session = replace(res.session, credential=chosen_route.credential, account=account_of(picked.auth),
-                                  generation=picked.auth.generation)
+        run_payer: str | None | object = routing._UNSET
+        if (active_pin := pins.current()) is not None:
+            run_payer = active_pin.payer
+        elif trace[0] and paths.DB_FILE.exists():
+            try:
+                if (run_row := run_store.run_get(trace[0])) is not None:
+                    run_payer = run_row.get("payer")
+            except (db_store.NoDatabase, db_store.IncompatibleSchema):
+                pass
+        trip = Trip(cfg, repo, target,
+                    routing.request_for(cfg, repo, which, name, settings, fallback, kw, size, active), resume,
+                    remaining_budget, kw.get("max_budget_usd"), layer=active, scratch=scratch,
+                    tokens=remaining_tokens, structured=kw.get("json_schema") is not None,
+                    hard_cap=hard_cap, needs_server=needs_server, headroom=codex_headroom,
+                    private_worker=bool(kw.get("private_worker")), payer=run_payer)
+        limited: list[Result] = []
+        previous: Stopped | None = None
+        launches, measured = 0, size
+        while True:
+            if step_id is None:
+                step_id = queue_row()
+            if hard_cap and kw.get("max_budget_usd") is not None:
+                trip.max_budget = kw["max_budget_usd"] - sum(r.paid_usd for r in limited)
+            picked, skipped = pick(trip)
+            if not picked:
+                wake = wake_up(skipped)
+                if wait_out_limits and wake:
+                    run_store.wait_step(step_id)
+                    say(f"{NO_ROUTE}, waiting until {routing.local_time(util.iso(wake))}: {route_reasons(skipped)}")
+                    with waits("limit"):
+                        wait_until(trip, wake)
+                    continue
+                done = exhausted(trip, skipped, limited, which, name, wake)
+                if trip.request.requires.declared:
+                    given = {"launch": launches + 1, "skipped": skipped, "requested_effort": trip.request.effort,
+                             "selection": launched_selection(trip, prior, skipped, measured, error=done.error)}
+                    sid, step_id = step_id, None
+                    res = refused(which, name, prompt, cwd, done.session, cfg, trace, record_id, target, kw, tier, kind,
+                                  given, try_no, done.error, atom, step_id=sid, chat_id=resolved_chat_id)
+                    res.skipped, res.usage_limit = done.skipped, done.usage_limit
+                    return with_spent(res, limited)
+                run_store.fail_step(step_id, done.error, runner=which, model=name, provider=done.provider)
+                step_id = None
+                return with_spent(done, limited)
+            chosen_route = picked.candidate
+            if kw.get("native_observation") and (target.remote or chosen_route.runner != "pi"
+                                                 or picked.auth.mode != "subscription"):
+                err_text = "native observation requires local Pi subscription"
+                run_store.fail_step(step_id, err_text, runner=chosen_route.runner, model=name)
+                step_id = None
+                return Result(ok=False, runner=chosen_route.runner, model=name, error=err_text)
+            text, session = session_for(trip, picked, prompt, fresh_prompt, previous, kw, record_id)
+            launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say, cwd=cwd, claude_tools=claude_tools)
+            openrouter = routing.claude_openrouter(chosen_route.runner, chosen_route.provider)
+            config_run = session.openrouter_run or record_id
             if openrouter:
-                res.session = replace(res.session, openrouter_model=picked.name, openrouter_run=config_run)
-        if not res.usage_limit:
-            if res.ok and paths.DB_FILE.exists() and devices_store.holds():
-                scopes = [found for a in picked.auths for s in routing.limit_scopes(a, picked.name)
-                          for found in (accounts.scope(a, s, picked.unknown),
-                                        accounts.legacy_scope(a, s, picked.unknown))
-                          if found]
-                devices_store.clear_holds(scopes, set_before=started)
-            return with_spent(res, limited)
-        limit = res.usage_limit
-        why = (f"{chosen_route.runner} model overloaded" if limit.kind == "overloaded"
-               else f"{chosen_route.runner} provider could not be reached" if limit.kind == "unreachable"
-               else f"{chosen_route.runner} {limit.kind or 'usage'} limit reached")
-        for a in picked.auths:
-            if hold_scope := accounts.scope(a, limit.scope, picked.unknown):
-                devices_store.hold(hold_scope, limit.until, why)
-        limited.append(res)
-        previous = Stopped(res, picked)
-        key = routing.route_key(chosen_route)
-        if picked.selected:
-            trip.pinned[key] = picked.selected
-        if limit.until:
-            ends = util.parse_iso(limit.until)
-            trip.floors[key] = (ends if ends > util.now() else util.now() + timedelta(seconds=HOLD_CHECK_SECONDS),
-                                picked.auth)
-        say(f"{routing.hold_words({'why': why, 'until': limit.until})}, trying another route")
+                launch_kw["openrouter_config"] = paths.RUNS_DIR / config_run / "claude-openrouter"
+            final_size = routing.routing_size(text, settings, launch_kw)
+            measured = max(measured, final_size)
+            if (trip.request.requires.declared and final_size > trip.request.size
+                    and (why := outgrown(trip, chosen_route, final_size))):
+                trip.barred[routing.route_key(chosen_route)] = why
+                continue
+            if resume_only and not session.id:
+                res = unresumable(chosen_route.runner, picked.name, trip.resume)
+                run_store.fail_step(step_id, res.error, runner=chosen_route.runner, model=picked.name)
+                step_id = None
+                return with_spent(res, limited)
+            provider_name = _default_provider(
+                chosen_route.runner, picked.name, picked.auth.mode,
+                picked.selected.provider if picked.selected else chosen_route.provider,
+            )
+            effective_auth_mode = "local" if chosen_route.credential == "local" else picked.auth.mode
+            acct_id, rver, floor_err = _begin_step_row(
+                step_id, picked.auth, device=target.name, which=chosen_route.runner, model=picked.name,
+                provider=provider_name, auth_mode=effective_auth_mode, resume=trip.resume,
+            )
+            if floor_err is not None:
+                step_id = None
+                return with_spent(floor_err, limited)
+            launches += 1
+            trip.launched = True
+            selection = launched_selection(trip, prior, skipped, final_size, chosen_route, picked.name)
+            route = {**({"selection": selection} if selection else {}),
+                     "runner": chosen_route.runner, "model": picked.name,
+                     "provider": picked.selected.provider if picked.selected else chosen_route.provider,
+                     "auth_mode": picked.auth.mode, "credential": chosen_route.credential, "billing": chosen_route.billing,
+                     "effort": chosen_route.effort, "requested_effort": trip.request.effort, "tier": chosen_route.tier,
+                     "position": chosen_route.position, "requested": chosen_route.requested,
+                     "env": launch_env(picked, cfg, repo, trace[0], launch_kw.get("extra_env"),
+                                       launch_kw.get("ask_owner", False),
+                                       openrouter_config=launch_kw.get("openrouter_config")),
+                     "skipped": skipped, "launch": launches,
+                     **({"request_tokens": final_size} if trip.request.requires.declared else {})}
+            launch_kw = admitted(launch_kw, on_launch(route))
+            has_account = bool(picked.auth.identity or picked.auth.credential)
+            sid, step_id = step_id, None
+            with ExitStack() as after_attempt:
+                if has_account and (picked.selected is None or picked.selected.using_login or picked.selected.key_available):
+                    local_claude = sys.platform == "linux" and chosen_route.runner == "claude" and not target.remote
+                    if accounts.record_resolved(picked.auth, defer_unconfigured=local_claude):
+                        after_attempt.callback(enroll_after_attempt, picked)
+                started = util.iso()
+                with verification_scratch.producing(launch_kw.pop("verification_attempt", None)):
+                    res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target,
+                                  launch_kw, tier, kind, picked.auth, route, try_no, atom,
+                                  openrouter_quote=chosen_route.price if openrouter else None,
+                                  step_id=sid, chat_id=resolved_chat_id, account_id=acct_id, runner_version=rver)
+            res.credential, res.effort, res.requested_effort, res.skipped = (
+                chosen_route.credential, chosen_route.effort, trip.request.effort, skipped)
+            if res.session.id:
+                res.session = replace(res.session, credential=chosen_route.credential, account=account_of(picked.auth),
+                                      generation=picked.auth.generation)
+                if openrouter:
+                    res.session = replace(res.session, openrouter_model=picked.name, openrouter_run=config_run)
+            if not res.usage_limit:
+                if res.ok and paths.DB_FILE.exists() and devices_store.holds():
+                    scopes = [found for a in picked.auths for s in routing.limit_scopes(a, picked.name)
+                              for found in (accounts.scope(a, s, picked.unknown),
+                                            accounts.legacy_scope(a, s, picked.unknown))
+                              if found]
+                    devices_store.clear_holds(scopes, set_before=started)
+                return with_spent(res, limited)
+            limit = res.usage_limit
+            why = (f"{chosen_route.runner} model overloaded" if limit.kind == "overloaded"
+                   else f"{chosen_route.runner} provider could not be reached" if limit.kind == "unreachable"
+                   else f"{chosen_route.runner} {limit.kind or 'usage'} limit reached")
+            for a in picked.auths:
+                if hold_scope := accounts.scope(a, limit.scope, picked.unknown):
+                    devices_store.hold(hold_scope, limit.until, why)
+            limited.append(res)
+            previous = Stopped(res, picked)
+            key = routing.route_key(chosen_route)
+            if picked.selected:
+                trip.pinned[key] = picked.selected
+            if limit.until:
+                ends = util.parse_iso(limit.until)
+                trip.floors[key] = (ends if ends > util.now() else util.now() + timedelta(seconds=HOLD_CHECK_SECONDS),
+                                    picked.auth)
+            say(f"{routing.hold_words({'why': why, 'until': limit.until})}, trying another route")
+    except BaseException as exc:
+        if step_id is not None:
+            run_store.fail_step(step_id, record.failure(exc), runner=which, model=name)
+        raise
 
 
 def enroll_after_attempt(picked: Picked) -> None:
@@ -589,10 +703,11 @@ def launched_selection(trip: Trip, prior: dict | None, skipped: list[dict], size
 
 def refused(which: str, name: str, prompt: str, cwd: Path | str, session: Session, cfg: config.Config,
             trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str, kind: str,
-            route: dict | None, try_no: int, error: str, atom: str = "") -> Result:
+            route: dict | None, try_no: int, error: str, atom: str = "", *,
+            step_id: int | None = None, chat_id: int | None = None) -> Result:
     return attempt(which, name, prompt, cwd, session, cfg, trace, record_id, target,
                    {**kw, **({"remote": target} if target.remote else {}), "budget_error": error},
-                   tier, kind, accounts.Auth(), route, try_no, atom)
+                   tier, kind, accounts.Auth(), route, try_no, atom, step_id=step_id, chat_id=chat_id)
 
 
 def passed_over(found, why: str, detail: str, until: str = "") -> dict:
@@ -1016,12 +1131,16 @@ def _step_inputs_for(prompt: str, trace: tuple[str, str], kw: dict, resume: Sess
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
             trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str = "",
             kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None, try_no: int = 0,
-            atom: str = "", *, openrouter_quote: routing.Quote | None = None) -> Result:
+            atom: str = "", *, openrouter_quote: routing.Quote | None = None,
+            step_id: int | None = None, chat_id: int | None = None, account_id: str | None = None,
+            runner_version: str = "") -> Result:
     auth = auth or (authentication(name, which, cfg=cfg, device=target) if which != REPLAY else accounts.Auth())
     if target.remote and which == "claude":
         kw["leaf"] = f"{record.slug(trace[1])}-{try_no}"
     route = route or {}
-    header = {"runner": which, "model": name, "device": target.name, **origin(cwd, cfg, target), "cwd": str(cwd),
+    rver = runner_version or record.runner_version_of(which)
+    on_local = route.get("credential") == "local"
+    header = {"runner": which, "runner_version": rver, "model": name, "device": target.name, **origin(cwd, cfg, target), "cwd": str(cwd),
               "auth_mode": auth.mode, "credential": route.get("credential", ""), "billing": route.get("billing", ""),
               "requested_effort": route.get("requested_effort", ""), "tier": route.get("tier", tier),
               "position": route.get("position", 0), "requested": route.get("requested", True),
@@ -1055,6 +1174,11 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         hidden.add(selected.hidden)
         header["env"] = route["env"]
         header["provider"] = selected.provider
+    rate = cfg.pricing.get(name) or cfg.pricing.get(f"{which}:{name}")
+    if rate:
+        header["pricing_rate"] = [rate[0], rate[1]]
+    if on_local or (which == "pi" and (header["provider"] or routing.provider_of(name)) in cfg.local_providers):
+        header["local_billing"] = True
     subject = f"{record_id}/{trace[1]}" if record_id else trace[1]
 
     def safe_line(line):
@@ -1064,7 +1188,6 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     started = time.monotonic()
     at = util.now()
     max_tokens = kw.pop("max_tokens", None)
-    on_local = route.get("credential") == "local"
 
     def charged(res: Result) -> float:
         if openrouter_quote is not None:
@@ -1083,7 +1206,15 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                              tier=tier, kind=kind, try_no=try_no, auth_mode="local" if on_local else "",
                              inputs=step_inputs, settings_sha=step_settings_sha, blob_rows=step_blob_rows,
                              prompt_version=step_prompt_version, prompt_level=step_prompt_level,
-                             schema_version=step_schema_version)
+                             schema_version=step_schema_version,
+                             step_id=step_id, chat_id=chat_id, device=target.name, account_id=account_id,
+                             runner_version=rec.runner_version or rver, unread=rec.unread_count)
+                if rec.unread_count > 0 and paths.DB_FILE.exists():
+                    from .store import incidents as incident_store
+
+                    alert_key = f"record:unread:{which}:{rec.runner_version or rver}:{rec.first_unknown or 'unknown'}"
+                    if not incident_store.alert_get(alert_key):
+                        incident_store.alert_set(alert_key, None)
         except BaseException as error:
             rec.finish(replace(res, ok=False, error=scrub.text(
                 f"cost is not in steps: {record.failure(error)}; {res.error}", "record", subject, extra=hidden)),
@@ -1101,8 +1232,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     meter = Meter(max_tokens, kw.get("max_budget_usd") if max_tokens is not None or openrouter_quote is not None else None,
                   (lambda r: priced(r, cfg)) if openrouter_quote is None else charged,
                   Result(ok=False, session=resume, runner=which, model=name, auth_mode=auth.mode),
-                  actions=kw.pop("action_limit", None), reader=record.READERS[which](header))
-    with record.Recorder(record_id, trace[1], header, hidden) as rec:
+                  actions=kw.pop("action_limit", None), reader=record.reader_for(header))
+    with record.Recorder(record_id, trace[1], header, hidden, step_id=step_id) as rec:
         try:
             budget_error = kw.pop("budget_error", "")
             if budget_error:

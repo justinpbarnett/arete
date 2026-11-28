@@ -319,7 +319,12 @@ class Check:
         from . import environment, record
 
         path = f"/api/v1/runs/{self.run}"
+        deadline = time.monotonic() + 5.0
         before = self.read(path)["run"]
+        while before["status"] == "queued" and time.monotonic() < deadline:
+            time.sleep(0.05)
+            before = self.read(path)["run"]
+        require(before["status"] == "running", f"fixture child did not claim run {self.run}")
         with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.buffer.read(1)"],
                               stdin=subprocess.PIPE, start_new_session=True, env=environment.build(())) as replacement:
             record.note(self.run, pid=replacement.pid)
@@ -363,10 +368,18 @@ class Check:
         return done
 
     def cli(self):
-        done = self.cli_call("task", "start", "--repo", self.task_body["repo"], "--key", self.key, self.task_body["prompt"])
-        require(f"Idempotency-Key: {self.key}" in done.stderr, "arete task start did not print its key")
+        v1_body = {"repo": self.task_body["repo"], "body": self.task_body["prompt"], "kind": "feat", "start": True}
+        cli_key = "check-cli-replay-key"
+        with self.response("POST", "/api/v1/tasks", v1_body, headers={"Idempotency-Key": cli_key}) as resp:
+            raw_first = resp.read()
+            require(resp.status in (200, 201), f"POST /api/v1/tasks returned {resp.status}: {raw_first!r}")
+        v1_created = json.loads(raw_first)
+        spawns_after = len(self.spawn)
+        done = self.cli_call("task", "start", "--repo", self.task_body["repo"], "--key", cli_key, self.task_body["prompt"])
+        require(f"Idempotency-Key: {cli_key}" in done.stderr, "arete task start did not print its key")
         result = json.loads(done.stdout)
-        require((result["task"], result["run"]) == (self.task, self.run) and len(self.spawn) == 1,
+        require((result["task"], result["run"]) == (v1_created["task"]["id"], (v1_created.get("run") or {}).get("id", ""))
+                and len(self.spawn) == spawns_after,
                 "arete task start did not replay the HTTP-started task and run")
         shown = self.cli_call("task", "show", self.task, "--json")
         require(json.loads(shown.stdout)["id"] == self.task, "arete task show did not read the loopback task")
@@ -429,14 +442,15 @@ class Check:
 
     def shapes(self):
         from . import (
-            agent, cohorts, contract, dashboard, devices, leases, outbox, paths, principals, private_evidence, record,
-            replay,
-            secretstore, triage,
+            agent, cohorts, contract, control, dashboard, devices, heartbeat, leases, oncall, outbox, paths,
+            pipeline, principals, private_evidence, record, replay, research, secretstore, triage,
         )
+        from . import tasks as tasks_mod
         from .sighting import Sighting
         from .store import blobs, chats, db, incidents, insights, push, runs, tokens
         from .store import evidence as evidence_store
         from .store import inbox as inbox_store
+        from .store import tasks as task_store
         from .store import triage as triage_store
 
         record.step(self.run, "plan", agent.Result(ok=True, runner="replay"), 0)
@@ -447,6 +461,7 @@ class Check:
         fixture_lease.close("", fenced=False)
         chat = chats.chat_add("")
         chat_for_file = chats.chat_add("")
+        chat_for_send = chats.chat_add("")
         chats.chat_say(chat_for_file, "arete", "Drafted", draft_title="Fixture draft", draft_body="Fixture draft body")
         incident, _ = incidents.record_incident(Sighting("check", "expected", "fixture", "", "fixture incident", 1, "", ""))
         incidents.alert_set("fixture-alert", None)
@@ -499,12 +514,31 @@ class Check:
         insights.research_set(ticket.ref, status="done", title="Fixture research")
         stopped = record.start("loop", pid=0)
         session = record.start("session")
+        run_task = task_store.task_add(replay.SAMPLE_REPO, "Task to start via task.run", "Run me", "feat")
         fixture_token, _ = tokens.issue(principals.owner(), "Contract example", ["read"])
         secretstore.put("global", "DEMO_KEY", "fixture-contract-key", "api_key", "hand")
         paths.record_dir(session).mkdir(parents=True, exist_ok=True)
+        turn_step = runs.steps(self.run)[0]
+        if not runs.step_turns(turn_step["id"]):
+            rec_files = record.record_files(self.run)
+            if rec_files:
+                rec_path = rec_files[0]
+            else:
+                with record.Recorder(self.run, "plan", {"runner": "replay", "model": "replay"}, step_id=turn_step["id"]) as rec:
+                    rec.line('{"type":"replay","answer":"fixture"}')
+                    rec_path = rec.path
+            first_offset, first_len, _ = next(record.AppendedLines(rec_path).read_members(final=True))
+            runs.insert_turn(
+                turn_step["id"], 1, self.run, at="2026-01-01T00:00:00Z", status="ok",
+                tool="", excerpt="fixture", seconds=0.0, tokens_in=1, cache_read=0, tokens_out=1,
+                cost_nusd=0, file=record._relative_record_file(rec_path),
+                member_offset=first_offset, member_len=first_len,
+            )
         cohorts.declare("example", replay.SAMPLE_REPO, "fixture", "single known task", tickets=[self.task],
                         closes="2099-01-01T00:00:00Z", hours=24)
-        identities = {"task": self.task, "run": self.run, "step": str(runs.steps(self.run)[0]["id"]),
+        identities = {"task": self.task, "run": self.run, "step": str(turn_step["id"]),
+                      "node": str(turn_step.get("node") or turn_step["step"]), "try": str(turn_step.get("try") or 1),
+                      "n": "1", "ticket": ticket.ref,
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
                       "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
                       "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}",
@@ -516,8 +550,11 @@ class Check:
             resource = name.partition(".")[0]
             ob_item = outbox_targets.get(name, f"OB-{ob_main}")
             target = {**values, **identities, "id": identities.get(resource, ""),
-                      "chat": str(chat_for_file) if name == "chat.file" else identities["chat"],
+                      "chat": (str(chat_for_file) if name == "chat.file"
+                               else str(chat_for_send) if name in ("chat.send", "chat.session_start")
+                               else identities["chat"]),
                       "item": ob_item if resource == "outbox" else identities["item"],
+                      "task": run_task if name == "task.run" else identities["task"],
                       "run": stopped if name == "run.stop" else session if contract.keyed_write(op) else self.run}
             for field in re.findall(r"\{(\w+)\}", path):
                 path = path.replace("{" + field + "}", quote(target[field], safe=""))
@@ -580,6 +617,43 @@ class Check:
                     headers, raw = self.request(method, path, fixture_blob,
                                                 headers={**(key or {}), "Content-Type": "application/octet-stream"},
                                                 status=op["success_status"])
+                elif name in ("task.run", "session.start", "chat.session_start", "loop.start", "loop.try", "loop.draft"):
+                    dummy_proc = type("_P", (), {
+                        "pid": 0, "poll": lambda self: None, "terminate": lambda self: None,
+                        "kill": lambda self: None, "wait": lambda self, timeout=None: 0,
+                    })()
+                    with (patch.object(control, "launch", return_value=dummy_proc),
+                          patch.object(control, "detach", return_value=dummy_proc)):
+                        headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                elif name in ("run.resume", "run.repair", "run.step"):
+                    q_run = pipeline.queue_run(replay.SAMPLE_REPO, self.task)
+                    stub_ans = tasks_mod.answer(self.task, replay.SAMPLE_REPO, q_run, "queued", "started")
+                    fn_name = {"run.resume": "resume", "run.repair": "repair", "run.step": "run_step"}[name]
+                    with patch.object(tasks_mod, fn_name, return_value=stub_ans):
+                        headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                elif name == "chat.send":
+                    from . import chat as chat_mod
+
+                    def _stub_chat_answer(chat_id, text, message_id, project, *, run_id=""):
+                        if run_id:
+                            record.settle(run_id, "done")
+                        chats.chat_say(chat_id, "arete", "Fixture reply", busy=0)
+
+                    with patch.object(chat_mod, "answer", side_effect=_stub_chat_answer):
+                        headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                elif name == "triage.refresh":
+                    with patch.object(triage, "run", return_value=0):
+                        headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                elif name == "triage.research":
+                    with (patch.object(research, "ticket", return_value={"ref": ticket.ref}),
+                          patch.object(research, "run_now", return_value=0)):
+                        headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                elif name == "health.check":
+                    with patch.object(heartbeat, "run", return_value=0):
+                        headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                elif name == "incident.scan":
+                    with patch.object(oncall, "scan", return_value={"seen": 0}):
+                        headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 else:
                     headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 data = json.loads(raw)
@@ -661,9 +735,9 @@ def worker(lifeline):
             codebase.load()
             children = []
 
-            def spawn(repo, tid, force=False):
+            def spawn(repo, tid, force=False, *, run_id=""):
                 entry = "from arete.api_check import fixture_child; fixture_child(*sys.argv[1:])"
-                child = control.launch(child_command(SOURCE, entry, repo, str(tid)), start_new_session=False)
+                child = control.launch(child_command(SOURCE, entry, repo, str(tid), run_id), start_new_session=False)
                 children.append(child)
                 cleanup.callback(reap, child)
                 return child
@@ -698,12 +772,15 @@ def worker(lifeline):
     return 0
 
 
-def fixture_child(repo, ticket):
+def fixture_child(repo, ticket, run_id=""):
     with offline():
         from . import launch_lease, record
 
         launch_lease.verify(repo, ticket)
-        record.start("pipeline", repo=repo, issue=ticket)
+        if run_id:
+            record.claim(run_id)
+        else:
+            record.start("pipeline", repo=repo, issue=ticket)
         threading.Event().wait()
 
 

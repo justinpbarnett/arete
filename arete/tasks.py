@@ -151,7 +151,11 @@ def recover_start(claim, force=True):
 
 def live_run(repo: str, tid: str) -> dict | None:
     row = run_store.running_run(repo, tid)
-    return row if row and slots.holding([row], "pipeline") else None
+    if not row:
+        return None
+    if row["status"] == "queued":
+        return row
+    return row if slots.holding([row], "pipeline") else None
 
 
 def run_ids(repo: str, tid: str) -> list[str]:
@@ -172,13 +176,23 @@ def queued(repo: config.Repo, tid: str, why: str, poller_picks: bool) -> dict:
     return answer(tid, repo.name, "", "queued", f"{why}; {later}")
 
 
+def spawn_queued(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> subprocess.Popen:
+    from .store import factory as factory_state
+
+    factory_state.admit()
+    try:
+        foundation.require_workspace_contract()
+    except foundation.IncompatibleSchema as e:
+        raise control.Refused(str(e)) from e
+    with PENDING_LOCK, launch_lease.acquiring(repo_name, tid):
+        return spawn()
+
+
 def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool, *, owner_forcing=False) -> dict:
     from .store import factory as factory_state
 
     factory_state.admit()
     with PENDING_LOCK, util.lock(START_LOCK, wait=True):
-        if pending := pending_start(repo.name, tid):
-            return pending
         if run := live_run(repo.name, tid):
             return answer(tid, repo.name, run["id"], "running", "already running")
         if why := held(cfg, repo):
@@ -186,19 +200,18 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
         if why := runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
                                       runlimits.Policy.of(config.load_layer(repo.layer_dir)), force).reason:
             raise control.Refused(why)
-        new, state = spawned(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force))
-        if state == SLOT_QUEUE_FAILED:
-            return queued(repo, tid, NO_SLOT_AT_START, poller_picks)
-        if state != "exited":
-            result = answer(tid, repo.name, new, state, "started" if new else "child is starting")
-            if owner_forcing:
-                from . import cohorts
+        try:
+            foundation.require_workspace_contract()
+        except foundation.IncompatibleSchema as e:
+            raise control.Refused(str(e)) from e
+        run_id = pipeline.queue_run(repo.name, tid)
+        spawn_queued(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force, run_id=run_id))
+        result = answer(tid, repo.name, run_id, "running", "started")
+        if owner_forcing:
+            from . import cohorts
 
-                cohorts.owner_intervention(result, "owner-forced start")
-            return result
-        if why := held(cfg, repo):
-            return queued(repo, tid, why, poller_picks)
-    raise did_not_show(repo, tid)
+            cohorts.owner_intervention(result, "owner-forced start")
+        return result
 
 
 def pending_start(repo_name, tid):
@@ -272,21 +285,6 @@ def spawn_pending(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen
         return proc
 
 
-def spawned(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> tuple[str, str]:
-    spawn_pending(repo_name, tid, spawn)
-    give_up = time.monotonic() + pipeline.RUN_START_SECONDS
-    while True:
-        run, state = pending_state(repo_name, tid)
-        if state != "starting" or time.monotonic() >= give_up:
-            return run, state
-        time.sleep(0.1)
-
-
-def did_not_show(repo: config.Repo, tid: str) -> control.Refused:
-    return control.Refused(f"{tracker.issue_name(repo.name, tid)} did not show as running; the end "
-                           f"of {paths.short_path(paths.LOG_DIR / pipeline.RUNS_LOG)} says why")
-
-
 def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = "", ahead: bool = False) -> None:
     if run := live_run(repo.name, tid):
         raise control.Busy(f"run {run['id']} of {tracker.issue_name(repo.name, tid)}")
@@ -300,22 +298,21 @@ def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = 
 
 
 def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], ahead: bool = False,
-           admission=None) -> dict:
-    def admitted_spawn():
-        if admission and not writes.check_run(*admission, public=True):
-            raise control.NotFound(f"no run {admission[0]}")
-        return control.launch(command, pipeline.RUNS_LOG)
-
+           admission=None, *, continues: str | None = None, restart: str = "", only_step: str = "") -> dict:
     with PENDING_LOCK, util.lock(START_LOCK, wait=True):
-        if pending := pending_start(repo.name, tid):
-            return pending
         free_to_start(cfg, repo, tid, ahead=ahead)
-        new, state = spawned(repo.name, tid, admitted_spawn)
-        if state == SLOT_QUEUE_FAILED:
-            return queued(repo, tid, NO_SLOT_AT_START, repo.pipeline)
-        if state != "exited":
-            return answer(tid, repo.name, new, state, "started" if new else "child is starting")
-    raise did_not_show(repo, tid)
+        try:
+            foundation.require_workspace_contract()
+        except foundation.IncompatibleSchema as e:
+            raise control.Refused(str(e)) from e
+        with writes.atomic():
+            if admission and not writes.check_run(*admission, public=True):
+                raise control.NotFound(f"no run {admission[0]}")
+            run_id = pipeline.queue_run(repo.name, tid, continues=continues, restart=restart, only_step=only_step)
+        full_command = [*command, "--run-id", run_id]
+        record.write_launch(run_id, full_command, pipeline.RUNS_LOG)
+        spawn_queued(repo.name, tid, lambda: control.launch(full_command, pipeline.RUNS_LOG))
+        return answer(tid, repo.name, run_id, "running", "started")
 
 
 def launch_recovery(cfg: config.Config, repo: config.Repo, row: dict, attempt: dict) -> dict:
@@ -348,16 +345,16 @@ def launch_recovery(cfg: config.Config, repo: config.Repo, row: dict, attempt: d
             else:
                 command = pipeline.adw_command(repo.name, tid, "--repair" if repairing else "--continue", row["id"])
 
+            run_id = pipeline.queue_run(repo.name, tid, continues=row["id"], restart="resume")
+            full_command = [*command, "--run-id", run_id]
+            record.write_launch(run_id, full_command, pipeline.RUNS_LOG)
+
             def spawn():
                 launch_lease.CURRENT.get().recovery = attempt["id"]
-                return control.launch(command, pipeline.RUNS_LOG)
+                return control.launch(full_command, pipeline.RUNS_LOG)
 
-            new, state = spawned(repo.name, tid, spawn)
-            if state == SLOT_QUEUE_FAILED:
-                return answer(tid, repo.name, "", "queued", "Waiting for an available run slot")
-            if state == "exited":
-                return answer(tid, repo.name, "", "refused", "Recovery child did not pass admission")
-            return answer(tid, repo.name, new, state, "Recovery child started" if new else "Recovery child is starting")
+            spawn_queued(repo.name, tid, spawn)
+            return answer(tid, repo.name, run_id, "running", "Recovery child started")
 
 
 def run_of(run_id: str) -> tuple[config.Config, config.Repo, dict]:
@@ -410,6 +407,15 @@ def reply(run_id: str, text: str) -> dict:
         if waiting:
             return reply_to_asks(cfg, repo, row, waiting, text)
         free_to_start(cfg, repo, tid, "; the answer was not stored")
+        if tracker.is_task_id(tid):
+            with PENDING_LOCK, util.lock(START_LOCK, wait=True):
+                with writes.atomic():
+                    if not task_store.task_comment(tid, principals.current(), text):
+                        raise control.NotFound(f"no task {tid}")
+                    new_run_id = pipeline.queue_run(repo.name, tid, continues=row["id"], restart="answer")
+                util.write_bytes_atomic(paths.RUNS_DIR / run_id / pipeline.ANSWER_FILE, text.encode())
+                spawn_queued(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, True, run_id=new_run_id))
+            return answer(tid, repo.name, new_run_id, "running", "started")
         kept = store_answer(cfg, repo, tid, text)
         util.write_bytes_atomic(paths.RUNS_DIR / run_id / pipeline.ANSWER_FILE, text.encode())
         started = begin(cfg, repo, tid, force=True, poller_picks=repo.pipeline)
@@ -480,13 +486,18 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
             if not current or current["status"] != "open":
                 raise AlreadyResolved(f"ask {a['id']} was already resolved, so this answer was not stored")
     kept = store_answer(cfg, repo, tid, text)
-    with writes.atomic():
-        for a in waiting:
-            answers = owner_asks.text_answers(owner_asks.unstaged(a), text)
-            if not ask_store.ask_close(a["id"], "answered", owner_asks.combine_staged(a, answers)):
-                raise AlreadyResolved(f"ask {a['id']} was already resolved; the answer was stored as a comment, "
-                                      "but this reply did not update the asks or resume the run")
-    started = continue_asked(cfg, repo, row, command)
+    with PENDING_LOCK, util.lock(START_LOCK, wait=True):
+        with writes.atomic():
+            for a in waiting:
+                answers = owner_asks.text_answers(owner_asks.unstaged(a), text)
+                if not ask_store.ask_close(a["id"], "answered", owner_asks.combine_staged(a, answers)):
+                    raise AlreadyResolved(f"ask {a['id']} was already resolved; the answer was stored as a comment, "
+                                          "but this reply did not update the asks or resume the run")
+            new_run_id = pipeline.queue_run(repo.name, tid, continues=row["id"], restart="answer")
+        full_command = [*command, "--run-id", new_run_id]
+        record.write_launch(new_run_id, full_command, pipeline.RUNS_LOG)
+        spawn_queued(repo.name, tid, lambda: control.launch(full_command, pipeline.RUNS_LOG))
+    started = answer(tid, repo.name, new_run_id, "running", "started")
     return {**started, "why": f"{started['why']}; {kept}"} if kept else started
 
 
@@ -598,12 +609,18 @@ def answer_ask(ask_id: str, body) -> dict:
                     secret_move.put_legacy_repo(repo.name, given)
             except (OSError, ValueError, secretstore.StoreMissing) as error:
                 raise control.Refused(f"could not store {', '.join(given)} ({error}); the ask stays open") from None
-        if not ask_store.ask_close(ask_id, "answered", answers):
-            raise AlreadyResolved(f"ask {ask_id} was answered from the tracker a moment ago, so this answer was not stored")
-        if more := ask_store.asks_of(row["id"], "open"):
-            return answer(tid, repo.name, "", "waiting",
-                          f"{util.count(len(more), 'more ask')} of run {row['id']} wait for an answer")
-        return continue_asked(cfg, repo, row, command)
+        with PENDING_LOCK, util.lock(START_LOCK, wait=True):
+            with writes.atomic():
+                if not ask_store.ask_close(ask_id, "answered", answers):
+                    raise AlreadyResolved(f"ask {ask_id} was answered from the tracker a moment ago, so this answer was not stored")
+                if more := ask_store.asks_of(row["id"], "open"):
+                    return answer(tid, repo.name, "", "waiting",
+                                  f"{util.count(len(more), 'more ask')} of run {row['id']} wait for an answer")
+                new_run_id = pipeline.queue_run(repo.name, tid, continues=row["id"], restart="answer")
+            full_command = [*command, "--run-id", new_run_id]
+            record.write_launch(new_run_id, full_command, pipeline.RUNS_LOG)
+            spawn_queued(repo.name, tid, lambda: control.launch(full_command, pipeline.RUNS_LOG))
+        return answer(tid, repo.name, new_run_id, "running", "started")
 
 
 def answers_holder(ask: dict) -> dict | None:
@@ -648,7 +665,7 @@ def continuing(cfg: config.Config, repo: config.Repo, row: dict) -> list[str]:
 def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: list[str] | None = None,
                    admission=None) -> dict:
     return launch(cfg, repo, str(row["issue"]), command or continuing(cfg, repo, row), ahead=True,
-                  admission=admission)
+                  admission=admission, continues=row["id"], restart="answer")
 
 
 def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> workspace.Release | None:
@@ -863,7 +880,7 @@ def resume(run_id: str, step: str = "", base_version=None, *, environment_releas
                 tid = str(row["issue"])
                 return launch(cfg, repo, tid, control.command(["run", repo.name, tid, "--local", "--force",
                               "--continue", run_id, "--environment-release", environment_release]),
-                              admission=(run_id, base_version))
+                              admission=(run_id, base_version), continues=run_id, restart="resume")
         if path == "classic":
             path = ""
         if path == "orchestrate":
@@ -873,7 +890,7 @@ def resume(run_id: str, step: str = "", base_version=None, *, environment_releas
                 repo.name, str(row["issue"]), "--force", "--continue", run_id,
                 *(["--action", step] if step else []),
                 *(["--environment-release", environment_release] if environment_retry else [])),
-                admission=(run_id, base_version))
+                admission=(run_id, base_version), continues=run_id, restart="resume")
         if step and step_named(step) and not factory.started(run_id, step):
             raise control.Refused(f"run {run_id} never started {step}, so it cannot resume from it")
         if not path and not flows.ran_on_seam(run_id):
@@ -886,7 +903,7 @@ def resume(run_id: str, step: str = "", base_version=None, *, environment_releas
         return launch(cfg, repo, tid, pipeline.adw_command(repo.name, tid, "--force", "--continue", run_id,
                                                            *(["--from", step] if step else []),
                                                            *(["--environment-release", environment_release] if environment_retry else [])),
-                      admission=(run_id, base_version))
+                      admission=(run_id, base_version), continues=run_id, restart="resume")
 
 
 def repair(run_id: str, base_version=None) -> dict:
@@ -914,7 +931,7 @@ def repair(run_id: str, base_version=None) -> dict:
         if refusal := pipeline.script_refusal(cfg, repo, tid, pipeline.Script(path, None, repairs=run_id)):
             raise control.Refused(refusal)
         return launch(cfg, repo, tid, pipeline.adw_command(repo.name, tid, "--force", "--repair", run_id),
-                      admission=(run_id, base_version))
+                      admission=(run_id, base_version), continues=run_id, restart="resume")
 
 
 def adaptive_action(row: dict, action: str) -> dict:
@@ -970,7 +987,8 @@ def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
                 raise control.Refused("adaptive action reruns keep their accepted settings; select new settings through a resumed controller")
             return launch(cfg, repo, str(row["issue"]), pipeline.adw_command(
                 repo.name, str(row["issue"]), "--force", "--continue", run_id,
-                "--action", step, "--only-action"), admission=(run_id, base_version))
+                "--action", step, "--only-action"), admission=(run_id, base_version),
+                continues=run_id, restart="step", only_step=step)
         step_named(step)
         if not factory.started(run_id, step):
             raise control.Refused(f"run {run_id} never started {step}, so it cannot run it alone")
@@ -992,7 +1010,8 @@ def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
                                   "cannot run alone on it")
         return launch(cfg, repo, tid, pipeline.adw_command(
             repo.name, tid, "--continue", run_id, "--only", step,
-            *(f"--set={step}.{s}" for s in settings)), admission=(run_id, base_version))
+            *(f"--set={step}.{s}" for s in settings)), admission=(run_id, base_version),
+            continues=run_id, restart="step", only_step=step)
 
 
 def removed_tree(run_id: str, step: str) -> str:

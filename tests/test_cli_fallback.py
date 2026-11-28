@@ -55,9 +55,10 @@ def answer_ask(values):
     body = {'answers': [{'secret': value} for value in values.values()]}
     with mock.patch.multiple(tasks, run_of=mock.Mock(return_value=(cfg, cfg.repo('demo'), row)),
                              no_later_run=mock.Mock(), live_run=mock.Mock(return_value=None),
-                             free_to_start=mock.Mock(), continuing=mock.Mock(),
-                             continue_asked=mock.Mock(return_value={'state': 'running'})):
-        assert tasks.answer_ask('demo-ask', body) == {'state': 'running'}
+                             free_to_start=mock.Mock(), continuing=mock.Mock(return_value=['python', '-m', 'arete']),
+                             spawn_queued=mock.Mock()):
+        res = tasks.answer_ask('demo-ask', body)
+        assert res['state'] == 'running' and res['run']
     answered = asks.ask_get('demo-ask')
     assert answered['status'] == 'answered'
     assert all(entry['set'] for entry in answered['answers'])
@@ -254,31 +255,52 @@ class CliRouteFallbackTests(unittest.TestCase):
             ask: {"asks": [{"run": "r1", "id": "1", "questions": []}]},
             feed: {"restore_epoch": 0, "lines": []},
             events_route: report, follow_events: report,
-            "POST /api/tasks": {"run": "r1", "task": "t-1234", "state": "running"},
+            "POST /api/tasks": {"task": "t-1234", "repo": "replay-sample", "run": "r1", "state": "running", "why": "started"},
+            "POST /api/v1/tasks": {"seq": seq, "task": task, "run": {"id": "r1", "status": "queued", "version": 1},
+                                   "state": "running", "why": "started"},
             "GET /api/tasks": {"tasks": [summary, parent_summary]},
             **{route: {**row, "comments": [], "runs": [], "children": []}
                for route, row in zip(task_details, (task, parent), strict=True)},
             "GET /api/v1/tasks": {"seq": seq, "tasks": [parent, task]},
             "POST /api/runs/r1/stop": stop, "POST /api/v1/runs/r1/stop": {"seq": seq, **stop},
-            "POST /api/asks/1/answer": {}, "POST /api/runs/r1/resume": {}, "POST /api/runs/r1/repair": {},
-            "POST /api/runs/r1/steps/build": {}, "POST /api/approvals/1": {},
+            "POST /api/asks/1/answer": {}, "POST /api/runs/r1/resume": {"run": "r2"}, "POST /api/runs/r1/repair": {"run": "r2"},
+            "POST /api/v1/runs/r1/resume": {"seq": seq, "run": {"id": "r2", "status": "queued", "version": 1}},
+            "POST /api/v1/runs/r1/repair": {"seq": seq, "run": {"id": "r2", "status": "queued", "version": 1}},
+            "POST /api/runs/r1/steps/build": {"run": "r2"},
+            "POST /api/v1/runs/r1/step": {"seq": seq, "run": {"id": "r2", "status": "queued", "version": 1}},
+            "POST /api/approvals/1": {},
             "POST /api/proposals/1/done": {}, "POST /api/proposals/1/approve": {}, "POST /api/proposals/1/reject": {},
             "POST /api/loops/example/start": {"id": "r1"},
+            "POST /api/v1/loops/example/start": {"seq": seq, "run": {"id": "r1", "status": "queued", "version": 1}},
             "POST /api/loops/example/enable": {"name": "example", "enabled": True, "serve_up": True},
             "POST /api/loops/example/disable": {"name": "example", "enabled": False},
             "POST /api/v1/loops/example/enable": {"seq": seq, "loop": {"name": "example", "enabled": True}},
             "POST /api/v1/loops/example/disable": {"seq": seq, "loop": {"name": "example", "enabled": False}},
             session_start: {"id": "r1", "task": False, "runner": "pi", "model": "test", "device": "local",
                             "cwd": "/tmp", "branch": "", "tools": []},
+            "POST /api/v1/sessions": {
+                "seq": seq, "run": {"id": "r1", "status": "queued", "version": 1},
+                "session": {"id": "r1", "task": False, "runner": "pi", "model": "test", "device": "local",
+                            "cwd": "/tmp", "branch": "", "tools": []},
+            },
             "POST /api/incidents/switch": {}, "POST /api/incidents/1/cancel": {"stopped": "", "cooldown_until": ""},
             "POST /api/incidents/1/dismiss": {}, "POST /api/incidents/1/retry": {},
             "GET /api/live": {"live": {"rows": {"runs": []}}},
             "GET /api/chats/1/sessions": {}, "POST /api/chats/1/sessions": {},
             "GET /api/chats/1/sessions/r1/report": {}, "POST /api/chats/1/sessions/r1/stop": {},
         }
-        canonical = {"GET /api/tasks": "GET /api/v1/tasks", "POST /api/runs/r1/stop": "POST /api/v1/runs/r1/stop",
-                     "POST /api/loops/example/enable": "POST /api/v1/loops/example/enable",
-                     "POST /api/loops/example/disable": "POST /api/v1/loops/example/disable"}
+        canonical = {
+            "GET /api/tasks": "GET /api/v1/tasks",
+            "POST /api/tasks": "POST /api/v1/tasks",
+            "POST /api/runs/r1/stop": "POST /api/v1/runs/r1/stop",
+            "POST /api/runs/r1/resume": "POST /api/v1/runs/r1/resume",
+            "POST /api/runs/r1/repair": "POST /api/v1/runs/r1/repair",
+            "POST /api/runs/r1/steps/build": "POST /api/v1/runs/r1/step",
+            "POST /api/loops/example/enable": "POST /api/v1/loops/example/enable",
+            "POST /api/loops/example/disable": "POST /api/v1/loops/example/disable",
+            "POST /api/loops/example/start": "POST /api/v1/loops/example/start",
+            "POST /api/sessions": "POST /api/v1/sessions",
+        }
         before = {
             "answer r1": [ask], "resume r1": [info], "repair r1": [info], "step r1 build": [info],
             "stop r1": [info], "session stop r1": [info], "loop stop example": [loop, info],
@@ -363,7 +385,7 @@ class CliRouteFallbackTests(unittest.TestCase):
                             self.assertEqual([(route, key) for route, key, _ in seen],
                                              expected([*prefix, primary, *retry, *suffix]))
                             self.assertEqual(seen[:len(prefix) + 1], current_requests[:len(prefix) + 1])
-                            if retry:
+                            if retry and legacy not in ("POST /api/tasks", "POST /api/runs/r1/steps/build"):
                                 self.assertEqual(seen[len(prefix) + 1][2], current_requests[len(prefix)][2])
                             if legacy == "GET /api/tasks":
                                 self.assertEqual([json.loads(line) for line in result[1]], [parent, task])
@@ -658,8 +680,8 @@ class CliRouteFallbackTests(unittest.TestCase):
         self.assertTrue(any(line.endswith("[session] session output") for line in lines), lines)
         info = "GET /api/runs/r1"
         feed = "GET /api/feed/r1"
-        self.assertEqual(requests, ["GET /api/v1/meta", "GET /api/meta", "POST /api/sessions", info,
-                                    f"{feed}?after=0", info, f"{feed}?after=1", info, f"{feed}?after=1", info])
+        self.assertEqual(requests, ["GET /api/v1/meta", "GET /api/meta", "POST /api/v1/sessions", "POST /api/sessions",
+                                    info, f"{feed}?after=0", info, f"{feed}?after=1", info, f"{feed}?after=1", info])
 
     def test_session_send_retry_after_serve_rollback(self):
         path = "/api/v1/runs/r1/steer"

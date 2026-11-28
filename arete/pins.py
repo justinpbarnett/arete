@@ -507,7 +507,7 @@ def pin_config(*, cfg: config.Config | None = None, config_commit: str | None = 
     if commit:
         pinned_dir = config_dir if config_dir is not None else config_checkout(commit)
         pinned_cfg = cfg if (cfg is not None and config_dir is not None) else _rebase_cfg(
-            config.load(pinned_dir / "config.toml", base_dir=pinned_dir), live_root, pinned_dir,
+            config.load(pinned_dir / "config.toml", base_dir=live_root), live_root, pinned_dir,
         )
         return commit, pinned_dir, pinned_cfg
     pinned_dir = config_dir if config_dir is not None else live_root
