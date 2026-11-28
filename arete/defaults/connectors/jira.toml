@@ -1,0 +1,6 @@
+schema = 1
+id = "jira"
+name = "Jira (default)"
+service = "jira"
+driver = "jira"
+enabled = true

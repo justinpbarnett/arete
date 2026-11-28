@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 25
+MINOR = 26
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -515,6 +515,25 @@ SECRET_HISTORY = obj({"id": INTEGER, "event": STRING, "actor": STRING, "ok": BOO
 SECRET_TARGET = obj({"scope": STRING, "name": STRING})
 SECRET_EXAMPLE = {"scope": "global", "name": "DEMO_KEY"}
 ACCOUNT = obj({**dict.fromkeys(("id", "service", "mode", "usage", "holder"), STRING), "secret_name": NULL_TEXT})
+ACCOUNT_STATUS = obj({
+    **dict.fromkeys(("id", "service", "mode", "usage", "holder", "status"), STRING),
+    **dict.fromkeys(("scope", "secret_name", "secret_ref"), NULL_TEXT),
+    "supported_service": BOOLEAN,
+    "usable": BOOLEAN,
+    "problems": array(STRING),
+})
+CONNECTOR_VIEW = obj({
+    **dict.fromkeys(("id", "name", "service", "driver", "level", "path", "content_version", "status"), STRING),
+    **dict.fromkeys(("account", "endpoint"), NULL_TEXT),
+    "enabled": BOOLEAN,
+    "protected": BOOLEAN,
+    "usable": BOOLEAN,
+    "version": INTEGER,
+    "options": mapping(STRING),
+    "secrets": mapping(STRING),
+    "problems": array(STRING),
+    "account_status": {"anyOf": [ACCOUNT_STATUS, {"type": "null"}]},
+})
 
 
 def secret_operation(action, suffix, result, method="GET", internal=False):
@@ -531,6 +550,12 @@ OPERATIONS += [
     secret_operation("remove", "", {}, "DELETE", internal=True),
     {**secret_operation("check", "/check", {}, "POST", internal=True), "scope": "config:activate"},
     operation("account.list", "accounts", envelope({"accounts": array(ACCOUNT)})),
+    operation("account.status", "accounts/status", envelope({"accounts": array(ACCOUNT_STATUS)}),
+              obj({"service": {**STRING, "enum": ["github", "jira"]}, "connector": STRING, "endpoint": STRING}, []),
+              {}),
+    operation("connector.list", "connectors", envelope({"connectors": array(CONNECTOR_VIEW)})),
+    operation("connector.get", "connectors/{id}", envelope({"connector": CONNECTOR_VIEW}),
+              obj({"id": {**STRING, "pattern": f"^{configkinds.NAME_PATTERN}$"}}), {"id": "github"}),
     operation("webhook.rotate", "loops/{loop}/webhook/rotate", envelope({"text": STRING}),
               obj({"loop": STRING}), {"loop": "example"}, "POST",
               errors=(*AUTH_ERRORS, "secret_store_missing", "secret_internal")),

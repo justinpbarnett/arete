@@ -10,7 +10,7 @@ from .store import db, tokens
 
 REMOTE = frozenset(["screen.get", "inbox.list", "inbox.get", "inbox.resolve", "task.list", "task.get", "task.create", "comment.create", "run.list", "run.get", "run.stop", "run.steer", "event.page", "intake.add", "outbox.list", "outbox.get"])
 FLOOR_PREFIXES = ("secret.", "token.", "principal.", "pairing.", "push.", "export.")
-FLOOR_OPERATIONS = {"session.end", "webhook.rotate", "serve.install", "account.list"}
+FLOOR_OPERATIONS = {"session.end", "webhook.rotate", "serve.install", "account.list", "account.status"}
 TARGET_DEPENDENT_FLOORS = {"inbox.resolve", "outbox.approve", "config.activate"}
 CALL_RATES = api_http.RateLimits(command_limit=(2, 10))
 SIMPLE_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")

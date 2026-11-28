@@ -1,1 +1,100 @@
-{"type": "object", "x-arete-read-only": true}
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "service"],
+  "properties": {
+    "schema": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "service": {
+      "type": "string",
+      "enum": ["github", "jira"],
+      "x-arete-reach": true
+    },
+    "driver": {
+      "type": "string",
+      "enum": ["github", "jira"],
+      "x-arete-reach": true
+    },
+    "account": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9:_-]{0,63}$",
+      "x-arete-reach": true
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "endpoint": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "x-arete-reach": true
+    },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "x-arete-reach": true,
+      "properties": {
+        "api_token": {
+          "type": "string",
+          "pattern": "^secret:(?:global|(?:repo|line|device|connector):[A-Za-z0-9][A-Za-z0-9_.-]{0,63})/[A-Z][A-Z0-9_]{0,63}$"
+        },
+        "app_private_key": {
+          "type": "string",
+          "pattern": "^secret:(?:global|(?:repo|line|device|connector):[A-Za-z0-9][A-Za-z0-9_.-]{0,63})/[A-Z][A-Z0-9_]{0,63}$"
+        }
+      }
+    },
+    "options": {
+      "type": "object",
+      "additionalProperties": false,
+      "x-arete-reach": true,
+      "properties": {
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 254,
+          "pattern": "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"
+        },
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Z][A-Z0-9_]*$"
+        },
+        "app_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[0-9]+$"
+        },
+        "installation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[0-9]+$"
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        }
+      }
+    }
+  }
+}

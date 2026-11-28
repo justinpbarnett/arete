@@ -52,6 +52,7 @@ def evolution_exercise(root):
     original = (SOURCE / evolution.SOURCE).read_text()
     other_producers = set(evolution.PRODUCERS) - {evolution.SOURCE}
     for path in sorted(other_producers):
+        (seed / path).parent.mkdir(parents=True, exist_ok=True)
         (seed / path).write_bytes((SOURCE / path).read_bytes())
     git(seed, env, "init", "-q", "-b", "main")
 
@@ -84,7 +85,8 @@ def evolution_exercise(root):
     stale_producers = {f"stale-{Path(path).stem}": path for path in sorted(other_producers)}
     for tag, path in stale_producers.items():
         git(seed, env, "switch", "-q", "--detach", "inert")
-        (seed / path).write_bytes((SOURCE / path).read_bytes() + b"\n# Producer snapshot fixture\n")
+        suffix = b" \n" if path.endswith(".json") else b"\n# Producer snapshot fixture\n"
+        (seed / path).write_bytes((SOURCE / path).read_bytes() + suffix)
         git(seed, env, "commit", "-qam", "Producer no longer matches snapshot")
         git(seed, env, "tag", tag)
     git(seed, env, "switch", "-q", "main")
