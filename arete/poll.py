@@ -24,6 +24,7 @@ from . import (
     pilot,
     pipeline,
     pr_recovery,
+    private_evidence,
     queueing,
     requeue,
     routing,
@@ -53,6 +54,7 @@ from .pipeline import (
 from .slots import slots_free_to_start
 from .store import asks as ask_store
 from .store import db
+from .store import evidence as evidence_store
 from .store import feedback as feedback_store
 from .store import insights as insights_store
 from .store import orchestration as orchestration_store
@@ -64,6 +66,8 @@ MAX_STARTS_PER_POLL = 64
 FEEDBACK_PICK = "revising the PR for your review comments"
 TICKET_FEEDBACK_PICK = "addressing authorized ticket feedback"
 CLARIFICATION_WAIT = "waiting for an authorized product clarification in the ticket thread"
+PRIVATE_EVIDENCE_WAIT = private_evidence.PRIVATE_EVIDENCE_WAIT
+PRIVATE_EVIDENCE_PICK = "resuming after private evidence resolution in Triage"
 SECRET_ASK_REPLY = "its ask holds a secret, which a tracker reply cannot answer; answer it on the dashboard"
 
 
@@ -74,6 +78,7 @@ class Pick:
     from_queue: bool = False
     from_feedback: bool = False
     from_ticket_feedback: bool = False
+    from_private_evidence: bool = False
 
 
 def ticket_queues(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracker]:
@@ -201,6 +206,9 @@ def priority_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLo
     for tid in feedback_store.tickets_needing_worker(repo.name):
         if ordinary_history(tid):
             return Pick(tid, TICKET_FEEDBACK_PICK, from_ticket_feedback=True)
+    for tid in evidence_store.tickets_ready_to_resume(repo.name):
+        if eligible_again(tid):
+            return Pick(tid, PRIVATE_EVIDENCE_PICK, from_private_evidence=True)
     for source in ticket_queues(repo, tk):
         for t in source.replied():
             if not eligible_again(t.id):
@@ -271,6 +279,8 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
 
 def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: bool, *,
                   from_queue: bool, from_feedback: bool, spec: bool = False) -> str:
+    if evidence_store.has_open(repo.name, tid):
+        return PRIVATE_EVIDENCE_WAIT
     newest = run_store.newest_live_whole_run(repo.name, tid)
     if not newest or newest["status"] != "needs-info":
         return ""
@@ -459,6 +469,10 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     if feedback_store.has_open_clarification(repo.name, str(tid)):
         skips.note(name, ticket, CLARIFICATION_WAIT, repo.name)
         return "blocked"
+    if evidence_store.has_open(repo.name, str(tid)):
+        if not private_evidence.probe_restored_for_ticket(repo.name, source, ticket, dry_run=dry_run):
+            skips.note(name, ticket, PRIVATE_EVIDENCE_WAIT, repo.name)
+            return "blocked"
     claim = (spec_store.find(repo.name, str(tid), identity=ticket.spec_identity)
              if not isinstance(source, tracker.LocalTracker) else {})
     if claim or ticket.is_spec:
@@ -550,6 +564,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
             return "skipped"
         if not spawned:
             return "refused"
+        evidence_store.mark_resumed(repo.name, str(tid))
     return "started"
 
 

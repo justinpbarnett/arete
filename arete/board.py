@@ -625,6 +625,7 @@ def inbox_needs_you(running: list[dict]) -> dict:
     approvals = []
     skipped_rows = []
     ready_rows = []
+    evidence_rows = []
     proposals_by_kind: dict[str, list[dict]] = {"memory": [], "hand": [], "approve": []}
     drafts = []
     for item in open_items:
@@ -632,6 +633,13 @@ def inbox_needs_you(running: list[dict]) -> dict:
         detail = item["detail"]
         if subj.startswith("approval:"):
             approvals.append({k: v for k, v in detail.items() if k != "stamp"})
+        elif subj.startswith("evidence:"):
+            evidence_rows.append({
+                **{k: v for k, v in detail.items() if k != "stamp"},
+                "inbox_id": item["id"],
+                "version": item["version"],
+                "verbs": item["verbs"],
+            })
         elif subj.startswith("skipped:"):
             if (detail.get("repo"), detail.get("id")) not in tickets_running:
                 skipped_rows.append({k: v for k, v in detail.items() if k != "stamp"})
@@ -651,7 +659,7 @@ def inbox_needs_you(running: list[dict]) -> dict:
     if drafts:
         newest = max(drafts, key=lambda d: (d.get("updated", ""), d.get("chat", 0)))
         draft = {k: newest[k] for k in ("chat", "title", "body", "repo", "fingerprint") if k in newest}
-    return {"approvals": {"rows": approvals}, "skipped": {"rows": skipped_rows},
+    return {"approvals": {"rows": approvals}, "evidence": {"rows": evidence_rows}, "skipped": {"rows": skipped_rows},
             "proposals": {"rows": proposals_by_kind}, "ready": {"rows": ready_rows}, "draft": draft}
 
 

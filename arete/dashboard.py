@@ -566,7 +566,11 @@ class Handler(BaseHTTPRequestHandler):
                 api_http.check_media(self.headers, {"application/octet-stream", *capture.EXTENSIONS}, self.content_size)
         elif post:
             media = self.operation[0].get("body_media") if self.operation else None
-            if not legacy or "Content-Type" in self.headers:
+            if self.operation and self.operation[0]["name"] == "inbox.upload_evidence":
+                from . import private_evidence
+
+                api_http.check_media(self.headers, private_evidence.ALLOWED_UPLOAD_MEDIA_TYPES, self.content_size)
+            elif not legacy or "Content-Type" in self.headers:
                 api_http.check_media(self.headers, {media or "application/json"}, self.content_size)
             if len(self.headers.get_all("Idempotency-Key", [])) > 1:
                 raise contract.Problem("invalid_framing", "Send at most one Idempotency-Key.")

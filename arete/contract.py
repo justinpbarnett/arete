@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 12
+MINOR = 13
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -485,6 +485,11 @@ OPERATIONS += [
                  {"item": "TR-1", "base_version": 1, "verb": "continue"},
                  "POST", errors=("already_resolved", "invalid_state", "validation", "gate_refused", "presence_expired")),
      "scope": "inbox:resolve"},
+    {**operation("inbox.upload_evidence", "inbox/{item}/evidence",
+                 envelope({"item": INBOX_ITEM, "evidence": mapping(JSON), "result": JSON}),
+                 obj({"item": STRING}, ["item"]), {"item": "TR-1"}, "POST",
+                 errors=("already_resolved", "invalid_state", "validation", "body_too_large")),
+     "scope": "inbox:resolve", "body_media": "application/octet-stream"},
     operation("inbox.history", "inbox/{item}/history", envelope({"events": array(INBOX_EVENT)}),
               obj({"item": STRING}), {"item": "TR-1"}),
     operation("triage_screen.get", "screens/triage",

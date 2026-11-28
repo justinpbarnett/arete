@@ -3527,9 +3527,17 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     elif t.blocker and not run.force:
         return "skipped", t.blocker, ""
     try:
-        attachments, attachment_dirs, _manifest = collect_ticket_attachments(tk, t, run.dir, log=run.log)
+        attachments, attachment_dirs, manifest = collect_ticket_attachments(
+            tk, t, run.dir, log=run.log, repo_name=repo.name, run_id=run.id, record_missing=not run.dry_run,
+        )
     except tracker.ERRORS as e:
         return "failed", f"could not download the images on {run.ref}: {e}", ""
+    if missing := manifest.get("needs_private_help"):
+        from . import private_evidence
+
+        summary = private_evidence.waiting_summary(missing)
+        run_lines.write(run.id, "private_evidence", ticket=t.ref, missing=missing)
+        return "needs-info", summary, ""
     for d in attachment_dirs:
         if d not in run.add_dirs:
             run.add_dirs.append(d)
@@ -5774,10 +5782,28 @@ def collect_ticket_attachments(
     *,
     log: Callable[[str], None] | None = None,
     external_kwargs: dict | None = None,
+    repo_name: str = "",
+    run_id: str = "",
+    keyframe_extractor=None,
+    record_missing: bool = True,
 ) -> tuple[str, list[Path], dict]:
+    from . import private_evidence
+
     ticket_ref = t.ref or t.id
+    repo_label = repo_name or getattr(getattr(tk, "repo", None), "name", "")
     images = tk.save_images(t, run_dir / "images")
     evidence = external_evidence.resolve_ticket_evidence(t, run_dir / "evidence", **(external_kwargs or {}))
+    missing = private_evidence.apply_private_copies_and_record_missing(
+        repo_label,
+        t,
+        images,
+        evidence,
+        run_dir,
+        tracker_name=getattr(tk, "name", ""),
+        run_id=run_id,
+        keyframe_extractor=keyframe_extractor,
+        record_missing=record_missing,
+    )
     add_dirs: list[Path] = []
     if images.paths:
         add_dirs.append(run_dir / "images")
@@ -5797,11 +5823,14 @@ def collect_ticket_attachments(
     if unresolved_ext and log:
         summary = ", ".join(f"{o.ref.provider} ({o.status})" for o in unresolved_ext)
         log(f"evidence: unresolved links on {ticket_ref}: {summary}")
+    if missing and log:
+        log(f"private-evidence: {private_evidence.waiting_summary(missing)}")
 
     manifest = {
         "ticket": ticket_ref,
         "media": [o.to_dict() for o in images.outcomes],
         "external": [o.to_dict() for o in evidence.outcomes],
+        "needs_private_help": missing,
     }
     if images.outcomes or evidence.outcomes:
         run_dir.mkdir(parents=True, exist_ok=True)

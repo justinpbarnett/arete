@@ -32,6 +32,7 @@ from .store import approvals as approvals_store
 from .store import asks as asks_store
 from .store import db as foundation
 from .store import events as event_store
+from .store import evidence as evidence_store
 from .store import idempotency as claims_store
 from .store import inbox as inbox_store
 from .store import incidents as incident_store
@@ -54,6 +55,7 @@ RESERVED_MANUAL_PREFIXES = (
     "chat:",
     "incident:",
     "workspace:",
+    "evidence:",
 )
 
 
@@ -157,6 +159,12 @@ def _asks_items(c) -> list[dict]:
 
 
 def _runs_items(c) -> list[dict]:
+    private_clause = (
+        "AND NOT EXISTS (SELECT 1 FROM private_evidence e WHERE e.repo = r.repo "
+        "  AND e.ticket = CAST(r.issue AS TEXT) AND e.status = 'open') "
+        if evidence_store.available(c)
+        else ""
+    )
     rows = [
         dict(r)
         for r in c.execute(
@@ -164,6 +172,7 @@ def _runs_items(c) -> list[dict]:
             f"AND {run_store.WHOLE_RUN} AND {run_store.LIVE_RUN} "
             "AND NOT EXISTS (SELECT 1 FROM asks a WHERE a.run = r.id "
             "  AND (a.status = 'open' OR (a.status = 'answered' AND a.taken_by = ''))) "
+            f"{private_clause}"
             "AND NOT EXISTS (SELECT 1 FROM runs later WHERE later.kind = 'pipeline' "
             f"  AND later.repo = r.repo AND later.issue = r.issue AND {run_store.WHOLE_RUN} "
             f"  AND {run_store.LIVE_RUN} AND later.rowid > r.rowid) "
@@ -431,10 +440,56 @@ def _workspaces_items(c) -> list[dict]:
     return items
 
 
+def _evidence_items(c) -> list[dict]:
+    if not evidence_store.available(c):
+        return []
+    rows = evidence_store.list_open(connect=lambda: nullcontext(c))
+    items = []
+    for row in rows:
+        label = row.get("ticket_ref") or row["ticket"]
+        name = row.get("name") or row["ref_key"]
+        detail = {
+            "id": row["id"],
+            "repo": row["repo"],
+            "ticket": row["ticket"],
+            "ticket_ref": label,
+            "tracker": row["tracker"],
+            "run_id": row["run_id"],
+            "ref_key": row["ref_key"],
+            "ref_kind": row["ref_kind"],
+            "source": row["source"],
+            "name": name,
+            "original_url": row["original_url"],
+            "attachment_id": row["attachment_id"],
+            "media_kind": row["media_kind"],
+            "failure_status": row["failure_status"],
+            "failure_detail": row["failure_detail"],
+            "last_error": row["last_error"],
+            "opened": row["opened"],
+            "updated": row["updated"],
+            "private": True,
+            "stamp": f"{row['id']}:{row['opened']}",
+        }
+        items.append({
+            "kind": "evidence",
+            "subject": f"evidence:{row['id']}",
+            "task_id": str(row["ticket"] or ""),
+            "run_id": row["run_id"] or "",
+            "line": row["repo"] or "",
+            "priority": 1,
+            "title": f"{label}: missing evidence {name}",
+            "detail": detail,
+            "verbs": ["retry", "dismiss"],
+            "options": [],
+        })
+    return items
+
+
 ADAPTERS: dict[str, tuple[str, Callable[..., list[dict]]]] = {
     "approvals": ("approval:%", _approvals_items),
     "asks": ("ask:%", _asks_items),
     "runs": ("run:%", _runs_items),
+    "evidence": ("evidence:%", _evidence_items),
     "proposals": ("proposal:%", _proposals_items),
     "skipped": ("skipped:%", _skipped_items),
     "ready": ("ticket:%", _ready_items),
@@ -451,6 +506,11 @@ def _clear_resolution(c, source: str, subject: str) -> str:
         row = c.execute("SELECT status FROM asks WHERE id = ?", (ask_id,)).fetchone()
         if row and row["status"] in ("stopped", "expired"):
             return row["status"]
+    if source == "evidence" and subject.startswith("evidence:") and evidence_store.available(c):
+        ev_id = subject.removeprefix("evidence:")
+        row = c.execute("SELECT status FROM private_evidence WHERE id = ?", (ev_id,)).fetchone()
+        if row and row["status"] in ("uploaded", "access_restored", "stopped"):
+            return "dismissed" if row["status"] == "stopped" else row["status"]
     return "cleared"
 
 
@@ -590,6 +650,11 @@ def subject_object(item: dict, connect=foundation.reader) -> dict | None:
         if kind == "workspace" and ident.isdecimal():
             row = c.execute("SELECT * FROM workspaces WHERE id = ?", (int(ident),)).fetchone()
             return workspaces_store._decode(row) if row else None
+        if kind == "evidence":
+            from . import private_evidence
+
+            row = evidence_store.get(ident, connect=lambda: nullcontext(c))
+            return private_evidence.safe_view(row) if row else None
         if kind == "presence":
             actor, _, key = ident.partition("/")
             pending = inbox_store.get_pending(c, actor, key)
@@ -1209,11 +1274,36 @@ def resolve(
                 handler_result = {"workspace": ws_id, "state": (updated_ws or row)["state"]}
                 resolution = "removed"
             stored_answer = verb
+        elif prefix == "evidence":
+            from . import private_evidence
+
+            try:
+                if verb == "retry":
+                    handler_result = private_evidence.confirm_access_restored(ident, actor=actor)
+                    resolution = "access_restored"
+                else:
+                    handler_result = private_evidence.dismiss(ident, actor=actor)
+                    resolution = "dismissed"
+            except private_evidence.EvidenceAlreadyResolved as e:
+                _RESOLVING.reset(token)
+                token = None
+                sync_source("evidence")
+                current = inbox_store.get(numeric) or item
+                raise contract.Problem("already_resolved", str(e), current=current) from None
+            except private_evidence.EvidenceNotFound as e:
+                raise contract.Problem("not_found", str(e)) from None
+            except private_evidence.StillInaccessible as e:
+                _RESOLVING.reset(token)
+                token = None
+                sync_source("evidence")
+                raise contract.Problem("validation", str(e)) from None
+            stored_answer = verb
         else:
             resolution = verb
             stored_answer = str(answer or verb)
     finally:
-        _RESOLVING.reset(token)
+        if token is not None:
+            _RESOLVING.reset(token)
 
     now = util.iso()
     with foundation.tx() as c:
@@ -1236,6 +1326,84 @@ def resolve(
                 raise contract.Problem("already_resolved", f"Inbox item {updated['id']} is already resolved.", current=updated)
             raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=updated)
     return {"item": updated, "result": handler_result}
+
+
+def upload_evidence(
+    item_id: str | int,
+    data: bytes,
+    *,
+    filename: str = "",
+    content_type: str = "",
+    actor: str = "",
+    keyframe_extractor=None,
+    auto_resume: bool = True,
+    resumer=None,
+) -> dict:
+    from . import private_evidence
+
+    numeric = inbox_store.parse_id(item_id)
+    if numeric is None:
+        raise contract.Problem("not_found", f"No inbox item {item_id}")
+    item = inbox_store.get(numeric)
+    if item is None:
+        raise contract.Problem("not_found", f"No inbox item {item_id}")
+    if item["state"] == "resolved":
+        raise contract.Problem("already_resolved", f"Inbox item {item['id']} is already resolved.", current=item)
+    subject = item["subject"]
+    if not subject.startswith("evidence:"):
+        raise contract.Problem("invalid_state", f"Inbox item {item['id']} does not accept private evidence uploads.")
+    ev_id = subject.removeprefix("evidence:")
+    who = actor or principals.current()
+
+    token = _RESOLVING.set(subject)
+    try:
+        uploaded = private_evidence.upload_copy(
+            ev_id,
+            data,
+            filename=filename,
+            content_type=content_type,
+            actor=who,
+            keyframe_extractor=keyframe_extractor,
+            auto_resume=auto_resume,
+            resumer=resumer,
+        )
+    except private_evidence.EvidenceAlreadyResolved as e:
+        _RESOLVING.reset(token)
+        token = None
+        sync_source("evidence")
+        current = inbox_store.get(numeric) or item
+        raise contract.Problem("already_resolved", str(e), current=current) from None
+    except private_evidence.EvidenceNotFound as e:
+        raise contract.Problem("not_found", str(e)) from None
+    except private_evidence.UploadTooLarge as e:
+        _RESOLVING.reset(token)
+        token = None
+        sync_source("evidence")
+        raise contract.Problem("body_too_large", str(e)) from None
+    except private_evidence.EvidenceError as e:
+        _RESOLVING.reset(token)
+        token = None
+        sync_source("evidence")
+        raise contract.Problem("validation", str(e)) from None
+    finally:
+        if token is not None:
+            _RESOLVING.reset(token)
+
+    now = util.iso()
+    with foundation.tx() as c:
+        updated, _, ok = inbox_store.resolve_item(
+            c,
+            numeric,
+            resolution="uploaded",
+            answer="uploaded",
+            answered_by=who,
+            answered_at=now,
+        )
+        if not ok:
+            if updated and updated["state"] == "resolved":
+                return {"item": updated, "evidence": uploaded["evidence"], "result": uploaded["resumed"]}
+            raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=updated)
+    return {"item": updated, "evidence": uploaded["evidence"], "result": uploaded["resumed"]}
 
 
 def on_server_start(pending_secrets=None) -> None:
