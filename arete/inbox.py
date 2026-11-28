@@ -179,8 +179,8 @@ def _runs_items(c) -> list[dict]:
             f"{private_clause}"
             "AND NOT EXISTS (SELECT 1 FROM runs later WHERE later.kind = 'pipeline' "
             f"  AND later.repo = r.repo AND later.issue = r.issue AND {run_store.WHOLE_RUN} "
-            f"  AND {run_store.LIVE_RUN} AND later.rowid > r.rowid) "
-            "ORDER BY r.started, r.rowid"
+            f"  AND {run_store.LIVE_RUN} AND {run_store.later_than(c, 'later', 'r')}) "
+            f"ORDER BY r.started, {run_store.seq_col(c, 'r')}"
         )
     ]
     items = []

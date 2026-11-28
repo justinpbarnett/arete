@@ -202,10 +202,15 @@ def prove(bench: Bench, path: Path, clock: Clock) -> None:
     checked = [t for t in todo if exp.tasks[t].check]
     if not checked:
         return
+    from .. import configrepo, pins
+
     clock.check()
-    run_id = record.start("eval", tag=f"benchmark-{exp.name}-proof", repo=exp.repo.name)
-    with record.failed_on_crash(run_id):
-        run = ProofRun(id=run_id, repo=exp.repo, dir=paths.RUNS_DIR / run_id, cfg=exp.cfg, task="proof", clock=clock)
+    pin_res = pins.resolve("eval", repo=exp.repo, layer=exp.layer, harness_source=evals.Source(exp.repo),
+                           cfg=exp.cfg if not configrepo.is_repo() else None)
+    run_id = record.start("eval", tag=f"benchmark-{exp.name}-proof", repo=exp.repo.name, resolution=pin_res)
+    with record.failed_on_crash(run_id), pins.use(pin_res):
+        run = ProofRun(id=run_id, repo=pin_res.repo or exp.repo, dir=paths.RUNS_DIR / run_id,
+                       cfg=pin_res.cfg, task="proof", clock=clock)
         run.dir.mkdir(parents=True, exist_ok=True)
         try:
             failures = [why for name in checked if (why := prove_check(bench, path, name, run))]
@@ -226,7 +231,10 @@ def unusable(candidates: list, atom: str, codex: bool) -> list:
 def unavailable(exp: experiment.Experiment) -> dict[str, str]:
     if exp.cfg.replay.all:
         return {}
-    discovery = routing.Discovery(exp.cfg, exp.repo, layer=exp.layer, priced=False)
+    from .. import pins
+
+    run_payer = pin.payer if (pin := pins.current()) is not None else routing._UNSET
+    discovery = routing.Discovery(exp.cfg, exp.repo, layer=exp.layer, priced=False, payer=run_payer)
     missing = {}
     for arm, s in exp.settings.items():
         which, name = routing.chosen(s.model, s.runner, exp.cfg)

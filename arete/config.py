@@ -161,6 +161,7 @@ class Repo:
     landing: str = ""
     unattended_environment: str = ""
     commenters: list[str] = field(default_factory=list)
+    payer: str = ""
 
     def allows_unattended_deploy(self, environment: str) -> bool:
         return (environment in DEPLOYMENT_ENVIRONMENTS[1:] and
@@ -448,6 +449,7 @@ class Config:
     unblock_repos: tuple[str, ...] = ()
     unblock_step: dict = field(default_factory=dict)
     ab: dict[str, dict] = field(default_factory=dict)
+    automation_payer: str = ""
     ignored: tuple[str, ...] = ()
     problems: tuple[Problem, ...] = ()
 
@@ -505,9 +507,11 @@ def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
                         del data["jira"][name]
         if not sparse:
             for repo in data["repos"]:
-                for key in ("jira_site", "target_branch", "landing", "unattended_environment", "commenters"):
+                for key in ("jira_site", "target_branch", "landing", "unattended_environment", "commenters", "payer"):
                     if not repo[key]:
                         del repo[key]
+            if not data.get("automation_payer"):
+                data.pop("automation_payer", None)
     if "orchestration" in data and data["orchestration"].get("max_builders") is None:
         data["orchestration"].pop("max_builders", None)
     if "orchestration" in data and not data["orchestration"].get("private_worker_model"):
@@ -1426,6 +1430,7 @@ def repo_table(repo: dict) -> Repo:
         landing=repo.get("landing", ""),
         unattended_environment=repo.get("unattended_environment", ""),
         commenters=commenters,
+        payer=str(repo.get("payer", "") or "").strip(),
     )
 
 
@@ -1543,6 +1548,10 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.document = document_table(data.get("document") or {}, anchor_dir, ignored)
     cfg.capture = capture_table(data.get("capture") or {}, anchor_dir, ignored)
     cfg.ab = ab_tables(data.get("ab") or {}, problems=problems, path=source)
+    automation = table_of(data.get("automation") or {}, "automation")
+    if "payer" in automation and not isinstance(automation["payer"], str):
+        raise TypeError("[automation] payer must be a string")
+    cfg.automation_payer = str(automation.get("payer") or "").strip()
     cfg.problems = tuple(problems or ())
     from . import steps
     steps.check(cfg, defer_tiers=True)
@@ -1772,6 +1781,7 @@ def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | Non
         raise ValueError(f"[targeted_commands] names collide with required checks: {', '.join(sorted(shared))}")
     check_policy(layer, section(data, "check_policy"), ignored)
     lim = section(data, "limits")
+    layer._limits_set = frozenset(k for k in ("max_attempts", "timeout_minutes") if k in lim)
     layer.max_diff_lines = int(lim.get("max_diff_lines", layer.max_diff_lines))
     layer.deny = list(lim.get("deny", []))
     layer.max_attempts = int(lim.get("max_attempts", layer.max_attempts))

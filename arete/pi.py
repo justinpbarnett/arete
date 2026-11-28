@@ -21,7 +21,6 @@ from . import (
     accounts,
     child,
     claude,
-    config,
     devices,
     environment,
     issue_goal,
@@ -388,7 +387,9 @@ def missing_key(provider, owner):
 def select(model: str, passing=None, providers=None, *, held=lambda auth, model: None, mode: str = "",
            source=None, local_providers=(), owner_auth: Path | None = None, metadata_only=False) -> Route:
     if passing is None or providers is None:
-        cfg = config.load()
+        from . import pins
+
+        cfg = pins.active_config()
         passing = environment.passed(cfg) if passing is None else passing
         providers = cfg.environment.providers if providers is None else providers
         local_providers = cfg.local_providers

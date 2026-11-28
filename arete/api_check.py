@@ -434,13 +434,15 @@ class Check:
             secretstore, triage,
         )
         from .sighting import Sighting
-        from .store import chats, db, incidents, insights, push, runs, tokens
+        from .store import blobs, chats, db, incidents, insights, push, runs, tokens
         from .store import evidence as evidence_store
         from .store import inbox as inbox_store
         from .store import triage as triage_store
 
         record.step(self.run, "plan", agent.Result(ok=True, runner="replay"), 0)
         record.mark(self.run, "diff", patch=(self.root / "sample/replay/build.patch").read_text())
+        fixture_blob = b"fixture-contract-blob"
+        fixture_sha = blobs.put(fixture_blob, "upload")
         fixture_lease = leases.claim("local", devices.version_of("local"), run_id=self.run, start_renewer=False)
         fixture_lease.close("", fenced=False)
         chat = chats.chat_add("")
@@ -504,7 +506,7 @@ class Check:
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
                       "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
                       "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}",
-                      "item": fixture_item["id"], "subscription": f"PS-{sub_id}",
+                      "item": fixture_item["id"], "subscription": f"PS-{sub_id}", "sha256": fixture_sha,
                       "device": "local", "lease": fixture_lease.label}
         for op in self.published["operations"]:
             name, method, path = (op[key] for key in ("name", "method", "path"))
@@ -569,6 +571,10 @@ class Check:
                     }
                     with patch.object(private_evidence, "resume_ticket", return_value={"state": "queued", "why": "fixture"}):
                         headers, raw = self.request(method, ev_path, png, headers=ev_headers, status=op["success_status"])
+                elif name == "blob.put":
+                    headers, raw = self.request(method, path, fixture_blob,
+                                                headers={**(key or {}), "Content-Type": "application/octet-stream"},
+                                                status=op["success_status"])
                 else:
                     headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 data = json.loads(raw)

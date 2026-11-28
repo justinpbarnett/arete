@@ -361,9 +361,22 @@ def setting_for(cfg, repo, kind=""):
 
 
 def diagnose(cfg, repo, row, attempt: str, evidence: dict, limit: str) -> dict | None:
+    from . import configrepo, pins
+
     kind = evidence["ticket"].get("kind", "")
+    pin_res = pins.resolve("orchestrator", repo=repo, task_kind=kind,
+                           cfg=cfg if not configrepo.is_repo() else None)
+    cfg = pin_res.cfg
+    repo = pin_res.repo or repo
     layer, setting = setting_for(cfg, repo, kind)
-    report = record.start("orchestrator", repo=repo.name, issue=str(row.get("issue", "")), lock="ticket-unblock")
+    report = record.start("orchestrator", repo=repo.name, issue=str(row.get("issue", "")), lock="ticket-unblock",
+                          resolution=pin_res)
+    with pins.use(pin_res):
+        return _diagnose_pinned(cfg, repo, layer, setting, report, row, attempt, evidence, limit, kind)
+
+
+def _diagnose_pinned(cfg, repo, layer, setting, report: str, row, attempt: str, evidence: dict,
+                     limit: str, kind: str) -> dict | None:
     run = pipeline.AgentRun(report, repo, paths.RUNS_DIR / report, cfg=cfg, layer=layer, kind=kind)
     run.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     place = run.dir / "controller"

@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 15
+MINOR = 16
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -38,9 +38,10 @@ TASK = obj({**dict.fromkeys(("id", "repo", "title", "body", "kind", "state", "pa
 RUN_TEXT = ("id", "kind", "repo", "issue", "loop", "loop_kind", "started", "finished", "status", "summary", "pr_url",
             "branch", "only_step", "files_purged", "mined_until", "stop_asked", "ab_held", "measured_at", "landed",
             "device", "model", "runner", "log", "trigger", "queue", "grp", "lock", "moved", "engine_sha",
-            "label_pending", "wait_minutes")
+            "label_pending", "wait_minutes", "config_commit", "resolved_sha", "continues", "chain", "restart",
+            "started_by", "payer")
 RUN_NUMBERS = ("pid", "cost_usd", "tokens_in", "tokens_out", "active_seconds", "verify_seconds", "verify_open_seconds",
-               "repair_calls", "schema_version", "attempts", "version", "lease_id")
+               "repair_calls", "schema_version", "attempts", "version", "seq", "lease_id")
 RUN = obj({**{k: {"type": ["string", "null"]} for k in RUN_TEXT},
            **{k: {"type": ["number", "null"]} for k in RUN_NUMBERS}}, ["id", "status", "version"])
 RUN["properties"]["issue"] = {"type": ["integer", "string", "null"]}
@@ -81,7 +82,11 @@ RESOURCE = {
     "line": obj({"id": STRING, "kind": STRING, "repo": STRING, "enabled": BOOLEAN}),
     "view": obj({"id": STRING, "label": STRING, "data": mapping(JSON)}, ["id", "label"]),
     "step": obj({"id": INTEGER, "run_id": STRING, "name": STRING, "model": STRING, "runner": STRING,
-                 "cost_usd": NUMBER, "seconds": NUMBER}),
+                 "cost_usd": NUMBER, "seconds": NUMBER,
+                 "settings_sha": NULL_TEXT,
+                 "settings": {"type": ["object", "null"], "additionalProperties": JSON},
+                 "inputs": {"type": ["array", "null"], "items": mapping(JSON)}},
+                ["id", "run_id", "name", "model", "runner", "cost_usd", "seconds"]),
     "loop": obj({"id": STRING, "enabled": BOOLEAN, "detail": LOOP}),
     "incident": obj({"id": STRING, "detail": INCIDENT}),
     "triage": obj({"id": STRING, "detail": TRIAGE}),
@@ -254,6 +259,8 @@ META = envelope({"api": obj({"version": STRING, "minor": INTEGER, "contract_sha"
                  "push": obj({"vapid_public_key": STRING})})
 META["required"] = [k for k in META["required"] if k not in ("features", "push")]
 ROLE_ENUM = {**STRING, "enum": list(configkinds.ROLE_NAMES)}
+ROLE_LEVEL = {"type": ["string", "null"],
+              "enum": ["inherit", "engine", "config", "config kind", "layer", "layer kind", "arm", "run", None]}
 ROLE_STEP_OVERRIDES = obj({"runner": STRING, "model": STRING, "effort": STRING}, [], additional=False)
 ROLE_OVERRIDES = obj({
     "models": {**mapping(STRING), "maxProperties": 1},
@@ -264,9 +271,20 @@ ROLE_VIEW = obj({
     "runner": NULL_TEXT,
     "model": NULL_TEXT,
     "effort": NULL_TEXT,
-    "level": NULL_TEXT,
+    "level": ROLE_LEVEL,
     "overrides": ROLE_OVERRIDES,
 })
+BLOB_SHA = {**STRING, "pattern": "^[0-9a-f]{64}$"}
+BLOB_META = obj({"sha256": STRING, "kind": STRING, "bytes": INTEGER})
+BLOB_DATA = obj({"sha256": STRING, "kind": STRING, "bytes": INTEGER, "data": STRING,
+                 "encoding": {**STRING, "enum": ["utf-8", "base64"]}})
+RESOLVED_LEVEL_ENTRY = obj({"level": ROLE_LEVEL, "from": NULL_TEXT})
+RESOLVED_SETTINGS = envelope({
+    "values": mapping(mapping(JSON)),
+    "levels": mapping(mapping(RESOLVED_LEVEL_ENTRY)),
+    "roles": array(ROLE_VIEW),
+    "config_commit": NULL_TEXT,
+}, ["seq", "values", "levels", "config_commit"])
 SETTINGS_VALUES = obj({
     "max_parallel": INTEGER,
     "max_parallel_per_repo": INTEGER,
@@ -442,9 +460,17 @@ OPERATIONS += [
     operation("line_stream.read", "line-stream", envelope({"lines": array(FEED_LINE), "after": INTEGER}),
               obj({"run": STRING, "after": STRING}, ["run"]), {"run": "example"}),
     operation("settings.get", "settings", envelope({"settings": SETTINGS})),
+    operation("settings.resolved", "settings/resolved", RESOLVED_SETTINGS,
+              obj({"repo": STRING, "task_kind": STRING, "node": STRING}, [])),
     {**operation("settings.update", "settings", envelope({"settings": SETTINGS}),
                  SETTINGS_PATCH, {"base_version": 1, "values": {"max_parallel": 2}}, "PATCH"),
      "scope": "config:activate"},
+    operation("blob.get", "blobs/{sha256}", envelope({"blob": BLOB_DATA}),
+              obj({"sha256": BLOB_SHA}), {"sha256": "0" * 64}),
+    {**operation("blob.put", "blobs/{sha256}", envelope({"blob": BLOB_META}),
+                 obj({"sha256": BLOB_SHA}), {"sha256": "0" * 64}, "PUT",
+                 errors=("validation",), success_status=201),
+     "scope": "intake:write", "body_media": "application/octet-stream"},
     {**operation("loop.enable", "loops/{loop}/enable", envelope({"loop": LOOP}),
                  obj({"loop": STRING}), {"loop": "poll"}, "POST"),
      "scope": "config:activate"},

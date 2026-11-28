@@ -254,7 +254,7 @@ def owner_intervention(result, observation):
 def facts(repo, tickets):
     if not paths.DB_FILE.is_file():
         return [], [], ""
-    from .store import db
+    from .store import db, runs as run_store
 
     marks = ",".join("?" for _ in tickets)
     args = (repo, *tickets)
@@ -263,7 +263,7 @@ def facts(repo, tickets):
             dict(r)
             for r in conn.execute(
                 f"SELECT id,started,status,pr_url FROM runs WHERE repo=? AND issue IN ({marks}) "  # noqa: S608
-                "AND kind='pipeline' AND dry_run=0 ORDER BY started DESC,rowid DESC",
+                f"AND kind='pipeline' AND dry_run=0 ORDER BY started DESC,{run_store.seq_col(conn)} DESC",
                 args,
             )
         ]

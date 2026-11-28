@@ -21,12 +21,11 @@ YOUNG_MINUTES = 10
 CHAT_GRACE_SECONDS = 300
 APPROVAL_HOURS = 1
 BACKUP_MAX_HOURS = 3
-CHAT_STEPS = "chat"
 UNFOLDERED_KINDS = ("session",)
-UNRECORDED_FOLDERS = ("chat",)
+UNRECORDED_FOLDERS = ()
 UNRECORDED_PATTERNS = ("eva-*-prompts",)
 ORPHAN_TABLES = ("steps", "evals", "feed", "verdicts")
-NAMES = ("cost", "orphans", "chat", "folders", "stuck", "store", "backup")
+NAMES = ("cost", "orphans", "folders", "stuck", "store", "backup")
 
 
 @dataclass
@@ -105,12 +104,6 @@ def check_orphans(conn: sqlite3.Connection) -> Result:
             ids += [f"{table}#{r[0]}:{r[1]}" for r in rows]
     detail = ", ".join(per_table) + " with no runs row" if per_table else "every row names a run"
     return result("orphans", "fail", ids, detail, total)
-
-
-def check_chat(conn: sqlite3.Connection) -> Result:
-    rows = run_store.pseudo_chat_steps(conn, CHAT_STEPS)
-    return result("chat", "info", [f"steps#{r[0]}" for r in rows],
-                  "steps filed under the pseudo run 'chat'" if rows else "no steps under 'chat'")
 
 
 def unrecorded(name: str) -> bool:
@@ -206,7 +199,6 @@ def run() -> list[Result]:
 
         guarded("cost", lambda: check_cost(conn))
         guarded("orphans", lambda: check_orphans(conn))
-        guarded("chat", lambda: check_chat(conn))
         guarded("folders", lambda: check_folders(conn, listing, now))
         guarded("stuck", lambda: check_stuck(conn, now))
         guarded("store", lambda: check_store(conn))

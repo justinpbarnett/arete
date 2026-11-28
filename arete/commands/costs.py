@@ -188,7 +188,25 @@ def print_step_costs(groupings: list[str], days: float | None, as_json: bool) ->
 
 
 def cmd_steps(args) -> int:
-    from .. import research_audit, research_search, routing, steps
+    from urllib.parse import urlencode
+
+    from .. import client, research_audit, research_search, routing, settings, steps
+
+    if client.configured_server() is not None:
+        query = {k: v for k, v in (("repo", args.repo or ""), ("task_kind", args.kind or "")) if v}
+        path = "/api/v1/settings/resolved" + ("?" + urlencode(query) if query else "")
+        try:
+            payload = client.request("GET", path)
+        except Exception as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        values = payload.get("values") or {}
+        levels = payload.get("levels") or {}
+        for role in config.STEP_ROLES:
+            if role in values:
+                print(json.dumps({"step": role, "values": values[role], "levels": levels.get(role, {}),
+                                  "config_commit": payload.get("config_commit")}))
+        return 0
 
     where = ""
     try:
@@ -198,6 +216,7 @@ def cmd_steps(args) -> int:
         where = f"{paths.short_path(layer_dir / 'config.toml')}: " if layer_dir else ""
         layer = config.load_layer(layer_dir) if layer_dir else None
         steps.check(cfg, layer)
+        settings.resolved(repo=args.repo or "", task_kind=args.kind or "")
         sheet = [steps.resolve(cfg, layer, role, args.kind) for role in config.STEP_ROLES]
     except (ValueError, TypeError) as e:
         print(f"{where}{e}", file=sys.stderr)

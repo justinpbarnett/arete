@@ -634,8 +634,12 @@ def run(path: Path | str, dry: bool = False) -> int:
         if not got:
             print(f"verifiers {suite.name} is already running")
             return 0
-        run_id = record.start("eval", tag=lock, lock=lock, **({"repo": suite.repo.name} if suite.repo else {}))
-        with record.failed_on_crash(run_id):
+        from .. import configrepo, pins
+
+        pin_res = pins.resolve("eval", repo=suite.repo, layer=suite.layer, cfg=cfg if not configrepo.is_repo() else None)
+        run_id = record.start("eval", tag=lock, lock=lock, resolution=pin_res,
+                              **({"repo": suite.repo.name} if suite.repo else {}))
+        with record.failed_on_crash(run_id), pins.use(pin_res):
             results, stopped = execute(suite, cfg, run_id)
             found = summary(read(results.path))
             tried = sum(a["judged"] + a["blocked"] for a in found["arms"].values())

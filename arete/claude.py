@@ -14,7 +14,7 @@ from datetime import timedelta
 from pathlib import Path
 from threading import Lock
 
-from . import accounts, background, child, config, device_turns, devices, environment, jev, paths, sandbox, ssh, tool_events, util
+from . import accounts, background, child, device_turns, devices, environment, jev, paths, sandbox, ssh, tool_events, util
 from .agent import (
     NO_SESSION,
     Result,
@@ -63,7 +63,10 @@ def binary() -> str:
 
 def agent_env(passing: list[str] | None = None, extra: dict[str, str] | None = None, source=None, *,
               api_key: str = "", openrouter_config: Path | None = None, model: str = "") -> dict[str, str]:
-    passing = environment.passed(config.load()) if passing is None else passing
+    if passing is None:
+        from . import pins
+
+        passing = environment.passed(pins.active_config())
     env = {k: v for k, v in environment.build(["CLAUDE_CONFIG_DIR", *passing], {**AGENT_SETS, **(extra or {})},
                                              role="runner:claude", never=PARENT_SESSION_VARS, source=source).items()
            if k not in PARENT_SESSION_VARS}

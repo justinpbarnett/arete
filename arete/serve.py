@@ -1555,10 +1555,11 @@ def run(with_dashboard: bool = True) -> NoReturn:
         server.report_config()
         if not server.contracts_waiting and not server.config_problem:
             server.guard("stage:secret-move", server.move_secrets_when_due)
-            from . import configrepo
+            from . import configrepo, pins
 
             try:
                 configrepo.init()
+                pins.ensure_automation_payer()
             except configrepo.ConfigRepoError as e:
                 server.say(f"config repo init deferred: {e}")
             server.read_config()

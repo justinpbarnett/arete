@@ -181,8 +181,11 @@ def run(repo_name: str, dry_run: bool = False) -> int:
         kinds = ", ".join(f"{sum(c.brief.kind == k for c in spec.cases)} {k}" for k in KINDS)
         print(f"{util.count(len(spec.cases), 'case')}: {kinds}")
         return 0
-    run_id = record.start("eval", tag=f"writers-{repo.name}", repo=repo.name)
-    with record.failed_on_crash(run_id):
+    from .. import configrepo, pins
+
+    pin_res = pins.resolve("eval", repo=repo, cfg=cfg if not configrepo.is_repo() else None)
+    run_id = record.start("eval", tag=f"writers-{repo.name}", repo=repo.name, resolution=pin_res)
+    with record.failed_on_crash(run_id), pins.use(pin_res):
         chance = random.SystemRandom()
         saved = {"run": run_id, "repo": repo.name, "raters": spec.raters,
                  "candidates": {n: {"runner": s.runner, "model": s.model, "provider": s.provider,

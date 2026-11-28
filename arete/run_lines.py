@@ -19,12 +19,11 @@ FILE = "run.jsonl"
 HEARTBEAT_SECONDS = 30
 FOLLOW_POLL_SECONDS = 0.2
 END = "report"
-FIXED = ("ts", "run", "seq", "event")
+FIXED = ("ts", "run", "seq", "event", "engine")
 WAIT_CAUSES = ("limit", "ci", "slot", "person", "unblock")
 TAIL_BYTES = 4096
 GUARDED_TAIL_BYTES = 64 * 1024
 
-_named: set[tuple[int, str]] = set()
 _append_guard: ContextVar[Callable[[], None] | None] = ContextVar("run_line_append_guard", default=None)
 
 
@@ -119,8 +118,8 @@ def recover_tail(f, check: Callable[[], None] | None) -> int:
 
 
 def write(run_id: str, event: str, *, event_id: str = "", **fields) -> dict:
-    line = {"ts": util.iso(), "run": run_id, "seq": 0, "event": event,
-            **{k: v for k, v in fields.items() if k not in FIXED + ("engine",)}}
+    line = {"ts": util.iso(), "run": run_id, "seq": 0, "event": event, "engine": codebase.STAMP,
+            **{k: v for k, v in fields.items() if k not in FIXED}}
     if event_id:
         line["event_id"] = event_id
     target = path(run_id)
@@ -137,16 +136,11 @@ def write(run_id: str, event: str, *, event_id: str = "", **fields) -> dict:
                                   if row.get("event") == event and row.get("event_id") == event_id), None):
                     os.fsync(f.fileno())
                     return prior
-            line["ts"], line["seq"] = util.iso(), seq + 1
-            first = (os.getpid(), run_id) not in _named
-            if first:
-                line["engine"] = codebase.STAMP
+            line["ts"], line["seq"], line["engine"] = util.iso(), seq + 1, codebase.STAMP
             text = scrub.text(json.dumps(line, ensure_ascii=False, default=str), "run_lines", f"{run_id}/{event}")
             append_bytes(f, text.encode() + b"\n", check)
             if event_id:
                 os.fsync(f.fileno())
-            if first:
-                _named.add((os.getpid(), run_id))
     except OSError as e:
         if check or event_id:
             raise

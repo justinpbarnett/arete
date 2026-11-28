@@ -1,11 +1,63 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, fields
 from pathlib import Path
 from string import Formatter, Template
 
 from . import owner_asks, paths
+
+
+class Rendered(str):
+    prompt_name: str
+    prompt_version: str
+    prompt_level: str
+    prompt_values: dict
+    prompt_sha256: str
+
+    def __new__(cls, text: str, *, name: str = "", version: str = "", level: str = "",
+                values: dict | None = None, sha256: str = "") -> Rendered:
+        obj = super().__new__(cls, text)
+        obj.prompt_name = name
+        obj.prompt_version = version
+        obj.prompt_level = level
+        obj.prompt_values = dict(values or {})
+        obj.prompt_sha256 = sha256
+        return obj
+
+    @classmethod
+    def wrap(cls, text: str, source: str) -> Rendered | str:
+        if isinstance(source, Rendered):
+            return cls(
+                text,
+                name=source.prompt_name,
+                version=source.prompt_version,
+                level=source.prompt_level,
+                values=source.prompt_values,
+                sha256=source.prompt_sha256,
+            )
+        return text
+
+    def __add__(self, other: str) -> Rendered:
+        return Rendered(
+            super().__add__(other),
+            name=self.prompt_name,
+            version=self.prompt_version,
+            level=self.prompt_level,
+            values=self.prompt_values,
+            sha256=self.prompt_sha256,
+        )
+
+    def __radd__(self, other: str) -> Rendered:
+        return Rendered(
+            str(other) + str(self),
+            name=self.prompt_name,
+            version=self.prompt_version,
+            level=self.prompt_level,
+            values=self.prompt_values,
+            sha256=self.prompt_sha256,
+        )
 
 TEMPLATES: dict[Path, dict[str, str]] = {}
 TRIAGE_ANSWERS = "Answers to triage's questions"
@@ -65,8 +117,26 @@ def template(name: str, prompts_dir: Path = paths.PROMPTS_DIR) -> Template:
     return parse_template(name, text)
 
 
-def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
-    source = template(name, prompts_dir)
+def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> Rendered:
+    from . import pins
+
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+        raise ValueError(f"invalid prompt name {name!r}; use a template's file stem")
+    pin = pins.current()
+    if pin is not None:
+        if name not in pin.prompt_texts:
+            raise KeyError(f"prompt {name!r} is missing from the active run pin")
+        raw_text = pin.prompt_texts[name]
+        meta = pin.prompts.get(name, {})
+        version = str(meta.get("id") or "")
+        level = str(meta.get("level") or "engine")
+        sha = str(meta.get("sha256") or "")
+        source = parse_template(name, raw_text)
+    else:
+        source = template(name, prompts_dir)
+        sha = hashlib.sha256(source.template.encode("utf-8")).hexdigest()
+        version = f"prompt/{name}@{sha[:12]}"
+        level = "engine" if prompts_dir.resolve() == paths.PROMPTS_DIR.resolve() else "run"
     values.setdefault("owner", owner_asks.NOBODY)
     class_check = values.get("class_check")
     values.setdefault("test_classes", class_check or "uv run python -m tests.parallel test_x.SomeTests")
@@ -75,11 +145,20 @@ def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
     ))
     if missing := sorted(set(source.get_identifiers()) - values.keys()):
         raise MissingInputs(f"prompt {name}: missing inputs: {', '.join(missing)}")
-    return source.substitute({k: ("" if v is None else str(v)) for k, v in values.items()})
+    rendered_values = {k: ("" if v is None else str(v)) for k, v in values.items()}
+    return Rendered(
+        source.substitute(rendered_values),
+        name=name,
+        version=version,
+        level=level,
+        values=rendered_values,
+        sha256=sha,
+    )
 
 
 def task_prompt(text: str) -> str:
-    return TASK_BOUNDARY + "\n\n" + VERIFICATION_POLICY + "\n\n" + text
+    combined = TASK_BOUNDARY + "\n\n" + VERIFICATION_POLICY + "\n\n" + str(text)
+    return Rendered.wrap(combined, text)
 
 
 def bash_rules(patterns: list[str]) -> list[str]:

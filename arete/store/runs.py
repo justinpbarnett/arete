@@ -9,9 +9,49 @@ from .. import refusals, util
 from ..agent import billing_of
 from . import events, writes
 from ._rows import json_dict, validate_columns
-from .db import SPEC_DELIVERY_SCHEMA, WORKER_EXCHANGE_SCHEMA, db, migration_applied, reader, tx
+from .db import (
+    RUNS_LINEAGE_SCHEMA,
+    RUNS_PINS_SCHEMA,
+    SPEC_DELIVERY_SCHEMA,
+    WORKER_EXCHANGE_SCHEMA,
+    db,
+    migration_applied,
+    reader,
+    tx,
+)
 
 STEP_LABEL_FIELDS = frozenset(("atom", "ab", "ab_side", "effort", "tier", "kind", "auth_mode"))
+PINS_RUN_FIELDS = frozenset(("config_commit", "resolved_sha"))
+LINEAGE_RUN_FIELDS = frozenset(("continues", "chain", "restart", "started_by", "payer", "seq"))
+
+
+def has_pins(c) -> bool:
+    return migration_applied(RUNS_PINS_SCHEMA, c)
+
+
+def has_lineage(c) -> bool:
+    return migration_applied(RUNS_LINEAGE_SCHEMA, c)
+
+
+def seq_col(c, alias: str = "") -> str:
+    col = "seq" if has_lineage(c) else "oid"
+    return f"{alias}.{col}" if alias else col
+
+
+def later_than(c, later: str, earlier: str) -> str:
+    col = "seq" if has_lineage(c) else "oid"
+    return f"{later}.{col} > {earlier}.{col}"
+
+
+def filter_run_fields(c, fields: dict) -> dict:
+    drop: set[str] = set()
+    if not has_pins(c):
+        drop |= PINS_RUN_FIELDS
+    if not has_lineage(c):
+        drop |= LINEAGE_RUN_FIELDS
+    if not drop:
+        return fields
+    return {k: v for k, v in fields.items() if k not in drop}
 
 TABLES = {
     "runs": "free command firings: 14 days; others kept",
@@ -26,6 +66,8 @@ TABLES = {
     "environment_gap_creations": "kept",
     "environment_budget_resets": "kept",
     "pr_gate_refreshes": "until refreshed or the PR head changes",
+    "step_inputs": "kept",
+    "settings_snapshots": "kept",
 }
 
 
@@ -95,10 +137,13 @@ def cost_drift(connect=reader) -> list[dict]:
 
 
 def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, connect=reader, loop: str | None = None,
-         firings: bool = False, statuses: tuple[str, ...] = (), running_first: bool = False) -> list[dict]:
+         firings: bool = False, statuses: tuple[str, ...] = (), running_first: bool = False,
+         include_chat: bool = False) -> list[dict]:
     q, args = "SELECT * FROM runs WHERE 1=1", []
     if not firings:
         q += f" AND NOT {FIRINGS}"
+    if not kind and not include_chat:
+        q += " AND kind != 'chat'"
     for column, value in (("kind", kind), ("loop", loop), ("repo", repo)):
         if value:
             q += f" AND {column} = ?"
@@ -106,16 +151,17 @@ def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, conn
     if statuses:
         q += f" AND status IN ({','.join('?' * len(statuses))})"
         args.extend(statuses)
-    q += " ORDER BY " + ("status = 'running' DESC, " if running_first else "") + "started DESC, rowid DESC LIMIT ?"
-    args.append(limit)
     with connect() as c:
+        q += (" ORDER BY " + ("status = 'running' DESC, " if running_first else "")
+              + f"started DESC, {seq_col(c)} DESC LIMIT ?")
+        args.append(limit)
         return [dict(r) for r in c.execute(q, args)]
 
 
 def run_facets(connect=reader) -> dict[str, list[str]]:
     with connect() as c:
         return {column: [r[0] for r in c.execute(f"SELECT DISTINCT {column} FROM runs WHERE NOT {FIRINGS} "  # noqa: S608
-                                                 f"AND COALESCE({column}, '') != '' ORDER BY 1")]
+                                                 f"AND kind != 'chat' AND COALESCE({column}, '') != '' ORDER BY 1")]
                 for column in ("kind", "repo", "loop")}
 
 
@@ -123,9 +169,9 @@ def paid_by_run(run_ids: list[str], connect=reader, local_providers=None) -> dic
     if not run_ids:
         return {}
     if local_providers is None:
-        from .. import config
+        from .. import pins
 
-        local_providers = config.load().local_providers
+        local_providers = pins.active_config().local_providers
     paid: dict[str, float] = {}
     with connect() as c:
         rows = c.execute("SELECT run_id, cost_usd, runner, provider, model, auth_mode FROM steps "  # noqa: S608
@@ -169,6 +215,7 @@ DRAFT_RECEIPT = ("SELECT e.at FROM events_log e WHERE e.subject = 'run:' || r.id
 
 def ticket_attention_runs(*, questions: bool = False) -> list[dict]:
     with reader() as c:
+        k = seq_col(c)
         return [dict(row) for row in c.execute(f"""
             SELECT r.* FROM runs r WHERE r.kind = 'pipeline' AND r.issue != '' AND r.repo != ''
                 AND COALESCE(r.stop_asked, '') = '' AND {WHOLE_RUN} AND {LIVE_RUN}
@@ -176,7 +223,7 @@ def ticket_attention_runs(*, questions: bool = False) -> list[dict]:
                       AND NOT EXISTS ({DRAFT_RECEIPT})) OR (? AND r.status = 'needs-info' AND NOT EXISTS (
                     SELECT 1 FROM runs later WHERE later.repo = r.repo AND later.issue = r.issue
                       AND later.kind = 'pipeline' AND {WHOLE_RUN} AND {LIVE_RUN}
-                      AND (later.started, later.rowid) > (r.started, r.rowid)))) ORDER BY r.started DESC, r.rowid DESC
+                      AND (later.started, later.{k}) > (r.started, r.{k})))) ORDER BY r.started DESC, r.{k} DESC
         """, (DRAFT_READY, questions))]  # noqa: S608
 
 def draft_review_at(run_id: str, receipt: str = DRAFT_READY) -> str | None:
@@ -268,9 +315,9 @@ def save_environment_hold(run_id: str, prs: list[tuple[str, int, str, str]]) -> 
 
 def held_environment_branch(repo: str, issue: str) -> str:
     with reader() as c:
-        row = c.execute("SELECT r.branch FROM environment_holds h JOIN runs r ON h.run_id = r.id "
+        row = c.execute(f"SELECT r.branch FROM environment_holds h JOIN runs r ON h.run_id = r.id "  # noqa: S608
                         "WHERE r.repo = ? AND r.issue = ? AND r.status = 'pr' AND r.dry_run = 0 AND h.released = 0 "
-                        "ORDER BY r.rowid DESC LIMIT 1", (repo, issue)).fetchone()
+                        f"ORDER BY {seq_col(c, 'r')} DESC LIMIT 1", (repo, issue)).fetchone()
     return (row["branch"] or "") if row else ""
 
 
@@ -433,7 +480,7 @@ def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=reader, wh
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
                                            + (f"AND {WHOLE_RUN} " if whole else "")
                                            + (f"AND {LIVE_RUN} " if live else "")
-                                           + "ORDER BY started DESC, rowid DESC LIMIT ?", (repo, issue, limit))]
+                                           + f"ORDER BY started DESC, {seq_col(c)} DESC LIMIT ?", (repo, issue, limit))]
 
 
 def newest_whole_run(repo: str, issue: int | str) -> dict | None:
@@ -517,8 +564,9 @@ def note_requeue_comment(run: dict, *, capped: bool = False) -> None:
 
 def ticket_runs_marked_running(repo: str, issue: int | str, connect=reader) -> list[dict]:
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                                           "AND status = 'running' ORDER BY started ASC, rowid ASC", (repo, issue))]
+        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
+                                           f"AND status = 'running' ORDER BY started ASC, {seq_col(c)} ASC",
+                                           (repo, issue))]
 
 
 def ab_placements(since: str, name: str = "", connect=reader) -> list[dict]:
@@ -552,21 +600,23 @@ def ticket_runs_since(repo: str, issue: int | str, since: str, connect=reader) -
 def later_run(repo: str, issue: int | str, run_id: str, connect=reader, *, live: bool = False,
               candidate: str = "") -> dict | None:
     with connect() as c:
+        k = seq_col(c)
         r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND {WHOLE_RUN} "  # noqa: S608
                       + (f"AND {LIVE_RUN} " if live else "")
                       + ("AND id = ? " if candidate else "")
-                      + "AND rowid > (SELECT rowid FROM runs WHERE id = ?) ORDER BY rowid LIMIT 1",
+                      + f"AND {k} > (SELECT {k} FROM runs WHERE id = ?) ORDER BY {k} LIMIT 1",  # noqa: S608
                       (repo, issue, *([candidate] if candidate else []), run_id)).fetchone()
         return dict(r) if r else None
 
 
 def interrupted_tickets(repo: str) -> list[str]:
     with reader() as c:
+        k = seq_col(c)
         rows = c.execute(f"SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "  # noqa: S608
-                         "AND rowid = (SELECT r2.rowid FROM runs r2 WHERE r2.kind = 'pipeline' "
+                         f"AND {k} = (SELECT r2.{k} FROM runs r2 WHERE r2.kind = 'pipeline' "
                          f"AND r2.repo = runs.repo AND r2.issue = runs.issue AND {WHOLE_RUN} AND {LIVE_RUN} "
-                         "ORDER BY r2.started DESC, r2.rowid DESC LIMIT 1) "
-                         "ORDER BY started, rowid", (repo,))
+                         f"ORDER BY r2.started DESC, r2.{k} DESC LIMIT 1) "
+                         f"ORDER BY started, {k}", (repo,))
         return [str(r["issue"]) for r in rows if r["status"] == "interrupted"]
 
 
@@ -578,15 +628,15 @@ def last_pipeline_starts() -> dict[str, str]:
 
 def running_run(repo: str, issue: int | str, connect=reader) -> dict | None:
     with connect() as c:
-        r = c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND status = 'running' "
-                      "ORDER BY started DESC, rowid DESC LIMIT 1", (repo, issue)).fetchone()
+        r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND status = 'running' "  # noqa: S608
+                      f"ORDER BY started DESC, {seq_col(c)} DESC LIMIT 1", (repo, issue)).fetchone()
         return dict(r) if r else None
 
 
 def pending_label(repo: str, issue: int | str) -> str:
     with reader() as c:
-        r = c.execute("SELECT label_pending FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                      "AND label_pending IS NOT NULL ORDER BY started DESC, rowid DESC LIMIT 1",
+        r = c.execute(f"SELECT label_pending FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
+                      f"AND label_pending IS NOT NULL ORDER BY started DESC, {seq_col(c)} DESC LIMIT 1",
                       (repo, issue)).fetchone()
         return r["label_pending"] if r else ""
 
@@ -678,25 +728,127 @@ def insert_run(run_id: str, row: dict) -> None:
     from . import factory
 
     with writes.atomic() as c:
-        writes.insert("runs", row, run_id, "run.started")
+        writes.insert("runs", filter_run_fields(c, row), run_id, "run.started")
         factory.registered_run(c, run_id, row)
         if row.get("kind") == "pipeline":
             _sync_inbox_runs(c)
 
 
+def save_settings_snapshots(c, snapshots: dict[str, str]) -> None:
+    if not snapshots or not has_pins(c):
+        return
+    now = util.iso()
+    c.executemany(
+        "INSERT OR IGNORE INTO settings_snapshots (sha256, body, created) VALUES (?, ?, ?)",
+        [(sha, body, now) for sha, body in snapshots.items()],
+    )
+
+
+def settings_snapshot(sha256: str, connect=reader) -> dict | None:
+    if not sha256:
+        return None
+    with connect() as c:
+        if not has_pins(c):
+            return None
+        row = c.execute("SELECT body FROM settings_snapshots WHERE sha256 = ?", (sha256,)).fetchone()
+    if not row:
+        return None
+    try:
+        parsed = json.loads(row["body"])
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def step_inputs(step_id: int, connect=reader) -> list[dict]:
+    with connect() as c:
+        if not has_pins(c):
+            return []
+        return [dict(r) for r in c.execute(
+            "SELECT step_id, role, name, version, level, sha256, call FROM step_inputs "
+            "WHERE step_id = ? ORDER BY rowid", (step_id,))]
+
+
+def step_inputs_by_run(run_id: str, connect=reader) -> dict[int, list[dict]]:
+    grouped: dict[int, list[dict]] = {}
+    with connect() as c:
+        if not has_pins(c):
+            return {}
+        rows = c.execute(
+            "SELECT si.step_id, si.role, si.name, si.version, si.level, si.sha256, si.call "
+            "FROM step_inputs si JOIN steps s ON s.id = si.step_id "
+            "WHERE s.run_id = ? ORDER BY si.step_id, si.rowid",
+            (run_id,),
+        )
+        for row in rows:
+            item = dict(row)
+            grouped.setdefault(item["step_id"], []).append(item)
+    return grouped
+
+
+def running_config_commits(connect=reader) -> set[str]:
+    with connect() as c:
+        if not has_pins(c):
+            return set()
+        return {
+            r[0] for r in c.execute(
+                "SELECT DISTINCT config_commit FROM runs WHERE status = 'running' AND COALESCE(config_commit, '') != ''"
+            )
+        }
+
+
+def highest_contract_migration(connect=reader) -> int:
+    with connect() as c:
+        row = c.execute("SELECT COALESCE(MAX(n), 0) FROM schema_migrations WHERE phase = 'contract'").fetchone()
+    return int(row[0]) if row else 0
+
+
 def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
-                 try_no: int = 0, auth_mode: str = "") -> None:
+                 try_no: int = 0, auth_mode: str = "", *, inputs: tuple[dict, ...] | list[dict] = (),
+                 settings_sha: str = "", settings_snapshots: dict[str, str] | None = None,
+                 blob_rows: tuple[tuple[str, str, int], ...] = ()) -> None:
+    from . import blobs as blob_store
+
     with writes.atomic() as c:
+        pinned = has_pins(c)
+        if pinned:
+            for sha, blob_kind, size in blob_rows:
+                blob_store.record_row(c, sha, blob_kind, size)
+            if settings_snapshots:
+                save_settings_snapshots(c, settings_snapshots)
         for res, seconds in calls:
-            c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
-                      " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
-                      " api_seconds, auth_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                      "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
-                      "?,?,?,?,?)",
-                      (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
-                       res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
-                       res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
-                       res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode))
+            if pinned:
+                cur = c.execute(
+                    "INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
+                    " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
+                    " api_seconds, auth_mode, settings_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                    "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
+                    "?,?,?,?,?,?)",
+                    (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
+                     res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
+                     res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
+                     res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode, settings_sha or None))
+            else:
+                cur = c.execute(
+                    "INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
+                    " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
+                    " api_seconds, auth_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                    "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
+                    "?,?,?,?,?)",
+                    (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
+                     res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
+                     res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
+                     res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode))
+            step_id = cur.lastrowid
+            if pinned and inputs and step_id is not None:
+                c.executemany(
+                    "INSERT INTO step_inputs (step_id, role, name, version, level, sha256, call) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [(step_id, str(item.get("role") or ""), str(item.get("name") or ""),
+                      str(item.get("version") or ""), str(item.get("level") or ""),
+                      str(item.get("sha256") or ""), int(item.get("call") or 0))
+                     for item in inputs],
+                )
             writes.update("runs", run_id, {}, increments={"cost_usd": res.cost_usd, "tokens_in": res.tokens_in,
                                                          "tokens_out": res.tokens_out})
 
@@ -724,10 +876,15 @@ def note(run_id: str, *, base_version=None, **fields) -> None:
         from . import factory
 
         with writes.atomic() as c:
-            writes.update("runs", run_id, fields, base_version=base_version)
+            filtered = filter_run_fields(c, fields)
+            if filtered:
+                writes.update("runs", run_id, filtered, base_version=base_version)
             factory.register(c, run_id, fields["pid"], "run")
     else:
-        writes.update("runs", run_id, fields, base_version=base_version)
+        with writes.atomic() as c:
+            filtered = filter_run_fields(c, fields)
+            if filtered:
+                writes.update("runs", run_id, filtered, base_version=base_version)
 
 
 def checkpoint(run_id: str, active: float, verified: float, opened: float, repairs: int, at: str) -> None:
@@ -809,16 +966,11 @@ def mined_until() -> str | None:
 def orphan_rows(c, table, limit):
     if table not in ("steps", "feed"):
         raise ValueError(table)
-    extra = " AND t.run_id <> 'chat'" if table == "steps" else ""
     query = (f"FROM {table} t LEFT JOIN runs ON runs.id = t.run_id "
-             f"WHERE t.run_id IS NOT NULL AND t.run_id <> '' AND runs.id IS NULL{extra}")
+             "WHERE t.run_id IS NOT NULL AND t.run_id <> '' AND runs.id IS NULL")
     count = c.execute(f"SELECT COUNT(*) {query}").fetchone()[0]
     rows = c.execute(f"SELECT t.rowid, t.run_id {query} ORDER BY t.rowid LIMIT ?", (limit,)).fetchall() if limit else []
     return count, rows
-
-
-def pseudo_chat_steps(c, run_id):
-    return c.execute("SELECT id FROM steps WHERE run_id = ? ORDER BY id", (run_id,)).fetchall()
 
 
 def folder_rows(c):

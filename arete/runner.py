@@ -122,7 +122,10 @@ def authentication(model: str, run_with: str = "", *, cfg: config.Config | None 
     which, name = routing.route(model, run_with)
     if which == REPLAY or (cfg and cfg.replay.all):
         return accounts.Auth()
-    cfg = cfg or config.load()
+    if cfg is None:
+        from . import pins
+
+        cfg = pins.active_config()
     target = devices.resolve(device)
     passing = environment.passed(cfg, repo)
     remote = target if target.remote else None
@@ -253,7 +256,10 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None,
         hard_cap: bool = False, needs_server: bool = False, codex_headroom: dict | None = None,
         max_steps: int | None = None, claude_tools: tuple[str, ...] = (), **kw) -> Result:
-    cfg = cfg or config.load()
+    if cfg is None:
+        from . import pins
+
+        cfg = pins.active_config()
     if settings and settings.requires.delegation_only:
         kw.update(tools=[], allowed_tools=[], disallowed_tools=[], instructions=[], mcp_config="", add_dirs=[],
                   ask_owner=False, persist=False)
@@ -302,12 +308,24 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         repo = repo or cfg.repo_for_work_dir(cwd)
     size = routing.routing_size(prompt, settings, kw)
     active = layer if layer is not None else routing.layer_of(repo)
+    from . import pins
+    from .store import db as db_store
+
+    run_payer: str | None | object = routing._UNSET
+    if (active_pin := pins.current()) is not None:
+        run_payer = active_pin.payer
+    elif trace[0] and paths.DB_FILE.exists():
+        try:
+            if (run_row := run_store.run_get(trace[0])) is not None:
+                run_payer = run_row.get("payer")
+        except (db_store.NoDatabase, db_store.IncompatibleSchema):
+            pass
     trip = Trip(cfg, repo, target,
                 routing.request_for(cfg, repo, which, name, settings, fallback, kw, size, active), resume,
                 remaining_budget, kw.get("max_budget_usd"), layer=active, scratch=scratch,
                 tokens=remaining_tokens, structured=kw.get("json_schema") is not None,
                 hard_cap=hard_cap, needs_server=needs_server, headroom=codex_headroom,
-                private_worker=bool(kw.get("private_worker")))
+                private_worker=bool(kw.get("private_worker")), payer=run_payer)
     limited: list[Result] = []
     previous: Stopped | None = None
     launches, measured = 0, size
@@ -445,6 +463,7 @@ class Trip:
     needs_server: bool = False
     headroom: dict | None = None
     private_worker: bool = False
+    payer: str | None | object = routing._UNSET
 
 
 @dataclass
@@ -541,7 +560,7 @@ class Stopped:
 
 
 def outgrown(trip: Trip, chosen, size: int) -> str:
-    discovery = routing.Discovery(trip.cfg, trip.repo, trip.target, layer=trip.layer)
+    discovery = routing.Discovery(trip.cfg, trip.repo, trip.target, layer=trip.layer, payer=trip.payer)
     key = routing.route_key(chosen)
     again = discovery.routes(replace(trip.request, size=size), request_tokens=size)
     return next((c.detail for c in again if routing.route_key(c) == key and c.state == "ineligible"), "")
@@ -582,7 +601,7 @@ def passed_over(found, why: str, detail: str, until: str = "") -> dict:
 
 
 def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
-    discovery = routing.Discovery(trip.cfg, trip.repo, trip.target, layer=trip.layer)
+    discovery = routing.Discovery(trip.cfg, trip.repo, trip.target, layer=trip.layer, payer=trip.payer)
     found = discovery.routes(trip.request, request_tokens=trip.request.size)
     wanted = trip.resume
     if wanted.id and not trip.launched:
@@ -908,6 +927,69 @@ def refresh_redactions(hidden: scrub.Redactions, selected: pi.Route | None) -> N
         scrub.remember(*vals)
 
 
+def _step_inputs_for(prompt: str, trace: tuple[str, str], kw: dict, resume: Session, atom: str,
+                     try_no: int) -> tuple[list[dict], tuple[tuple[str, str, int], ...], str]:
+    from . import factory, pins, prompt_loader
+    from .store import blobs as blob_store
+
+    if not trace[0]:
+        return [], (), ""
+    pin = pins.current()
+    items: list[dict] = []
+    blobs_to_write: dict[str, tuple[str, bytes]] = {}
+    call_no = max(0, int(try_no or 0))
+
+    rendered_bytes = str(prompt).encode("utf-8")
+    rendered_sha = blob_store.digest(rendered_bytes)
+    blobs_to_write[rendered_sha] = ("rendered", rendered_bytes)
+    items.append({"role": "rendered", "name": trace[1], "sha256": rendered_sha, "call": call_no})
+
+    if isinstance(prompt, prompt_loader.Rendered) and prompt.prompt_name:
+        items.append({
+            "role": "prompt",
+            "name": prompt.prompt_name,
+            "version": prompt.prompt_version,
+            "level": prompt.prompt_level,
+            "sha256": prompt.prompt_sha256,
+            "call": call_no,
+        })
+        input_bytes = json.dumps(prompt.prompt_values, sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=False, default=str).encode("utf-8")
+        input_sha = blob_store.digest(input_bytes)
+        blobs_to_write[input_sha] = ("inputs", input_bytes)
+        items.append({"role": "inputs", "name": prompt.prompt_name, "sha256": input_sha, "call": call_no})
+
+    if (schema_obj := kw.get("json_schema")) is not None and isinstance(schema_obj, dict):
+        sname, sver, ssha = pins.identify_schema(schema_obj, trace[1])
+        items.append({"role": "schema", "name": sname, "version": sver, "level": "engine",
+                      "sha256": ssha, "call": call_no})
+        if (seam := factory.inside(trace[0])) is not None:
+            seam.schema = sver
+
+    if pin is not None and pin.expertise:
+        items.append({"role": "expertise", "name": pin.expertise["path"],
+                      "sha256": pin.expertise["sha256"], "call": call_no})
+
+    if pin is not None and pin.loop_files:
+        for rel, sha in sorted(pin.loop_files.items()):
+            items.append({"role": "loop_file", "name": rel, "sha256": sha, "call": call_no})
+
+    for secret_name, secret_fp in (kw.get("secret_fingerprints") or ()):
+        items.append({"role": "secret", "name": str(secret_name), "version": str(secret_fp), "call": call_no})
+
+    if resume.id:
+        origin_run = getattr(resume, "origin_run", "") or trace[0]
+        items.append({"role": "session", "name": resume.id, "version": origin_run, "call": call_no})
+
+    blob_rows: list[tuple[str, str, int]] = []
+    for sha, (blob_kind, data) in blobs_to_write.items():
+        blob_store.write_file(data, sha)
+        blob_rows.append((sha, blob_kind, len(data)))
+
+    settings_sha = pin.settings_sha_for(atom or trace[1]) if pin is not None else ""
+    return items, tuple(blob_rows), settings_sha
+
+
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
             trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str = "",
             kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None, try_no: int = 0,
@@ -966,13 +1048,16 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             return token_cost(openrouter_quote.rates, res.tokens_in, res.tokens_out, res.cache_read, res.cache_write)
         return 0.0 if on_local else priced(res, cfg)
 
+    step_inputs, step_blob_rows, step_settings_sha = _step_inputs_for(prompt, trace, kw, resume, atom, try_no)
+
     def persist(res: Result) -> None:
         try:
             if trace[0]:
                 record.steps(trace[0], trace[1],
                              [(call, call.call_seconds if res.calls else time.monotonic() - started)
                               for call in res.calls or [res]], effort=kw.get("effort", ""),
-                             tier=tier, kind=kind, try_no=try_no, auth_mode="local" if on_local else "")
+                             tier=tier, kind=kind, try_no=try_no, auth_mode="local" if on_local else "",
+                             inputs=step_inputs, settings_sha=step_settings_sha, blob_rows=step_blob_rows)
         except BaseException as error:
             rec.finish(replace(res, ok=False, error=scrub.text(
                 f"cost is not in steps: {record.failure(error)}; {res.error}", "record", subject, extra=hidden)),
