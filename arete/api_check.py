@@ -564,6 +564,7 @@ class Check:
             )
         cohorts.declare("example", replay.SAMPLE_REPO, "fixture", "single known task", tickets=[self.task],
                         closes="2099-01-01T00:00:00Z", hours=24)
+        from . import configrepo as configrepo_mod
         from . import drafts as drafts_mod
         from . import lines as lines_mod
 
@@ -583,6 +584,10 @@ class Check:
         alt_cfg_text = cur_cfg_text.replace("max_parallel = 3", "max_parallel = 4", 1)
         if alt_cfg_text == cur_cfg_text:
             alt_cfg_text = cur_cfg_text.replace("max_parallel = 2", "max_parallel = 4", 1)
+        scratch_dev = paths.CONFIG_DIR / "devices" / "scratch.toml"
+        scratch_dev.parent.mkdir(parents=True, exist_ok=True)
+        scratch_dev.write_text('kind = "ssh"\nhost = "scratch.invalid"\n', encoding="utf-8")
+        configrepo_mod.commit_hand_edits()
         draft_for_activate, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture activate")
         draft_for_try, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture try")
         draft_for_discard, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture discard")
@@ -633,7 +638,7 @@ class Check:
             if name == "task.restore":
                 # task.close just closed self.task right before task.restore in OPERATIONS order.
                 pass
-            if name in ("inbox.snooze", "inbox.shelve", "inbox.resolve"):
+            if name in ("inbox.snooze", "inbox.shelve", "inbox.reopen", "inbox.resolve"):
                 values["base_version"] = self.read(f"/api/v1/inbox/{identities['item']}")["item"]["version"]
             if resource == "outbox" and method != "GET":
                 cur_ob = self.read(f"/api/v1/outbox/{ob_item}")["item"]
@@ -652,6 +657,8 @@ class Check:
             if name == "config.rollback":
                 values["to"] = 2
                 values["base_version"] = self.read("/api/v1/config/step_settings/defaults")["item"]["version"]
+            if name == "config.delete":
+                values["base_version"] = self.read("/api/v1/config/device/scratch")["item"]["version"]
             if name == "config.try":
                 values["draft"] = draft_for_try["id"]
                 values["steps"] = ["plan"]

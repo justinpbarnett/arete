@@ -1093,7 +1093,8 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
             kind, name = classify_path(rel)
             origin = origin_of(rel)
             if raw is None:
-                config_store.record_deleted(
+                tombstone = f"{kind}/{name}{config_store.DELETED_SUFFIX}"
+                ver = config_store.record_deleted(
                     conn,
                     kind=kind,
                     name=name,
@@ -1109,6 +1110,7 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
                     f"config.{kind}.changed",
                     f"config:{kind}/{name}",
                     cls="durable",
+                    ver=ver,
                     data={
                         "path": rel,
                         "commit": sha,
@@ -1117,6 +1119,9 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
                         "kind": kind,
                         "name": name,
                         "origin": origin,
+                        "version": ver,
+                        "deleted": True,
+                        "tombstone": tombstone,
                         "source": meta["source"],
                     },
                     connection=conn,
@@ -1288,32 +1293,38 @@ def _walk_history_rows(root: Path) -> list[dict]:
                 if prev := live_key.pop(op, None):
                     rows[prev]["live"] = 0
                 kind, name = classify_path(rel)
-                item_live_sha.pop((kind, name), None)
-                del_key = (origin, rel, ABSENT)
-                if del_key in rows:
-                    rows[del_key].update(
+                kn = (kind, name)
+                item_live_sha.pop(kn, None)
+                ver = item_ver.get(kn, 0)
+                if origin != "engine":
+                    ver += 1
+                    item_ver[kn] = ver
+                tombstone = f"{kind}/{name}{config_store.DELETED_SUFFIX}"
+                key = (origin, rel, "")
+                if key in rows:
+                    rows[key].update(
                         kind=kind,
                         name=name,
-                        version=f"{kind}/{name}@absent",
+                        version=tombstone,
                         commit_sha=sha,
                         author=meta["author"],
                         source=meta["source"],
                         note=meta["note"],
                         at=meta["at"],
                         live=0,
-                        fields="{}",
-                        ver=0,
+                        fields='{"deleted":true}',
+                        ver=ver if origin != "engine" else 0,
                     )
                 else:
                     n = max_n.get(op, 0) + 1
                     max_n[op] = n
-                    rows[del_key] = {
+                    rows[key] = {
                         "kind": kind,
                         "name": name,
                         "origin": origin,
                         "path": rel,
-                        "sha256": ABSENT,
-                        "version": f"{kind}/{name}@absent",
+                        "sha256": "",
+                        "version": tombstone,
                         "n": n,
                         "commit_sha": sha,
                         "author": meta["author"],
@@ -1321,8 +1332,8 @@ def _walk_history_rows(root: Path) -> list[dict]:
                         "note": meta["note"],
                         "at": meta["at"],
                         "live": 0,
-                        "fields": "{}",
-                        "ver": 0,
+                        "fields": '{"deleted":true}',
+                        "ver": ver if origin != "engine" else 0,
                     }
                 continue
             blob = _git(["cat-file", "blob", f"{sha}:{rel}"], root, check=False, text=False)
@@ -1427,7 +1438,13 @@ def _reconcile_locked(root: Path, fence: Fence) -> int:
                     origin = origin_of(rel)
                     if status == "D":
                         kind, name = classify_path(rel)
-                        config_store.record_deleted(
+                        tombstone = f"{kind}/{name}{config_store.DELETED_SUFFIX}"
+                        old_blob = ABSENT
+                        if parent:
+                            prev = _git(["rev-parse", "--verify", f"{parent}:{rel}"], root, check=False)
+                            if prev.returncode == 0:
+                                old_blob = prev.stdout.strip()
+                        ver = config_store.record_deleted(
                             conn,
                             kind=kind,
                             name=name,
@@ -1438,6 +1455,26 @@ def _reconcile_locked(root: Path, fence: Fence) -> int:
                             source=meta["source"],
                             note=meta["note"],
                             at=meta["at"],
+                        )
+                        events.emit(
+                            f"config.{kind}.changed",
+                            f"config:{kind}/{name}",
+                            cls="durable",
+                            ver=ver,
+                            data={
+                                "path": rel,
+                                "commit": sha,
+                                "old_blob": old_blob,
+                                "new_blob": ABSENT,
+                                "kind": kind,
+                                "name": name,
+                                "origin": origin,
+                                "version": ver,
+                                "deleted": True,
+                                "tombstone": tombstone,
+                                "source": meta["source"],
+                            },
+                            connection=conn,
                         )
                         continue
                     blob = _git(["cat-file", "blob", f"{sha}:{rel}"], root, check=False, text=False)
@@ -1670,7 +1707,26 @@ def version_history(kind: str, name: str, path: str) -> list[dict]:
     prev_sha = ""
     for sha in commits:
         blob = _git(["cat-file", "blob", f"{sha}:{path}"], root, check=False, text=False)
+        meta = _parse_commit_meta(root, sha)
         if blob.returncode != 0:
+            ver += 1
+            prev_sha = ""
+            if "" not in seen_n:
+                seen_n[""] = len(seen_n) + 1
+            entries.append({
+                "version": ver,
+                "content_version": f"{kind}/{name}{config_store.DELETED_SUFFIX}",
+                "commit_sha": sha,
+                "sha256": "",
+                "origin": origin,
+                "path": path,
+                "n": seen_n[""],
+                "author": meta["author"],
+                "source": meta["source"],
+                "note": meta["note"],
+                "at": meta["at"],
+                "live": False,
+            })
             continue
         raw = blob.stdout
         digest = hashlib.sha256(raw).hexdigest()
@@ -1679,7 +1735,6 @@ def version_history(kind: str, name: str, path: str) -> list[dict]:
             prev_sha = digest
         if digest not in seen_n:
             seen_n[digest] = len(seen_n) + 1
-        meta = _parse_commit_meta(root, sha)
         entries.append({
             "version": ver,
             "content_version": f"{kind}/{name}@{digest[:12]}",
@@ -1694,7 +1749,7 @@ def version_history(kind: str, name: str, path: str) -> list[dict]:
             "at": meta["at"],
             "live": False,
         })
-    if entries:
+    if entries and entries[-1]["sha256"]:
         entries[-1]["live"] = True
     entries.reverse()
     return entries

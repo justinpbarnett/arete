@@ -179,7 +179,7 @@ def add(
     origin: str = "",
     path: str = "",
     base_version: str = "",
-    body: str = "",
+    body: str | None = "",
     diff: str = "",
     author: str = "",
     model: str = "",
@@ -709,8 +709,15 @@ def default_path(kind: str, name: str) -> str:
     return first.pattern.replace("{name}", name)
 
 
-def _unified_diff(path: str, old_bytes: bytes | None, new_text: str) -> str:
+def _unified_diff(path: str, old_bytes: bytes | None, new_text: str | None) -> str:
     old_text = old_bytes.decode("utf-8", errors="replace") if old_bytes is not None else ""
+    if new_text is None:
+        return "".join(unified_diff(
+            old_text.splitlines(keepends=True),
+            [],
+            fromfile=f"a/{path}",
+            tofile="/dev/null",
+        ))
     return "".join(unified_diff(
         old_text.splitlines(keepends=True),
         new_text.splitlines(keepends=True),
@@ -719,9 +726,18 @@ def _unified_diff(path: str, old_bytes: bytes | None, new_text: str) -> str:
     ))
 
 
-def _live_ver_for(kind: str, name: str, path: str, conn=None) -> int:
+def _current_ver_row(kind: str, name: str, path: str, conn=None) -> dict | None:
     lookup_kind = "step_settings" if kind == "attention" else kind
-    row = config_store.live_item(lookup_kind, name, conn) or config_store.live_by_path(path, conn)
+    return (
+        config_store.live_item(lookup_kind, name, conn)
+        or config_store.live_by_path(path, conn)
+        or config_store.latest_item(lookup_kind, name, conn)
+        or config_store.latest_by_path(path, conn)
+    )
+
+
+def _live_ver_for(kind: str, name: str, path: str, conn=None) -> int:
+    row = _current_ver_row(kind, name, path, conn)
     if row is not None and row.get("ver") is not None:
         return int(row["ver"])
     return 0
@@ -775,7 +791,7 @@ def _prepare_prompt_draft(
 def create_and_check(
     kind: str,
     name: str,
-    body: str,
+    body: str | None,
     *,
     author: str | None = None,
     path: str = "",
@@ -968,8 +984,7 @@ def _validate_base_and_check_for_activation(
         raise contract.Problem("invalid_state", f"Draft {draft['id']} in state {draft['state']!r} cannot be activated.")
 
     rel = draft["path"] or default_path(draft["kind"], draft["name"])
-    lookup_kind = "step_settings" if draft["kind"] == "attention" else draft["kind"]
-    live_row = config_store.live_item(lookup_kind, draft["name"]) or config_store.live_by_path(rel)
+    live_row = _current_ver_row(draft["kind"], draft["name"], rel)
     live_ver = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
     if not _matches_base_version(base_version, live_ver, live_row):
         raise contract.Problem(
@@ -1044,7 +1059,7 @@ def activate(
 
         rel = draft["path"] or default_path(draft["kind"], draft["name"])
         live_blob = configrepo._live_blob(root, rel)
-        body_bytes = draft["body"].encode("utf-8")
+        body_bytes = None if draft["body"] is None else draft["body"].encode("utf-8")
         commit_sha = configrepo.commit(
             {rel: body_bytes},
             {rel: live_blob},
@@ -1065,6 +1080,149 @@ def activate(
     return {"draft": public(updated), "commit": commit_sha, "version": new_ver}
 
 
+def inspect_delete(kind: str, name: str, base_version: str | int, actor: str, *, root: Path | None = None) -> tuple[dict, bytes, dict]:
+    from . import configcheck
+
+    if actor.startswith("run:"):
+        raise contract.Problem("forbidden", f"Actor {actor!r} cannot delete config.")
+    if kind not in configkinds.REGISTRY:
+        raise contract.Problem("not_found", f"Unknown config kind {kind}")
+    cfg_root = (root or paths.CONFIG_DIR).resolve()
+    user_entries = [entry for entry in configitems.listing(kind, name=name) if entry.get("level") != "engine"]
+    if not user_entries:
+        if configitems._engine_item(kind, name) is not None:
+            raise contract.Problem("engine_default", f"Engine default {kind}/{name} cannot be deleted.")
+        rel = default_path(kind, name)
+        prev_row = _current_ver_row(kind, name, rel)
+        if prev_row is not None:
+            cur_ver = int(prev_row["ver"]) if prev_row.get("ver") is not None else 0
+            if not _matches_base_version(base_version, cur_ver, prev_row):
+                raise contract.Problem(
+                    "version_conflict",
+                    f"Config item {kind}/{name} is at version {cur_ver}, not {base_version}.",
+                    current={"kind": kind, "name": name, "version": cur_ver},
+                )
+        raise contract.Problem("not_found", f"No config item {kind}/{name}")
+    found = user_entries[0]
+    rel = found["path"]
+    target_path = cfg_root / rel
+    live_bytes = configrepo.live_bytes(rel, cfg_root) if configrepo.is_repo(cfg_root) else None
+    if live_bytes is None:
+        if not target_path.is_file():
+            raise contract.Problem("not_found", f"No config item {kind}/{name}")
+        old_bytes = target_path.read_bytes()
+        untracked_cv = f"{kind}/{name}@{hashlib.sha256(old_bytes).hexdigest()[:12]}"
+        if not _matches_base_version(base_version, 0, {"version": untracked_cv, "commit_sha": ""}):
+            raise contract.Problem(
+                "version_conflict",
+                f"Config item {kind}/{name} is at version 0, not {base_version}.",
+                current={"kind": kind, "name": name, "version": 0},
+            )
+    else:
+        old_bytes = live_bytes
+        live_row = _current_ver_row(kind, name, rel)
+        live_ver = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
+        if not _matches_base_version(base_version, live_ver, live_row):
+            raise contract.Problem(
+                "version_conflict",
+                f"Config item {kind}/{name} is at version {live_ver}, not {base_version}.",
+                current={"kind": kind, "name": name, "version": live_ver},
+            )
+    refs = configcheck.find_delete_references(kind, name, cfg_root)
+    if refs:
+        raise contract.Problem(
+            "referenced",
+            f"Config item {kind}/{name} is still referenced: {', '.join(refs)}.",
+            references=refs,
+        )
+    report = configcheck.check(kind, name, rel, None, author=actor, config_dir=cfg_root, old_bytes=old_bytes)
+    if not report["ok"]:
+        problems = [p for st in report["stages"] for p in st.get("problems", ())]
+        raise contract.Problem("validation", "; ".join(problems) or f"Delete check failed for {kind}/{name}.")
+    return found, old_bytes, report
+
+
+def delete_item(
+    kind: str,
+    name: str,
+    base_version: str | int,
+    actor: str,
+    idem: str = "",
+    *,
+    why: str = "",
+    presence_passed: bool = False,
+    fence=None,
+) -> dict:
+    if actor.startswith("run:"):
+        raise contract.Problem("forbidden", f"Actor {actor!r} cannot delete config.")
+    if kind not in configkinds.REGISTRY:
+        raise contract.Problem("not_found", f"Unknown config kind {kind}")
+    root = paths.CONFIG_DIR.resolve()
+    with configrepo.writer_lock(fence) as owned:
+        configrepo.ensure_repo(fence=owned)
+        configrepo.reconcile(fence=owned)
+        found, old_bytes, report = inspect_delete(kind, name, base_version, actor, root=root)
+        rel = found["path"]
+        effective_base: str | int = base_version
+        if configrepo._live_blob(root, rel) == configrepo.ABSENT:
+            configrepo.commit(
+                {rel: old_bytes},
+                {rel: configrepo.ABSENT},
+                actor="hand",
+                source="hand",
+                note=f"hand edit: {rel}",
+                activate_c=presence_passed,
+                fence=owned,
+                write_files=False,
+            )
+            effective_base = _live_ver_for(kind, name, rel)
+        live_row = _current_ver_row(kind, name, rel)
+        previous_version = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
+        previous_content_version = f"{kind}/{name}@{hashlib.sha256(old_bytes).hexdigest()[:12]}"
+        if report["gate"] == "C" and not presence_passed:
+            draft, _ = create_and_check(
+                kind,
+                name,
+                None,
+                author=actor,
+                path=rel,
+                base_version=effective_base,
+                why=why or f"delete {kind}/{name}",
+                run_check=True,
+            )
+            raise PresenceRequired(draft, report)
+        draft, check_report = create_and_check(
+            kind,
+            name,
+            None,
+            author=actor,
+            path=rel,
+            base_version=effective_base,
+            why=why or f"delete {kind}/{name}",
+            run_check=True,
+        )
+        if not check_report or not check_report["ok"]:
+            problems = [p for st in (check_report or {}).get("stages", ()) for p in st.get("problems", ())]
+            raise contract.Problem("validation", "; ".join(problems) or f"Delete draft {draft['id']} failed check.")
+        activated = activate(
+            draft["id"],
+            actor,
+            effective_base,
+            idem=idem,
+            presence_passed=presence_passed,
+            source="draft",
+            fence=owned,
+        )
+    return {
+        "draft": activated["draft"],
+        "commit": activated["commit"],
+        "version": activated["version"],
+        "tombstone": f"{kind}/{name}{config_store.DELETED_SUFFIX}",
+        "previous_version": previous_version,
+        "previous_content_version": previous_content_version,
+    }
+
+
 def rollback(
     kind: str,
     name: str,
@@ -1078,7 +1236,12 @@ def rollback(
 ) -> dict:
     if actor.startswith("run:"):
         raise contract.Problem("gate_refused", f"Actor {actor!r} cannot roll back config.")
-    found = configitems.item(kind, name)
+    found = configitems.item_or_historical(kind, name)
+    if configitems.is_tombstone_selector(found, str(to)):
+        raise contract.Problem(
+            "validation",
+            f"Version {to} of {kind}/{name} is a deletion tombstone and cannot be rolled back to as file bytes.",
+        )
     target = configitems.read(found, version=str(to))
     content = target["content"]
     if not isinstance(content, str):
@@ -1161,6 +1324,8 @@ def try_draft(kind: str, name: str, draft_id: str | int, steps_input: list, acto
         raise contract.Problem("validation", f"Draft {draft['id']} belongs to {draft['kind']}/{draft['name']}, not {kind}/{name}.")
     if draft["state"] not in ("draft", "valid"):
         raise contract.Problem("invalid_state", f"Draft {draft['id']} in state {draft['state']!r} cannot be tried.")
+    if draft["body"] is None:
+        raise contract.Problem("invalid_state", f"Deletion draft {draft['id']} cannot be tried.")
 
     resolved_steps = [_resolve_try_step(spec) for spec in steps_input]
     for _, step_name, source_run_id, source_step_id in resolved_steps:
@@ -1357,14 +1522,22 @@ def _previous_and_new_version_info(draft: dict) -> tuple[dict | None, dict | Non
         if len(history) > 1:
             prev_entry = history[1]
     if new_entry is None:
-        raw = draft["body"].encode("utf-8")
-        digest = hashlib.sha256(raw).hexdigest()
-        new_entry = {
-            "version": None,
-            "content_version": f"{kind}/{name}@{digest[:12]}",
-            "commit_sha": activated_sha,
-            "sha256": digest,
-        }
+        if draft["body"] is None:
+            new_entry = {
+                "version": None,
+                "content_version": f"{kind}/{name}{config_store.DELETED_SUFFIX}",
+                "commit_sha": activated_sha,
+                "sha256": "",
+            }
+        else:
+            raw = draft["body"].encode("utf-8")
+            digest = hashlib.sha256(raw).hexdigest()
+            new_entry = {
+                "version": None,
+                "content_version": f"{kind}/{name}@{digest[:12]}",
+                "commit_sha": activated_sha,
+                "sha256": digest,
+            }
     if prev_entry is None and draft["base_version"]:
         row = config_store.by_selector(lookup_kind, name, draft["base_version"])
         if row is not None:

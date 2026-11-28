@@ -328,6 +328,68 @@ def item(kind: str, name: str, *, level: str | None = None, conn=None) -> dict:
     raise refusals.NotFound(f"No config item {kind}/{name}")
 
 
+def item_or_historical(kind: str, name: str, *, level: str | None = None, conn=None) -> dict:
+    try:
+        return item(kind, name, level=level, conn=conn)
+    except refusals.NotFound:
+        if kind not in configkinds.REGISTRY or level == "engine":
+            raise
+    lookup_kind = "step_settings" if kind == "attention" else kind
+    row = config_store.latest_item(lookup_kind, name, conn)
+    if row is not None:
+        item_level = row["origin"] if row["origin"].startswith("layer:") else configrepo.level_of(row["path"])
+        if level is not None and item_level != level:
+            raise refusals.NotFound(f"No config item {kind}/{name} at level {level}")
+        return {
+            "kind": kind,
+            "name": name,
+            "path": row["path"],
+            "subject": f"config:{kind}/{name}",
+            "version": int(row.get("ver") or 0),
+            "content_version": row["version"],
+            "level": item_level,
+        }
+    if configrepo.is_repo():
+        from . import drafts
+
+        rel = drafts.default_path(kind, name)
+        entries = configrepo.version_history(lookup_kind, name, rel)
+        if entries:
+            latest = entries[0]
+            item_level = latest["origin"] if latest["origin"].startswith("layer:") else configrepo.level_of(rel)
+            if level is not None and item_level != level:
+                raise refusals.NotFound(f"No config item {kind}/{name} at level {level}")
+            return {
+                "kind": kind,
+                "name": name,
+                "path": rel,
+                "subject": f"config:{kind}/{name}",
+                "version": int(latest["version"]),
+                "content_version": latest["content_version"],
+                "level": item_level,
+            }
+    raise refusals.NotFound(f"No config item {kind}/{name}")
+
+
+def is_tombstone_selector(found: dict, selector: str, conn=None) -> bool:
+    lookup_kind = "step_settings" if found["kind"] == "attention" else found["kind"]
+    tombstone_cv = f"{lookup_kind}/{found['name']}{config_store.DELETED_SUFFIX}"
+    if selector in (tombstone_cv, f"{found['kind']}/{found['name']}{config_store.DELETED_SUFFIX}"):
+        return True
+    row = config_store.by_selector(lookup_kind, found["name"], selector, conn)
+    if row is not None:
+        return not row["sha256"] or str(row["version"]).endswith(config_store.DELETED_SUFFIX)
+    history = configrepo.version_history(lookup_kind, found["name"], found["path"])
+    for entry in history:
+        if (
+            (selector.isdecimal() and entry["version"] == int(selector))
+            or entry["commit_sha"] == selector
+            or entry["content_version"] == selector
+        ):
+            return not entry["sha256"] or entry["content_version"].endswith(config_store.DELETED_SUFFIX)
+    return False
+
+
 def _validate_subfile(file_name: str) -> str:
     if not file_name or "/" in file_name or "\\" in file_name or file_name in (".", "..") or "\0" in file_name:
         raise refusals.Invalid(f"Invalid file selector {file_name!r}")

@@ -7326,7 +7326,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
         with cls.server() as api:
             published = api.read("/api/v1/contract")["operations"]
             ops = {op["name"].partition(".")[2]: op for op in published if op["name"].startswith("config.")}
-            assert tuple(ops) == ("kinds", *configkinds.VERBS, "draft", "check", "activate", "rollback", "try", "ask", "promote")
+            assert tuple(ops) == ("kinds", *configkinds.VERBS, "draft", "check", "activate", "rollback", "try", "ask", "promote", "delete")
             assert all(tuple(op["input"]["properties"]["kind"]["enum"]) == kinds
                        for verb, op in ops.items() if verb != "kinds")
             assert ops["diff"]["input"]["required"] == ["kind", "name"]
@@ -9728,8 +9728,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 165)
-        self.assertEqual(len({op["name"] for op in operations}), 165)
+        self.assertEqual(len(operations), 167)
+        self.assertEqual(len({op["name"] for op in operations}), 167)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -18126,7 +18126,7 @@ emit_result({
 
 class _PromptReplayCase(unittest.TestCase):
     def run_prompt_child(self, body: str) -> dict:
-        with tempfile.TemporaryDirectory(prefix="arete-prompt-behavior-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="arete-prompt-behavior-", ignore_cleanup_errors=True) as tmp:
             root = Path(tmp).resolve()
             env = {
                 "ARETE_CONFIG_DIR": str(root / "config"),
