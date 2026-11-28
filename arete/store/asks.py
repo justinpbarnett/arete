@@ -10,15 +10,16 @@ from .db import db, reader
 
 def _latest(c) -> str:
     # Ignore a question from a ticket that has since started another whole run.
+    ic = run_store.issue_col(c)
     return (
         "NOT EXISTS (SELECT 1 FROM runs a, runs later "  # noqa: S608
-        "WHERE a.id = asks.run AND later.kind = 'pipeline' AND later.repo = a.repo AND later.issue = a.issue "
+        f"WHERE a.id = asks.run AND later.kind = 'pipeline' AND later.repo = a.repo AND later.{ic} = a.{ic} "
         f"AND COALESCE(later.only_step, '') = '' AND NOT later.dry_run AND {run_store.later_than(c, 'later', 'a')})"
     )
 
 
 LATEST = """NOT EXISTS (SELECT 1 FROM runs a, runs later
-    WHERE a.id = asks.run AND later.kind = 'pipeline' AND later.repo = a.repo AND later.issue = a.issue
+    WHERE a.id = asks.run AND later.kind = 'pipeline' AND later.repo = a.repo AND later.issue_key = a.issue_key
       AND COALESCE(later.only_step, '') = '' AND NOT later.dry_run AND later.seq > a.seq)"""
 
 TABLES = {

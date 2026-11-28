@@ -619,6 +619,12 @@ def _comment_preview(item: dict, body: str) -> str:
 
 
 def _issue_preview(item: dict, body: str) -> str:
+    try:
+        raw = json.loads(body)
+    except ValueError:
+        raw = None
+    if isinstance(raw, dict) and raw.get("action") == "edit" and "field" in raw:
+        return f"{raw['field']}: {raw.get('value', '')}"
     is_edit = "#" in (item.get("object") or "")
     payload = parse_issue_payload(body, is_edit=is_edit)
     full_body = senders.rendered_github_body(str(payload["body"]), item["marker"])

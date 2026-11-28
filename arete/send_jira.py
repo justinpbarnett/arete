@@ -139,15 +139,18 @@ def _comment_look(item: dict, since_iso: str) -> senders.LookResult:
     )
 
 
-def _issue_status(client: jira.Client, key: str) -> tuple[str, str]:
-    fields = (client.issue(key, ["status"]).get("fields") or {})
+def _issue_status(client: jira.Client, key: str) -> tuple[str, str, str]:
+    fields = (client.issue(key, ["status", "updated"]).get("fields") or {})
     status = fields.get("status") or {}
     name = str(status.get("name") or "")
     category = str((status.get("statusCategory") or {}).get("key") or "")
-    return name, category
+    updated = str(fields.get("updated") or "")
+    return name, category, updated
 
 
 def _transition_send(item: dict, body: str) -> senders.SendResult:
+    from contextlib import suppress
+
     key = _parse_key(item["object"])
     payload = parse_transition_payload(body)
     target = str(payload["target"])
@@ -155,7 +158,7 @@ def _transition_send(item: dict, body: str) -> senders.SendResult:
     keep_done = bool(payload["keep_done"])
     client = _client_for(item)
 
-    status, category = _issue_status(client, key)
+    status, category, before = _issue_status(client, key)
     if status.lower() == target.lower() or (keep_done and category == "done"):
         return senders.SendResult(external_id=key, external_url=client.browse_url(key))
 
@@ -175,6 +178,13 @@ def _transition_send(item: dict, body: str) -> senders.SendResult:
         if not destination or destination == "done":
             raise jira.JiraError(f"{key} has no non-closing transition to '{target}' from '{status}'")
     client.transition(key, str(pick["id"]))
+    if before:
+        with suppress(Exception):
+            after = str(((client.issue(key, ["updated"]).get("fields") or {}).get("updated")) or "")
+            if after and after != before:
+                from .store import triage as triage_store
+
+                triage_store.copy_verdict_after_move(key, before, after)
     return senders.SendResult(external_id=key, external_url=client.browse_url(key))
 
 
@@ -184,7 +194,7 @@ def _transition_look(item: dict, since_iso: str) -> senders.LookResult:
     target = str(payload["target"])
     keep_done = bool(payload["keep_done"])
     client = _client_for(item)
-    status, category = _issue_status(client, key)
+    status, category, _ = _issue_status(client, key)
     if status.lower() == target.lower() or (keep_done and category == "done"):
         return senders.LookResult(
             found=True,
@@ -318,6 +328,12 @@ def _issue_look(item: dict, since_iso: str) -> senders.LookResult:
 
 
 def _issue_preview(item: dict, body: str) -> str:
+    try:
+        raw = json.loads(body)
+    except ValueError:
+        raw = None
+    if isinstance(raw, dict) and raw.get("action") == "edit" and "field" in raw:
+        return f"{raw['field']}: {raw.get('value', '')}"
     payload = parse_issue_payload(body)
     rendered = senders.rendered_jira_body(str(payload["body"]), item["marker"])
     return f"{payload['title']}\n\n{rendered}"

@@ -226,8 +226,9 @@ def needs_you(conn: sqlite3.Connection) -> dict[str, object]:
         placeholders = ",".join("?" for _ in run_ids)
         run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
         has_task_id = "task_id" in run_cols
+        issue_expr = "issue_key" if "issue_key" in run_cols else ("issue AS issue_key" if "issue" in run_cols else "NULL AS issue_key")
         select_sql = (
-            f"SELECT id, repo, issue{', task_id' if has_task_id else ''} FROM runs WHERE id IN ({placeholders})"  # noqa: S608
+            f"SELECT id, repo, {issue_expr}{', task_id' if has_task_id else ''} FROM runs WHERE id IN ({placeholders})"  # noqa: S608
         )
         run_rows = conn.execute(select_sql, tuple(sorted(run_ids))).fetchall()
         issue_pairs: set[tuple[str, str]] = set()
@@ -236,7 +237,7 @@ def needs_you(conn: sqlite3.Connection) -> dict[str, object]:
             keys: list[str] = []
             if has_task_id and r["task_id"] is not None:
                 keys.append(task_store.format_task_id(int(r["task_id"])))
-            issue_str = str(r["issue"] or "").strip()
+            issue_str = str(r["issue_key"] or "").strip()
             repo_str = str(r["repo"] or "").strip()
             if issue_str:
                 keys.append(issue_str)
@@ -261,7 +262,7 @@ def needs_you(conn: sqlite3.Connection) -> dict[str, object]:
                 if found is not None:
                     canonical = task_store.format_task_id(int(found["num"])) if has_num and found["num"] is not None else str(found["id"])
                     for r in run_rows:
-                        if str(r["repo"] or "") == repo_str and str(r["issue"] or "") == issue_str:
+                        if str(r["repo"] or "") == repo_str and str(r["issue_key"] or "") == issue_str:
                             rid = str(r["id"])
                             if canonical not in run_to_task_keys[rid]:
                                 run_to_task_keys[rid].append(canonical)

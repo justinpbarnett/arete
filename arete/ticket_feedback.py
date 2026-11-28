@@ -1040,9 +1040,12 @@ def watched_tickets(cfg: config.Config, repo: config.Repo) -> list[str]:
                     add(row["parent"])
                     if row["ticket"] and "#" not in str(row["ticket"]):
                         add(row["ticket"])
+            from .store import runs as run_store
+
+            ic = run_store.issue_col(c)
             for row in c.execute(
-                "SELECT DISTINCT issue FROM runs WHERE kind = 'pipeline' AND repo = ? AND dry_run = 0 "
-                "AND COALESCE(issue, '') != '' AND status IN ('running', 'pr', 'needs-info', 'merged', 'done') "
+                f"SELECT DISTINCT {ic} AS issue FROM runs WHERE kind = 'pipeline' AND repo = ? AND dry_run = 0 "  # noqa: S608
+                f"AND COALESCE({ic}, '') != '' AND status IN ('running', 'pr', 'needs-info', 'merged', 'done') "
                 "ORDER BY started DESC LIMIT 200",
                 (repo.name,),
             ):

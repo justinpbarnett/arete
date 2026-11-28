@@ -143,8 +143,9 @@ def _active_runs_and_steps(
     has_line = "line" in run_cols
     has_adw = "adw" in run_cols
     has_task_id = "task_id" in run_cols
+    issue_expr = "r.issue_key" if "issue_key" in run_cols else ("r.issue AS issue_key" if "issue" in run_cols else "NULL AS issue_key")
     select_cols = [
-        "r.id", "r.kind", "r.repo", "r.issue", "r.status", "r.started", "r.finished",
+        "r.id", "r.kind", "r.repo", issue_expr, "r.status", "r.started", "r.finished",
         "r.line" if has_line else "NULL AS line",
         "r.adw" if has_adw else "NULL AS adw",
         "r.task_id" if has_task_id else "NULL AS task_id",
@@ -380,8 +381,8 @@ def floor_screen(
         task_label: str | None = None
         if run_row.get("task_id") is not None:
             task_label = task_store.format_task_id(int(run_row["task_id"]))
-        elif run_row.get("issue"):
-            task_label = str(run_row["issue"])
+        elif run_row.get("issue_key"):
+            task_label = str(run_row["issue_key"])
         live_rows.append({
             "id": rid,
             "task": task_label,

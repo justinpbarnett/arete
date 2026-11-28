@@ -113,7 +113,7 @@ class _FloorTestBase(unittest.TestCase):
     ) -> None:
         tnum = self.default_task_num if task_num is None else task_num
         conn.execute(
-            "INSERT INTO runs (id, kind, repo, issue, task_id, status, started, finished, line) "
+            "INSERT INTO runs (id, kind, repo, issue_key, task_id, status, started, finished, line) "
             "VALUES (?, 'pipeline', 'demo', ?, ?, ?, ?, ?, ?)",
             (run_id, issue or self.default_task, tnum, status, started, finished, line),
         )

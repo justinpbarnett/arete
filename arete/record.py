@@ -178,7 +178,7 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", resolut
         util.write_durably(resolved_file, resolution.resolved_bytes, 0o600)
     # A nested writer has not committed yet; retain its lease until exit.
     if kind in TICKET_KINDS and not nested:
-        launch_lease.registered(row.get("repo", ""), str(row.get("issue", "")))
+        launch_lease.registered(row.get("repo", ""), str(row.get("issue_key") or row.get("issue") or ""))
     return minted
 
 
