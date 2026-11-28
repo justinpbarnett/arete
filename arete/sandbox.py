@@ -33,10 +33,15 @@ SECRET_NAMES = (".env", ".env.*", "*.env", ".envrc", ".netrc", ".pgpass", ".npmr
                 "*.secret", "*.secrets", "secrets.toml", "secrets.json")
 SAFE_NAMES = ("*.example", "*.sample", "*.template", "*.dist")
 SECRET_DIRS = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker", ".password-store"})
+AUTHORITY_NAME = "verification-authority"
+AUTHORITY_MIGRATION_RECEIPT = f"{AUTHORITY_NAME}.migrated"
 try:
-    AUTHORITY = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".config/arete/verification-authority"
+    ACCOUNT_CONFIG_DIR = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".config/arete"
 except KeyError:
-    AUTHORITY = paths.NOWHERE
+    ACCOUNT_CONFIG_DIR = paths.NOWHERE
+LEGACY_AUTHORITY = ACCOUNT_CONFIG_DIR / AUTHORITY_NAME
+AUTHORITY = (paths.NOWHERE if paths.ISOLATED or (paths.GUARD_HOOK and paths.inside_scratch(paths.STATE_DIR))
+             else paths.STATE_DIR / AUTHORITY_NAME)
 
 
 class ConfinementUnavailable(PermissionError):
@@ -212,8 +217,9 @@ def secret_store_roots() -> tuple[Path, ...]:
 
 
 def authority_roots() -> tuple[Path, ...]:
-    return (AUTHORITY, paths.ZTE_AUTHORITY, AUTHORITY.parent / "zte-authority", paths.ZTE_STOP,
-            paths.CLIENT_DIR.with_name("arete") / "client", paths.DEFAULT_TOKEN_CLIENT_DIR,
+    migration = () if AUTHORITY == paths.NOWHERE else (AUTHORITY.with_name(AUTHORITY_MIGRATION_RECEIPT),)
+    return (AUTHORITY, LEGACY_AUTHORITY, *migration, paths.ZTE_AUTHORITY, ACCOUNT_CONFIG_DIR / "zte-authority",
+            paths.ZTE_STOP, paths.CLIENT_DIR.with_name("arete") / "client", paths.DEFAULT_TOKEN_CLIENT_DIR,
             paths.FINGERPRINT_KEY_FILE, *secret_store_roots(),
             *(root / "current.json" for root in (paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL)))
 
@@ -240,7 +246,7 @@ def already_protects_authority() -> bool:
         if denied(real_path(path) if fingerprint else path, b"file-read-data", b"file-write-data", b"file-write-create"):
             continue
         if not fingerprint and absent(path) and (path != paths.ZTE_STOP or all(absent(root) for root in (
-                paths.ZTE_AUTHORITY, AUTHORITY.parent / "zte-authority"))):
+                paths.ZTE_AUTHORITY, ACCOUNT_CONFIG_DIR / "zte-authority"))):
             continue
         return False
     return all(denied(root, b"file-write-data", b"file-write-create") or absent(root)
