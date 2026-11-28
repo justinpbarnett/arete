@@ -195,6 +195,10 @@ def reconsider(cfg: config.Config, source: tracker.GitHubTracker, layer: config.
         if not current.open or current.blocker or not source.queued_failure(current.labels):
             return None
         remove_failed_label(source, run)
+        if run.get("task_id") is not None:
+            from .store import tasks as task_store
+
+            task_store.task_set_state(int(run["task_id"]), "ready", 0)
         print(f"{util.iso()} {name}: requeued because {evidence}")
         announce(source, run, evidence)
         return None

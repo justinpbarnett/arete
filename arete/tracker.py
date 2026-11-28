@@ -274,8 +274,14 @@ class GitHubTracker:
             owned = self.by_owner(i)
             if owned and not names & {ZTE_LABEL, BATCH_LABEL}:
                 self._dependency_tickets.append(ticket)
-            if (names & skip or not self.by_publisher(i, ticket.is_spec)
-                    or failed in names and not (parked and parked(tid))):
+            primary = _sync_and_primary_task("github", f"{self.repo.github}#{tid}", i)
+            if ZTE_LABEL in names or not self.by_publisher(i, ticket.is_spec):
+                continue
+            if primary is not None:
+                is_failed = primary["state"] == "needs-you" and primary["fault"] == 1
+                if primary["state"] != "ready" and not (is_failed and parked and parked(tid)):
+                    continue
+            elif names & skip or (failed in names and not (parked and parked(tid))):
                 continue
             out.append(ticket)
         return sorted(out, key=lambda t: t.created)
@@ -604,13 +610,31 @@ class JiraTracker:
         if not self.project:
             raise jira.JiraError(f"{self.repo.name}: no Jira project; set [jira] project or jira_project on the repo")
         route = f"labels = {json.dumps(self.route)}"
-        fields = [*SEARCH_FIELDS, "description"]
-        issues = self.client.search(candidates_jql(self.project, route), fields, limit=20)
+        fields = [*SEARCH_FIELDS, "description", "status", "updated", "assignee", "parent"]
+        failed = self.label_name("failed")
+        skip = {self.label_name(s) for s in config.RUN_LABELS if s != "failed"}
+        issues = self.client.search(candidates_jql(self.project, route, skip_states=False), fields, limit=20)
+        seen = {str(i["key"]) for i in issues if isinstance(i, dict) and i.get("key")}
         if parked:
-            failed = self.label_name("failed")
             jql = candidates_jql(self.project, f"{route} AND labels = {json.dumps(failed)}", include_state=failed)
-            issues.extend(self.client.search(jql, fields, limit=20, include=lambda i: parked(i["key"])))
-        return [search_ticket(self.client, i) for i in issues]
+            for i in self.client.search(jql, fields, limit=20, include=lambda item: parked(item["key"])):
+                key = str(i["key"])
+                if key not in seen:
+                    seen.add(key)
+                    issues.append(i)
+        out: list[Ticket] = []
+        for i in issues:
+            key = str(i["key"])
+            labels = set((i.get("fields") or {}).get("labels") or ())
+            primary = _sync_and_primary_task("jira", key, i)
+            if primary is not None:
+                is_failed = primary["state"] == "needs-you" and primary["fault"] == 1
+                if primary["state"] != "ready" and not (is_failed and parked and parked(key)):
+                    continue
+            elif labels & skip or (failed in labels and not (parked and parked(key))):
+                continue
+            out.append(search_ticket(self.client, i))
+        return out
 
     def blocker(self, tid: str) -> str:
         return self.blocker_info(tid)[0]
@@ -1082,7 +1106,81 @@ def spec_blocker(cfg: config.Config, tk: Tracker, ticket: Ticket, *, require_ope
     return ""
 
 
+def _primary_task_for_ref(system: str, key: str, fallback_key: str = "") -> dict | None:
+    from . import paths
+    from .store import db as foundation
+
+    if not paths.DB_FILE.is_file():
+        return None
+    try:
+        with foundation.reader() as c:
+            if not tasks_store.has_identity_expand(c):
+                return None
+            keys = [key] + ([fallback_key] if fallback_key and fallback_key != key else [])
+            for k in keys:
+                if tasks_store.is_contracted(c):
+                    row = c.execute(
+                        "SELECT t.id, t.state, t.fault FROM refs r "
+                        "JOIN task_refs tr ON tr.ref_id = r.id AND tr.role = 'primary' "
+                        "JOIN tasks t ON t.id = tr.task_id "
+                        "WHERE r.system = ? AND r.key = ? LIMIT 1",
+                        (system, k),
+                    ).fetchone()
+                else:
+                    row = c.execute(
+                        "SELECT t.num AS id, t.state, t.fault FROM refs r "
+                        "JOIN task_refs tr ON tr.ref_id = r.id AND tr.role = 'primary' "
+                        "JOIN tasks t ON t.num = tr.task_id "
+                        "WHERE r.system = ? AND r.key = ? LIMIT 1",
+                        (system, k),
+                    ).fetchone()
+                if row is not None:
+                    state, fault = config.canonical_task_state(str(row["state"] or "ready"), int(row["fault"] or 0))
+                    return {"id": int(row["id"]), "state": state, "fault": fault}
+    except Exception:
+        return None
+    return None
+
+
+def _sync_and_primary_task(system: str, key: str, payload: dict) -> dict | None:
+    from . import paths
+    from . import sync as sync_mod
+    from .store import db as foundation
+
+    if not paths.DB_FILE.is_file():
+        return None
+    try:
+        ref_id: int | None = None
+        with foundation.tx() as c:
+            if not tasks_store.has_identity_expand(c):
+                return None
+            existing = c.execute(
+                "SELECT id, kind FROM refs WHERE system = ? AND key = ?", (system, key)
+            ).fetchone()
+            if existing is not None:
+                if existing["kind"] == "pr":
+                    return None
+                ref_id = int(existing["id"])
+            else:
+                kind = "issue" if system == "github" else "ticket"
+                ref_dict, _ = tasks_store.TaskStore.ensure_ref(c, system, key, kind=kind, emit_event=False)
+                ref_id = int(ref_dict["num"])
+        if ref_id is not None:
+            sync_mod.fetch(ref_id, payload=payload)
+        return _primary_task_for_ref(system, key)
+    except Exception:
+        return None
+
+
 def item_state(tk: Tracker, t: Ticket) -> str:
+    if isinstance(tk, GitHubTracker):
+        primary = _primary_task_for_ref("github", f"{tk.repo.github}#{t.id}", f"{tk.repo.name}#{t.id}")
+        if primary is not None:
+            return primary["state"]
+    elif isinstance(tk, JiraTracker):
+        primary = _primary_task_for_ref("jira", str(t.id))
+        if primary is not None:
+            return primary["state"]
     return next((s for s in config.RUN_LABELS if tk.label_name(s) in t.labels), "open" if t.open else "closed")
 
 

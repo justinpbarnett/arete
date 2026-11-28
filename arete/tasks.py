@@ -718,6 +718,12 @@ def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: li
 
 def kept_folder_removed(repo: config.Repo, tid: str, run_id: str, *, task_id: int | None = None) -> workspace.Release | None:
     ws = paths.WORKTREES_DIR / f"{repo.name}-{tid}"
+    ws_ticket = tid
+    if not os.path.lexists(ws) and workspaces.open_for(ws.name) is None:
+        owner_row = workspaces.for_owner_run(run_id)
+        if owner_row and owner_row["repo"] == repo.name and owner_row["name"] != ws.name:
+            ws = paths.WORKTREES_DIR / owner_row["name"]
+            ws_ticket = owner_row["ticket"]
     with workspaces.folder_lock(ws):
         row = workspaces.open_for(ws.name)
         if not row:
@@ -730,7 +736,7 @@ def kept_folder_removed(repo: config.Repo, tid: str, run_id: str, *, task_id: in
                 if task_id is not None
                 else run_store.newest_whole_run(repo.name, tid)
             )
-            if latest and latest["id"] == run_id and (row["repo"], row["ticket"]) == (repo.name, tid):
+            if latest and latest["id"] == run_id and (row["repo"], row["ticket"]) == (repo.name, ws_ticket):
                 return workspaces.remove_imported_waiting(ws, row)
             return None
         try:

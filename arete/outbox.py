@@ -726,7 +726,7 @@ def _apply_sent_effects(c, row: dict, body: str) -> list[int]:
                 run_id=str(run_id) if run_id else None,
                 task_id=run_row.get("task_id") if (run_row is not None and run_row.get("task_id") is not None) else task_id,
                 repo=str(run_row.get("repo") or "") if run_row is not None else "",
-                issue=str(run_row.get("issue") or "") if run_row is not None else "",
+                issue=str(run_row.get("issue_key") or run_row.get("issue") or "") if run_row is not None else "",
                 force_open=True,
                 actor=principals.current() or "hand",
                 emit_event=True,

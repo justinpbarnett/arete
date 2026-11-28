@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import tempfile
 import textwrap
@@ -51,7 +52,7 @@ MAX_PLAN_STEPS = 6
 MAX_ISSUE_CHARS = 60000
 META_FILE = paths.STATE_DIR / "triage.json"
 TICKET_RECORDS_DIR = paths.STATE_DIR / "triage"
-SEARCH_FIELDS = ["summary", "updated", "labels", "parent"]
+SEARCH_FIELDS = ["summary", "updated", "labels", "parent", "status"]
 SPRINT_JQL = "sprint in openSprints() OR (sprint in closedSprints() AND sprint not in futureSprints())"
 JIRA_FIELDS = ["summary", "description", "status", "labels", "issuetype", "parent", "updated"]
 MAX_ASSUMPTIONS = 8
@@ -107,6 +108,7 @@ class Candidate:
     in_sprint: bool | None = None
     parent: str = ""
     on_hold: bool = False
+    ext_state: str = ""
 
 
 @dataclass
@@ -190,7 +192,8 @@ class JiraSource(Source):
             if not {tracker.LABEL, tracker.SPEC_LABEL}.intersection(f.get("labels") or []):
                 out.append(Candidate(i["key"], i["key"], (f.get("summary") or "").strip(), client.browse_url(i["key"]),
                                      f.get("updated") or "", parent=(f.get("parent") or {}).get("key") or "",
-                                     on_hold=not HOLD_LABELS.isdisjoint(f.get("labels") or [])))
+                                     on_hold=not HOLD_LABELS.isdisjoint(f.get("labels") or []),
+                                     ext_state=str((f.get("status") or {}).get("name") or "")))
         if self.jira_cfg.sprint_only:
             scoped = {i["key"] for i in client.search(f"{mine} AND ({SPRINT_JQL}) ORDER BY updated DESC", ["updated"],
                                                       limit=PER_SOURCE)}
@@ -303,7 +306,8 @@ class GitHubSource(Source):
             if names & SKIP_LABELS or not tk.by_owner(i):
                 continue
             out.append(Candidate(f"{tk.repo.name}#{i['number']}", str(i["number"]), i["title"].strip(),
-                                 i.get("url", ""), i.get("updatedAt") or "", on_hold=bool(names & HOLD_LABELS)))
+                                 i.get("url", ""), i.get("updatedAt") or "", on_hold=bool(names & HOLD_LABELS),
+                                 ext_state=str(i.get("state") or "OPEN")))
         return out
 
     def ticket(self, c: Candidate) -> TicketText:
@@ -515,7 +519,10 @@ def sent_since_read(c: Candidate, sent: dict[str, str]) -> bool:
 
 
 def due(c: Candidate, prev: dict | None) -> bool:
-    return not prev or prev["ready"] is None or prev["updated"] != c.updated or not prev["kind"]
+    if not prev or prev.get("ready") is None or not prev.get("kind"):
+        return True
+    prev_updated = prev.get("judged_updated") if "judged_updated" in prev else prev.get("updated")
+    return triage_store.iso_updated(c.updated) != triage_store.iso_updated(prev_updated)
 
 
 def run(dry_run: bool = False) -> int:
@@ -533,19 +540,24 @@ def run(dry_run: bool = False) -> int:
 def read_all(srcs):
     read: dict[str, list[Candidate]] = {}
     errors: list[str] = []
+    errors_by_source: dict[str, str] = {}
     for src in srcs:
         try:
             read[src.name] = read_candidates(src)
         except tracker.ERRORS as e:
-            errors.append(f"{src.name}: {e}")
-            print(f"{util.iso()} {errors[-1]}")
-    return read, errors
+            msg = f"{src.name}: {e}"
+            errors.append(msg)
+            errors_by_source[src.name] = str(e)
+            print(f"{util.iso()} {msg}")
+    return read, errors, errors_by_source
 
 
 @dataclass
 class Triaged:
     answered: dict[str, dict] = field(default_factory=dict)
     failed: dict[str, str] = field(default_factory=dict)
+    failed_costs: dict[str, float] = field(default_factory=dict)
+    failed_models: dict[str, str] = field(default_factory=dict)
     waiting: list[str] = field(default_factory=list)
     spent: float = 0.0
     calls: int = 0
@@ -554,19 +566,23 @@ class Triaged:
 
 def triage_due(cfg, todo) -> Triaged:
     triaged = Triaged()
+    run_id = os.environ.get("ARETE_RUN_ID", "")
+    model_name = cfg.model("triage")
     for src, c in todo:
         print(f"{util.iso()} {c.ref}: triaging", flush=True)
         try:
             ticket = src.ticket_text(c)
         except tracker.ERRORS as e:
             triaged.failed[c.ref] = f"could not read it: {e}"
+            triaged.failed_costs[c.ref] = 0.0
+            triaged.failed_models[c.ref] = ""
             print(f"{util.iso()} {c.ref}: triage failed: {triaged.failed[c.ref]}")
             continue
         settled, screening_cost = classified_by_jev(cfg, src, c, ticket)
         triaged.screened += 1
         triaged.spent += screening_cost
         if settled:
-            triaged.answered[c.ref] = settled
+            triaged.answered[c.ref] = {**settled, "_model": "jev", "_run_id": run_id}
             print(f"{util.iso()} {c.ref}: {verdict(settled)} by JEV, no model call")
             continue
         if triaged.calls >= MAX_CALLS:
@@ -579,27 +595,73 @@ def triage_due(cfg, todo) -> Triaged:
             answer, cost, error = None, 0.0, f"could not read it: {e}"
         triaged.spent += cost
         if answer:
-            triaged.answered[c.ref] = settle(src, c, answer, cost + screening_cost)
+            triaged.answered[c.ref] = {
+                **settle(src, c, answer, cost + screening_cost),
+                "_model": model_name,
+                "_run_id": run_id,
+            }
             print(f"{util.iso()} {c.ref}: {verdict(triaged.answered[c.ref])} ({util.paid_note(cost, 3)})")
         else:
             triaged.failed[c.ref] = error
+            triaged.failed_costs[c.ref] = cost + screening_cost
+            triaged.failed_models[c.ref] = model_name
             print(f"{util.iso()} {c.ref}: triage failed: {error}")
     return triaged
 
 
-def write_board(srcs, read, triaged):
+def _candidate_ref_key(src: TriageSource, c: Candidate) -> str:
+    if isinstance(src, GitHubSource):
+        return f"{src.key}#{c.id}"
+    return c.id
+
+
+def write_board(srcs, read, triaged, errors_by_source: dict[str, str] | None = None):
+    err_map = errors_by_source or {}
+    stamp = util.iso()
+    run_id = os.environ.get("ARETE_RUN_ID", "")
     with util.lock(BOARD_LOCK, wait=True):
-        board = {r["ref"]: r for r in triage_store.triage_rows()}
-        sent = {a["ref"]: a["ts"] for a in triage_store.triage_approvals()}
-        delivered = delivered_since()
         for src in srcs:
             if src.name in read:
-                triage_store.triage_replace(src.name, [
-                    triaged.answered.get(c.ref) or kept(src, c, board.get(c.ref),
-                                                f"triage failed: {triaged.failed[c.ref]}" if c.ref in triaged.failed else WAITING)
-                    for c in read[src.name] if not sent_since_read(c, sent)]
-                    + still_shown(src, read[src.name], board, delivered))
-        triage_store.triage_prune([s.name for s in srcs])
+                ref_ids = triage_store.record_source_read(
+                    src.name,
+                    src.tracker,
+                    read[src.name],
+                    stamp,
+                    ok=True,
+                    key_for=lambda cand, s=src: _candidate_ref_key(s, cand),
+                    repo_for=lambda _cand, s=src: s.repos[0].name if len(s.repos) == 1 else "",
+                )
+                for c in read[src.name]:
+                    rid = ref_ids.get(c.ref)
+                    if c.ref in triaged.answered:
+                        ans = triaged.answered[c.ref]
+                        triage_store.record_verdict(
+                            {**ans, "ref_id": rid},
+                            model=str(ans.get("_model") or ""),
+                            run_id=str(ans.get("_run_id") or run_id),
+                            judged_updated=c.updated,
+                            key_override=_candidate_ref_key(src, c),
+                        )
+                    elif c.ref in triaged.failed:
+                        err = triaged.failed[c.ref]
+                        triage_store.record_verdict(
+                            row(src, c, ref_id=rid, cost=triaged.failed_costs.get(c.ref, 0.0)),
+                            reason=err,
+                            model=triaged.failed_models.get(c.ref, ""),
+                            run_id=run_id,
+                            judged_updated=c.updated,
+                            key_override=_candidate_ref_key(src, c),
+                        )
+            else:
+                triage_store.record_source_read(
+                    src.name,
+                    src.tracker,
+                    [],
+                    stamp,
+                    ok=False,
+                    detail=err_map.get(src.name, ""),
+                )
+        triage_store.drop_unconfigured_cursors([s.name for s in srcs])
 
 
 def prune_records():
@@ -619,32 +681,62 @@ def preview_refresh(cfg, srcs, read, old, todo):
           "fresh labels, issue versions and required screens still decide admission")
 
 
+def _prior_verdicts() -> dict[str, dict]:
+    by_ref: dict[str, dict] = {}
+    for v in triage_store.latest_verdicts().values():
+        if v.get("ref"):
+            by_ref[v["ref"]] = v
+    return by_ref
+
+
+def _source_policy(cfg: config.Config, src: TriageSource) -> str:
+    source_cfg = config.Config(repos=list(src.repos), jira=cfg.jira, jev=cfg.jev)
+    return intake.policy(source_cfg)
+
+
 @factory_control.work
 def refresh(cfg: config.Config, dry_run: bool) -> int:
     old = {r["ref"]: r for r in triage_store.triage_rows()}
+    verdicts_by_ref = _prior_verdicts()
+    sent = {a["ref"]: a["ts"] for a in triage_store.triage_approvals()}
     meta = util.read_json(META_FILE, {})
     policy = intake.policy(cfg)
-    changed_policy = meta.get("policy") != policy
+    prev_source_policies = dict(meta.get("source_policies") or {})
     retry = set(meta.get("waiting", [])) | set(meta.get("failed", {}))
     srcs = sources(cfg)
-    read, errors = read_all(srcs)
+    active_source_names = {s.name for s in srcs}
+    cur_source_policies = {s.name: _source_policy(cfg, s) for s in srcs}
+    changed_by_source = {
+        s.name: (
+            prev_source_policies.get(s.name) != cur_source_policies[s.name]
+            if s.name in prev_source_policies
+            else bool(meta.get("policy") and meta.get("policy") != policy)
+        )
+        for s in srcs
+    }
+    read, errors, errors_by_source = read_all(srcs)
     todo = sorted(((src, c) for src in srcs for c in read.get(src.name, [])
-                   if changed_policy or c.ref in retry or due(c, old.get(c.ref))),
+                   if not sent_since_read(c, sent)
+                   and (changed_by_source.get(src.name, False) or c.ref in retry
+                        or due(c, verdicts_by_ref.get(c.ref) or old.get(c.ref)))),
                   key=lambda sc: moment(sc[1].updated), reverse=True)
     if dry_run:
         preview_refresh(cfg, srcs, read, old, todo)
         return 1 if errors else 0
     triaged = triage_due(cfg, todo)
-    write_board(srcs, read, triaged)
+    write_board(srcs, read, triaged, errors_by_source)
     approved, held = approve_ready(cfg, srcs, excluded=set(triaged.failed) | set(triaged.waiting))
     prune_records()
-    triaged.waiting += [r["ref"] for r in old.values() if r["source"] not in read
-                        and (changed_policy or r["ref"] in retry)]
+    triaged.waiting += [r["ref"] for r in old.values()
+                        if r["source"] in active_source_names and r["source"] not in read
+                        and (changed_by_source.get(r["source"], False) or r["ref"] in retry)]
     previous_holds = meta.get("label_holds", {})
     label_holds = {src.name: previous_holds.get(src.name, []) for src in srcs}
     for source, candidates in read.items():
         label_holds[source] = [c.ref for c in candidates if c.on_hold]
-    meta.update(refreshed=util.iso(), policy=policy, errors=errors, label_holds=label_holds, waiting=triaged.waiting,
+    updated_source_policies = {**prev_source_policies, **cur_source_policies}
+    meta.update(refreshed=util.iso(), policy=policy, source_policies=updated_source_policies,
+                errors=errors, label_holds=label_holds, waiting=triaged.waiting,
                 failed=triaged.failed, approved=approved, held=held)
     problems = list(errors)
     try:
@@ -714,16 +806,20 @@ def approve(cfg: config.Config, src: TriageSource, r: dict) -> str:
     now = src.ticket(src.candidate(r))
     if stopped := sorted(set(now.labels) & AUTO_SKIP_LABELS):
         return f"its {', '.join(stopped)} label requires a person to release it"
-    if now.updated != r["updated"]:
+    if triage_store.iso_updated(now.updated) != triage_store.iso_updated(r["updated"]):
         return "it changed since triage, so the next refresh triages it again"
     screened = screening.screen(f"{r['title']}\n\n{now.text}", cfg, [repo], ("", f"triage {r['ref']} injection jev"))
     if screening.held(screened, screening.Posture.REQUIRED):
         if screened.status != screening.FLAGGED:
             return "JEV could not screen it this time"
         labels = " and ".join(f"`{lb}`" for lb in labels_to_add(r))
-        triage_store.triage_put({**r, "ready": 0, "questions": [
-            (f"JEV reads text in it as instructions to an agent (p {screened.p:.2f}). Check the ticket, then add "
-             f"{labels} by hand to approve it.")]})
+        triage_store.record_verdict(
+            {**r, "ready": 0, "cost": 0.0, "questions": [
+                (f"JEV reads text in it as instructions to an agent (p {screened.p:.2f}). Check the ticket, then add "
+                 f"{labels} by hand to approve it.")]},
+            model="jev",
+            judged_updated=r["updated"],
+        )
         return f"held for the injection screen (p {screened.p:.2f})"
     to_pipeline(src, r, "triage")
     return ""
@@ -742,7 +838,6 @@ def to_pipeline(src: TriageSource, r: dict, sent_by: str) -> None:
 
 def record_send(row: dict, sent_by: str) -> None:
     triage_store.triage_approve(row, sent_by)
-    triage_store.triage_drop(row["ref"])
 
 
 class NotOnBoard(refusals.NotFound, LookupError):
@@ -868,7 +963,7 @@ def read_send_ticket(src, row):
 
 
 def require_send_revision(now, row):
-    if now.updated != row["updated"]:
+    if triage_store.iso_updated(now.updated) != triage_store.iso_updated(row["updated"]):
         raise NotSendable(f"{row['ref']} changed since triage read it, so the next refresh triages it again.")
 
 
@@ -1052,7 +1147,11 @@ def in_sprint(r: dict) -> bool:
 
 
 def research_due(r: dict, report: dict | None) -> bool:
-    return not report or report["status"] != "running" and report["updated"] != r["updated"]
+    if not report:
+        return True
+    if report["status"] == "running":
+        return False
+    return triage_store.iso_updated(report["updated"]) != triage_store.iso_updated(r["updated"])
 
 
 def stamp(ts: str) -> str:

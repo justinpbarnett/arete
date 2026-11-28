@@ -212,8 +212,9 @@ def _feedback_due_rows(repo: str, quiet_since: str, *, only_open_asks: bool = Fa
                     (int(task_id),),
                 ).fetchone()
             else:
+                ic = run_store.issue_col(c, "nr")
                 newest = c.execute(
-                    f"SELECT id, status FROM runs nr WHERE nr.kind = 'pipeline' AND nr.repo = ? AND nr.issue = ? "  # noqa: S608
+                    f"SELECT id, status FROM runs nr WHERE nr.kind = 'pipeline' AND nr.repo = ? AND {ic} = ? "  # noqa: S608
                     f"AND {run_store.WHOLE_RUN} AND nr.status != 'queued' "
                     "AND NOT (nr.pid IS NULL AND nr.status = 'stopped' AND nr.stop_asked IS NULL) "
                     f"ORDER BY nr.started DESC, {k} DESC LIMIT 1",
@@ -330,9 +331,10 @@ def feedback_between(since: str, until: str) -> list[dict]:
                                            (since, until))]
 
 
-RESEARCH_COLUMNS = ("ref", "source", "title", "url", "updated", "status", "summary", "report", "error", "run_id",
-                    "cost", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered")
-RESEARCH_UPDATABLE_FIELDS = frozenset(RESEARCH_COLUMNS) - {"ref"}
+RESEARCH_COLUMNS = ("ref", "source", "title", "url", "updated", "status", "summary", "error", "run_id",
+                    "cost", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered",
+                    "ref_id", "report_blob")
+RESEARCH_UPDATABLE_FIELDS = frozenset((*RESEARCH_COLUMNS, "report")) - {"ref"}
 CAPTURE_UPDATABLE_FIELDS = frozenset((
     "kind", "text", "expected", "actual", "steps", "context", "jev_cost_usd", "inspect_cost_usd",
     "written_title", "written_body", "written_print", "written_note", "delivery", "issue",
@@ -344,42 +346,155 @@ CAPTURE_EVIDENCE_COLUMNS = frozenset((
 ))
 
 
+def normalize_research_ref(ref: str) -> str:
+    from .. import jira
+
+    raw = str(ref or "").strip()
+    if not raw:
+        return ""
+    if jira.KEY_RE.fullmatch(raw.upper()):
+        return raw.upper()
+    if "#" in raw:
+        left, right = raw.rsplit("#", 1)
+        if right.isascii() and right.isdigit() and int(right) > 0:
+            return f"{left}#{int(right)}"
+    return raw
+
+
+def _research_ref_id(c, ref: str, *, row: dict | None = None, create: bool = False) -> int | None:
+    from .. import jira, principals
+    from . import tasks as task_store
+
+    if not task_store.has_identity_expand(c):
+        return None
+    norm = normalize_research_ref(ref)
+    if not norm:
+        return None
+    if create:
+        return task_store.TaskStore.ref_for_triage(c, {**(row or {}), "ref": norm}, actor=principals.current())
+    if jira.KEY_RE.fullmatch(norm):
+        found = c.execute("SELECT id FROM refs WHERE system = 'jira' AND key = ? LIMIT 1", (norm,)).fetchone()
+        if found is not None:
+            return int(found[0])
+    if "#" in norm:
+        found = c.execute(
+            "SELECT id FROM refs WHERE system = 'github' AND (key = ? OR json_extract(facts, '$.triage_ref') = ?) "
+            "ORDER BY id ASC LIMIT 1",
+            (norm, norm),
+        ).fetchone()
+        if found is not None:
+            return int(found[0])
+        left, right = norm.rsplit("#", 1)
+        if left and right.isascii() and right.isdigit():
+            sys_name, _, key, _, _, _ = task_store._parse_external_ticket(left, right)
+            found = c.execute(
+                "SELECT id FROM refs WHERE system = ? AND key = ? LIMIT 1",
+                (sys_name, key),
+            ).fetchone()
+            if found is not None:
+                return int(found[0])
+    found = c.execute(
+        "SELECT id FROM refs WHERE key = ? OR json_extract(facts, '$.triage_ref') = ? ORDER BY id ASC LIMIT 1",
+        (norm, norm),
+    ).fetchone()
+    return int(found[0]) if found is not None else None
+
+
+def _hydrate_research_row(r) -> dict:
+    from . import blobs
+
+    d = dict(r)
+    sha = d.get("report_blob")
+    if sha:
+        raw = blobs.read(str(sha))
+        d["report"] = raw.decode("utf-8") if raw is not None else (d.get("report") or "")
+    else:
+        d["report"] = d.get("report") or ""
+    return d
+
+
 def research_rows(connect=reader) -> list[dict]:
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM research ORDER BY ts DESC")]
+        return [_hydrate_research_row(r) for r in c.execute("SELECT * FROM research ORDER BY ts DESC")]
 
 
 def research_get(ref: str, connect=reader) -> dict | None:
+    norm = normalize_research_ref(ref)
+    if not norm:
+        return None
     with connect() as c:
-        r = c.execute("SELECT * FROM research WHERE ref = ? COLLATE NOCASE", (ref,)).fetchone()
-    return dict(r) if r else None
+        ref_id = _research_ref_id(c, norm)
+        r = None
+        if ref_id is not None:
+            r = c.execute("SELECT * FROM research WHERE ref_id = ? LIMIT 1", (ref_id,)).fetchone()
+        if r is None:
+            r = c.execute("SELECT * FROM research WHERE ref = ? LIMIT 1", (norm,)).fetchone()
+    return _hydrate_research_row(r) if r else None
 
 
 def research_set(ref: str, **fields) -> None:
-    from .. import principals
-    from . import tasks as task_store
+    from . import blobs
 
-    row = {**(research_get(ref) or {"ref": ref, "cost": 0.0}), **fields, "ts": util.iso()}
-    with db() as c:
-        if task_store.has_identity_expand(c):
-            cols = (*RESEARCH_COLUMNS, "ref_id")
-            ref_id = row.get("ref_id")
-            if ref_id is None:
-                ref_id = task_store.TaskStore.ref_for_triage(c, row, actor=principals.current())
+    norm = normalize_research_ref(ref)
+    with blobs.lock(), db() as c:
+        cols_present = {r[1] for r in c.execute("PRAGMA table_info(research)")}
+        ref_id = fields.get("ref_id")
+        if ref_id is None and "ref_id" in cols_present:
+            ref_id = _research_ref_id(c, norm, row=fields, create=True)
+        existing = None
+        if ref_id is not None and "ref_id" in cols_present:
+            existing = c.execute("SELECT * FROM research WHERE ref_id = ? LIMIT 1", (ref_id,)).fetchone()
+        if existing is None:
+            existing = c.execute("SELECT * FROM research WHERE ref = ? LIMIT 1", (norm,)).fetchone()
+        base = _hydrate_research_row(existing) if existing is not None else {"ref": norm, "cost": 0.0}
+        row = {**base, **fields, "ts": util.iso()}
+        if ref_id is not None:
             row["ref_id"] = ref_id
-            c.execute(insert_sql("research", cols, "INSERT OR REPLACE"), tuple(row.get(k) for k in cols))
-        else:
-            c.execute(insert_sql("research", RESEARCH_COLUMNS, "INSERT OR REPLACE"),
-                      tuple(row.get(k) for k in RESEARCH_COLUMNS))
+        if "report_blob" in cols_present and "report" in fields:
+            report_text = str(fields["report"] or "")
+            row["report_blob"] = (
+                blobs.put(report_text.encode("utf-8"), "research_report", conn=c) if report_text else None
+            )
+        elif "report_blob" in cols_present and row.get("report") and not row.get("report_blob"):
+            row["report_blob"] = blobs.put(str(row["report"]).encode("utf-8"), "research_report", conn=c)
+        write_cols = tuple(col for col in (*RESEARCH_COLUMNS, "report") if col in cols_present)
+        c.execute(insert_sql("research", write_cols, "INSERT OR REPLACE"), tuple(row.get(k) for k in write_cols))
 
 
 def research_keep(ref: str, **fields) -> None:
+    from . import blobs
+
     validate_columns(fields, RESEARCH_UPDATABLE_FIELDS, "research")
     if not fields:
         return
-    with db() as c:
-        c.execute(f"UPDATE research SET {', '.join(f'{k} = ?' for k in fields)} WHERE ref = ? COLLATE NOCASE",  # noqa: S608
-                  (*fields.values(), ref))
+    norm = normalize_research_ref(ref)
+    with blobs.lock(), db() as c:
+        cols_present = {r[1] for r in c.execute("PRAGMA table_info(research)")}
+        updates = dict(fields)
+        if "report" in updates:
+            report_text = str(updates["report"] or "")
+            if "report_blob" in cols_present:
+                updates["report_blob"] = (
+                    blobs.put(report_text.encode("utf-8"), "research_report", conn=c) if report_text else None
+                )
+            if "report" not in cols_present:
+                updates.pop("report", None)
+        updates = {k: v for k, v in updates.items() if k in cols_present}
+        if not updates:
+            return
+        validate_columns(updates, RESEARCH_UPDATABLE_FIELDS, "research")
+        ref_id = _research_ref_id(c, norm) if "ref_id" in cols_present else None
+        if ref_id is not None:
+            changed = c.execute(
+                f"UPDATE research SET {', '.join(f'{k} = ?' for k in updates)} WHERE ref_id = ?",  # noqa: S608
+                (*updates.values(), ref_id),
+            ).rowcount
+            if changed:
+                return
+        c.execute(
+            f"UPDATE research SET {', '.join(f'{k} = ?' for k in updates)} WHERE ref = ?",  # noqa: S608
+            (*updates.values(), norm),
+        )
 
 
 def add_usage(row: dict, keep_days: float) -> None:

@@ -1,1 +1,29 @@
-{"type": "object", "x-arete-read-only": true}
+{
+  "type": "object",
+  "properties": {
+    "schema": {"type": "integer", "minimum": 1},
+    "state_labels": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "fields": {
+      "type": "object",
+      "properties": {
+        "title": {"type": "string", "enum": ["remote", "local"]},
+        "body": {"type": "string", "enum": ["remote", "local"]},
+        "status": {"type": "string", "enum": ["remote", "local"]},
+        "assignee": {"type": "string", "enum": ["remote", "local"]},
+        "parent": {"type": "string", "enum": ["remote", "local"]},
+        "priority": {"type": "string", "enum": ["remote", "local"]},
+        "labels": {"type": "string", "enum": ["remote", "local"]}
+      },
+      "additionalProperties": {"type": "string", "enum": ["remote", "local"]}
+    },
+    "priority_map": {
+      "type": "object",
+      "additionalProperties": {"type": ["integer", "string"]}
+    }
+  },
+  "required": ["fields"],
+  "additionalProperties": false
+}

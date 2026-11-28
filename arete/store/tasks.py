@@ -21,6 +21,7 @@ TABLES = {
     "tasks": "kept",
     "task_comments": "kept",
     "refs": "kept",
+    "ref_fields": "kept",
     "task_refs": "kept",
     "task_links": "kept",
     "task_labels": "kept",
@@ -219,6 +220,7 @@ def _row_to_ref(row) -> dict:
         "facts": json_dict(d.get("facts")),
         "run_id": d.get("run_id"),
         "remote_updated": d.get("remote_updated"),
+        "remote_actor": d.get("remote_actor"),
         "fetched_at": d.get("fetched_at"),
         "sync": d.get("sync") or "local",
         "version": int(d.get("version") or 1),
@@ -777,6 +779,10 @@ class TaskStore:
                     data=saved,
                     connection=conn,
                 )
+        if role == "primary" and ref_dict.get("fetched_at"):
+            from .. import sync as sync_mod
+
+            sync_mod.apply_primary_remote_fields(conn, task_num, ref_id, actor=event_actor)
         return saved
 
     @staticmethod
@@ -858,6 +864,10 @@ class TaskStore:
         )
         saved_row = conn.execute("SELECT * FROM task_refs WHERE id = ?", (existing["id"],)).fetchone()
         saved = _row_to_task_ref(saved_row, ref_dict)
+        if role == "primary" and existing["role"] != "primary" and ref_dict.get("fetched_at"):
+            from .. import sync as sync_mod
+
+            sync_mod.apply_primary_remote_fields(conn, task_num, ref_id, actor=event_actor)
         with principals.acting(event_actor):
             events.emit(
                 "task_ref.changed",
@@ -933,11 +943,20 @@ class TaskStore:
             if fallback is not None:
                 return int(fallback[0])
         if repo_name:
-            run_row = conn.execute(
-                "SELECT task_id FROM runs WHERE repo = ? AND (issue_key = ? OR issue = ?) AND task_id IS NOT NULL "
-                "ORDER BY started DESC, rowid DESC LIMIT 1",
-                (repo_name, raw.lstrip("#"), raw),
-            ).fetchone()
+            from . import runs as run_store
+
+            if run_store.has_issue_column(conn):
+                run_row = conn.execute(
+                    "SELECT task_id FROM runs WHERE repo = ? AND (issue_key = ? OR issue = ?) AND task_id IS NOT NULL "
+                    "ORDER BY started DESC, rowid DESC LIMIT 1",
+                    (repo_name, raw.lstrip("#"), raw),
+                ).fetchone()
+            else:
+                run_row = conn.execute(
+                    "SELECT task_id FROM runs WHERE repo = ? AND issue_key = ? AND task_id IS NOT NULL "
+                    "ORDER BY started DESC, rowid DESC LIMIT 1",
+                    (repo_name, raw.lstrip("#")),
+                ).fetchone()
             if run_row is not None:
                 return int(run_row[0])
         return None
@@ -1168,6 +1187,11 @@ class TaskStore:
         if not has_identity_expand(conn):
             return None
         ref_dict, _ = TaskStore.resolve_ref_row(conn, ref, create_if_missing=False)
+        if ref_dict is None:
+            return None
+        from .. import sync as sync_mod
+
+        ref_dict["fields"] = sync_mod.ref_fields_for(conn, ref_dict["num"])
         return ref_dict
 
     @staticmethod
@@ -1261,8 +1285,10 @@ class TaskStore:
         pr_key, clean_url = parsed
         run_row = None
         if run_id:
+            from . import runs as run_store
+
             r = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-            run_row = dict(r) if r is not None else None
+            run_row = run_store.run_row(r) if r is not None else None
         task_num: int | None = None
         if task_id is not None and str(task_id).strip():
             task_num = parse_task_num(task_id, conn)
@@ -1549,11 +1575,13 @@ def backfill_identities(conn, cfg=None) -> dict[str, int]:
     run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
     has_payer = "payer" in run_cols
     has_seq = "seq" in run_cols
+    has_issue = "issue" in run_cols
     order_col = "seq" if has_seq else "rowid"
     payer_expr = "payer" if has_payer else "NULL AS payer"
+    issue_expr = "issue" if has_issue else "issue_key AS issue"
     pipeline_runs = [
         dict(r) for r in conn.execute(
-            f"SELECT id, repo, issue, status, started, finished, only_step, pr_url, task_id, issue_key, {payer_expr} "  # noqa: S608
+            f"SELECT id, repo, {issue_expr}, status, started, finished, only_step, pr_url, task_id, issue_key, {payer_expr} "  # noqa: S608
             f"FROM runs WHERE kind = 'pipeline' ORDER BY started ASC, {order_col} ASC"
         ).fetchall()
     ]
@@ -1794,11 +1822,14 @@ def reconcile_pr_refs(conn, cfg=None) -> dict[str, int]:
         except Exception:
             cfg = None
 
+    from . import runs as run_store
+
     order_col = _run_order_col(conn)
+    issue_expr = "issue" if run_store.has_issue_column(conn) else "issue_key AS issue"
     run_rows = [
         dict(r)
         for r in conn.execute(
-            f"SELECT id, kind, repo, issue, status, started, finished, pr_url, task_id, {order_col} AS _ord "  # noqa: S608
+            f"SELECT id, kind, repo, {issue_expr}, status, started, finished, pr_url, task_id, {order_col} AS _ord "  # noqa: S608
             f"FROM runs WHERE COALESCE(pr_url, '') != '' AND (kind = 'pipeline' OR task_id IS NOT NULL) "
             f"ORDER BY started ASC, {order_col} ASC"
         ).fetchall()
@@ -1869,7 +1900,7 @@ def reconcile_pr_refs(conn, cfg=None) -> dict[str, int]:
             rrow = run_by_id.get(rid) if rid else None
             if rid and rrow is None:
                 fetched = conn.execute(
-                    f"SELECT id, kind, repo, issue, status, started, finished, pr_url, task_id, {order_col} AS _ord "  # noqa: S608
+                    f"SELECT id, kind, repo, {issue_expr}, status, started, finished, pr_url, task_id, {order_col} AS _ord "  # noqa: S608
                     "FROM runs WHERE id = ?",
                     (rid,),
                 ).fetchone()
@@ -1983,9 +2014,12 @@ def pr_refs_to_sync(rejected_since: str, connect=reader) -> list[dict]:
     with connect() as c:
         if not has_identity_expand(c):
             return []
+        from . import runs as run_store
+
+        ic = run_store.issue_col(c, "runs")
         rows = c.execute(
-            "SELECT r.*, "
-            "runs.repo AS _run_repo, runs.issue AS _run_issue, runs.issue_key AS _run_issue_key, "
+            f"SELECT r.*, "  # noqa: S608
+            f"runs.repo AS _run_repo, {ic} AS _run_issue, runs.issue_key AS _run_issue_key, "
             "runs.task_id AS _run_task_id, runs.status AS _run_status, runs.finished AS _run_finished, "
             "runs.started AS _run_started, "
             "COALESCE("
@@ -2050,7 +2084,7 @@ def open_pr_refs(repo_or_task: str | int, issue: int | str | None = None, connec
             f"SELECT r.* FROM task_refs tr "  # noqa: S608
             "JOIN refs r ON r.id = tr.ref_id "
             "LEFT JOIN runs ON runs.id = r.run_id "
-            "WHERE tr.task_id = ? AND r.kind = 'pr' AND r.ext_state IN ('open', '') AND r.url != '' "
+            "WHERE tr.task_id = ? AND r.kind = 'pr' AND LOWER(r.ext_state) IN ('open', '') AND r.url != '' "
             f"ORDER BY COALESCE(runs.started, r.updated) DESC, COALESCE(runs.{order_col}, 0) DESC, r.id DESC",
             (tnum,),
         ).fetchall()
@@ -2069,7 +2103,7 @@ def open_pr_runs(repo_or_task: str | int, issue: int | str | None = None, connec
             f"SELECT DISTINCT runs.* FROM task_refs tr "  # noqa: S608
             "JOIN refs r ON r.id = tr.ref_id "
             "JOIN runs ON runs.id = r.run_id "
-            "WHERE tr.task_id = ? AND r.kind = 'pr' AND r.ext_state IN ('open', '') AND r.url != '' "
+            "WHERE tr.task_id = ? AND r.kind = 'pr' AND LOWER(r.ext_state) IN ('open', '') AND r.url != '' "
             f"ORDER BY runs.started DESC, runs.{order_col} DESC",
             (tnum,),
         ).fetchall()
@@ -2297,6 +2331,10 @@ def task_update(tid: str | int, base_version: int, fields: dict) -> dict | None:
             return None
         if expand and num is not None and "body" in fields:
             TaskStore.sync_body_links(c, num, str(fields["body"] or ""))
+        if expand and num is not None:
+            from .. import sync as sync_mod
+
+            sync_mod.draft_remote_field_edits(c, num, dict(row), fields, actor=principals.current() or "hand")
         refreshed = _select_task_row(c, identity)
         return _present_task_row(c, refreshed) if refreshed else None
 

@@ -177,6 +177,32 @@ def _engine_items(kind: str) -> dict[str, dict]:
                 "engine": str(target),
             }),
         }
+    if kind == "vocabularies":
+        target = paths.DEFAULTS_DIR / "vocabularies.toml"
+        if not target.is_file():
+            return {}
+        return {
+            "defaults": _enrich({
+                "kind": "vocabularies",
+                "name": "defaults",
+                "path": "arete/defaults/vocabularies.toml",
+                "engine": str(target),
+            }),
+        }
+    if kind == "sync":
+        folder = paths.DEFAULTS_DIR / "sync"
+        if not folder.is_dir():
+            return {}
+        out: dict[str, dict] = {}
+        for file in sorted(folder.glob("*.toml")):
+            if not file.is_file():
+                continue
+            name = file.stem
+            if not re.fullmatch(configkinds.NAME_PATTERN, name):
+                continue
+            rel = f"arete/defaults/sync/{file.name}"
+            out[name] = _enrich({"kind": "sync", "name": name, "path": rel, "engine": str(file)})
+        return out
     if kind not in ("target", "rule"):
         return {}
     folder = paths.DEFAULTS_DIR / f"{kind}s"
@@ -240,6 +266,25 @@ def _engine_item(kind: str, name: str) -> dict | None:
         if target.is_file():
             return {
                 **_enrich({"kind": kind, "name": name, "path": "arete/defaults/retention.toml", "engine": str(target)}),
+                "_engine_file": str(target),
+            }
+    if kind == "vocabularies" and name == "defaults":
+        target = paths.DEFAULTS_DIR / "vocabularies.toml"
+        if target.is_file():
+            return {
+                **_enrich({"kind": kind, "name": name, "path": "arete/defaults/vocabularies.toml", "engine": str(target)}),
+                "_engine_file": str(target),
+            }
+    if kind == "sync" and re.fullmatch(configkinds.NAME_PATTERN, name):
+        target = paths.DEFAULTS_DIR / "sync" / f"{name}.toml"
+        if target.is_file():
+            return {
+                **_enrich({
+                    "kind": kind,
+                    "name": name,
+                    "path": f"arete/defaults/sync/{name}.toml",
+                    "engine": str(target),
+                }),
                 "_engine_file": str(target),
             }
     if kind == "loop":

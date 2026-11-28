@@ -124,6 +124,16 @@ def open_for(name: str) -> dict | None:
         return _decode(c.execute("SELECT * FROM workspaces WHERE name = ? AND state != 'removed'", (name,)).fetchone())
 
 
+def for_owner_run(run_id: str) -> dict | None:
+    require_workspace_contract()
+    if not run_id:
+        return None
+    with reader() as c:
+        return _decode(
+            c.execute("SELECT * FROM workspaces WHERE owner_run = ? ORDER BY id DESC LIMIT 1", (run_id,)).fetchone()
+        )
+
+
 def retained_rows(c) -> list[dict]:
     if not c.execute("SELECT 1 FROM sqlite_master WHERE name = 'workspaces' AND type = 'table'").fetchone():
         return []
@@ -491,9 +501,23 @@ def record_release_error(ws: Path, row: dict, error: OSError) -> None:
     _change_current(row, bytes=workspace.tree_bytes(ws), last_sweep_error=util.first_line(str(error), 300))
 
 
+def _owner_task_id(row: dict) -> int | None:
+    owner_run = row.get("owner_run")
+    if not owner_run:
+        return None
+    owner = runs.run_get(owner_run)
+    if owner and owner.get("task_id") is not None:
+        return int(owner["task_id"])
+    return None
+
+
 def _ticket_ended(row: dict) -> bool:
     ticket = row["ticket"]
-    latest = next(iter(runs.ticket_runs(row["repo"], ticket, limit=1, whole=True)), {}) if ticket else {}
+    task_id = _owner_task_id(row)
+    if task_id is not None:
+        latest = next(iter(runs.ticket_runs(task_id, limit=1, whole=True)), {})
+    else:
+        latest = next(iter(runs.ticket_runs(row["repo"], ticket, limit=1, whole=True)), {}) if ticket else {}
     status = latest.get("status")
     return (status in workspace.ENDED or
             (status not in workspace.WAITING and workspace.ticket_closed(ticket)))
@@ -524,7 +548,12 @@ def remove_imported_waiting(ws: Path, row: dict) -> workspace.Release:
 
 
 def _waiting_ask_retired(row: dict) -> bool:
-    latest = runs.newest_whole_run(row["repo"], row["ticket"])
+    task_id = _owner_task_id(row)
+    latest = (
+        runs.newest_whole_run(task_id)
+        if task_id is not None
+        else runs.newest_whole_run(row["repo"], row["ticket"])
+    )
     if not latest or latest["id"] != row["owner_run"] or latest["status"] not in ("needs-info", "stopped"):
         return False
     history = asks.asks_of(latest["id"])
@@ -585,8 +614,14 @@ def _sweep_row(ws: Path, row: dict, *, missing: bool = False) -> None:
 
 def _sweep_owned(ws: Path, row: dict) -> None:
     repo, ticket = row["repo"], row["ticket"]
-    with ticket_lock(repo, ticket) as ticket_held:
-        if not ticket_held or runs.issue_running(repo, ticket):
+    owner_task_id = _owner_task_id(row)
+    with ticket_lock(repo, ticket, task_id=owner_task_id) as ticket_held:
+        running = (
+            runs.issue_running(owner_task_id)
+            if owner_task_id is not None
+            else runs.issue_running(repo, ticket)
+        )
+        if not ticket_held or running:
             return
         with folder_lock(ws, wait=False) as got:
             current = open_for(ws.name) if got else None
