@@ -238,7 +238,7 @@ def resolve_item(
         where += " AND version = ?"
         args.append(base_version)
     changed = c.execute(
-        f"UPDATE inbox SET state = 'resolved', resolution = ?, answer = ?, answered_by = ?, answered_at = ?, "
+        f"UPDATE inbox SET state = 'resolved', resolution = ?, answer = ?, answered_by = ?, answered_at = ?, "  # noqa: S608
         f"snooze_until = '', snooze_watch = '', snooze_watch_ver = 0, shelve_until = '', "
         f"resolved = ?, version = ? WHERE {where}",
         args,
@@ -272,7 +272,7 @@ def record_answer(
         where += " AND version = ?"
         args.append(base_version)
     changed = c.execute(
-        f"UPDATE inbox SET answer = ?, answered_by = ?, answered_at = ?, version = ? WHERE {where}",
+        f"UPDATE inbox SET answer = ?, answered_by = ?, answered_at = ?, version = ? WHERE {where}",  # noqa: S608
         args,
     ).rowcount
     after = c.execute("SELECT * FROM inbox WHERE id = ?", (numeric_id,)).fetchone()
@@ -467,7 +467,7 @@ def list_items(
             clauses.append("subject LIKE ?")
             args.append(subject_prefix + "%")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        rows = c.execute(f"SELECT * FROM inbox{where} ORDER BY priority ASC, id ASC", args).fetchall()
+        rows = c.execute(f"SELECT * FROM inbox{where} ORDER BY priority ASC, id ASC", args).fetchall()  # noqa: S608
         return [decode(r) for r in rows]
 
 
@@ -479,7 +479,7 @@ def count_open(connect=reader) -> int:
 
 
 def counts_by_state(connect=reader) -> dict[str, int]:
-    counts = {s: 0 for s in ("open", "snoozed", "shelved", "paused", "resolved")}
+    counts = dict.fromkeys(("open", "snoozed", "shelved", "paused", "resolved"), 0)
     with connect() as c:
         if not available(c):
             return counts
