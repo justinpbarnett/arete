@@ -75,11 +75,16 @@ export function TicketProgress({ progress }) {
 export function FloorFocus({ snapshot, retry }) {
   const feedback = snapshot.live?.waiting;
   const progress = snapshot.live?.ticket_progress;
+  const waits = snapshot.live?.dependency_waits;
   return html`<div class="ops-detail">
     <section class="ops-section"><h3>Needs you</h3>
-      <p>${snapshot.needsYou == null || !snapshot.questions?.data || snapshot.questions.error ? "See the inbox for current work." :
-    `${snapshot.needsYou + snapshot.questions.data.asks.length} items in the inbox`}</p>
+      <p>${snapshot.needsYou == null ? "See the inbox for current work." : `${snapshot.needsYou} items in the inbox`}</p>
       <a href="#triage">Open Triage</a></section>
+    ${waits && (waits.error || waits.rows?.length) ? html`<${Panel} panel=${waits} title="Waiting on dependencies" retry=${retry}>
+      ${(rows) => html`<ul class="ops-health-rows">${rows.map((w) => html`<li key=${w.ticket}>
+        <div><strong>${w.ticket}</strong><${Text} text=${w.why} />${w.url ? html`<${DetailLink} href=${w.url}>Open source ticket<//>` : null}</div>
+        <small class="ops-row-state">${w.repo || ""}</small>
+      </li>`)}</ul>`}<//>` : null}
     ${progress && (progress.error || progress.rows?.length) ? html`<${Panel} panel=${progress} title="Ticket progress" retry=${retry}>
       ${(rows) => rows.map((row) => html`<article key=${`${row.repo}:${row.issue}`}>
         <h4><a href=${row.run ? runHash(row.run) : taskHash(row.issue, row.repo)}>${row.ticket}</a></h4>

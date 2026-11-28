@@ -143,8 +143,9 @@ def fresh_candidates(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.Ski
             if feedback_store.has_open_clarification(repo.name, tid):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, CLARIFICATION_WAIT, repo.name)
                 continue
-            if blocker := source.blocker(t.id):
-                skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
+            blocker, blocker_kind = tracker.blocker_of(source, t.id)
+            if blocker:
+                skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name, blocker_kind=blocker_kind)
                 continue
             yield t
 
@@ -207,8 +208,9 @@ def priority_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLo
             if _conflicts_other_routes(repo, source, t, other_routes):
                 skips.note(t.ref, t, tracker.route_blocker(other_routes | {tracker.route_label(repo)}, t.labels))
                 continue
-            if blocker := source.blocker(t.id):
-                skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
+            blocker, blocker_kind = tracker.blocker_of(source, t.id)
+            if blocker:
+                skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name, blocker_kind=blocker_kind)
                 continue
             return Pick(t.id, f"{t.title} (you replied to the question)")
     return None
@@ -508,7 +510,14 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
         fresh_feedback = True
     blocked, readmission = ("", None) if fresh_feedback else runlimits.poll_admission(
         repo, str(tid), ticket, runlimits.Policy.of(layer))
-    blocked = blocked or (ticket.blocker if ticket.is_spec else source.blocker(tid)) or reply
+    blocker_kind = ""
+    if not blocked:
+        if ticket.is_spec:
+            blocked, blocker_kind = ticket.blocker, ticket.blocker_kind
+        else:
+            blocked, blocker_kind = tracker.blocker_of(source, tid)
+    if not blocked and reply:
+        blocked, blocker_kind = reply, ""
     route_blocked = ""
     if not blocked and continues:
         blocked = route_blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer, mode="orchestrate")
@@ -520,7 +529,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
             blocked = route_blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer,
                                                          **({"mode": "orchestrate"} if ticket.is_spec else {}))
     if blocked:
-        skips.note(name, ticket, blocked, repo.name)
+        skips.note(name, ticket, blocked, repo.name, blocker_kind=blocker_kind)
         if route_blocked and not dry_run:
             waiting = answered or run_store.newest_live_whole_run(repo.name, tid) or {}
             if waiting.get("status") == "needs-info" and (answered or pipeline.answer_text(waiting["id"])):
@@ -659,6 +668,9 @@ def save_skips(skips: pipeline.SkipLog) -> None:
                 and (rid, since) != (current.get("answer_run"), current.get("since"))):
             run_lines.write(rid, "wait", event_id=f"provider-wait:{since}", cause="provider", phase="end", since=since, at=now)
     util.write_json(pipeline.SKIPPED_FILE, skips.current)
+    from . import inbox
+
+    inbox.sync_source("skipped")
 
 
 def poll(dry_run: bool = False) -> int:

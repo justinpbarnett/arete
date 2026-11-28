@@ -429,13 +429,17 @@ class Check:
     def shapes(self):
         from . import agent, cohorts, contract, dashboard, paths, principals, record, replay, secretstore, triage
         from .sighting import Sighting
-        from .store import chats, incidents, insights, runs, tokens
+        from .store import chats, incidents, insights, push, runs, tokens
+        from .store import inbox as inbox_store
         from .store import triage as triage_store
 
         record.step(self.run, "plan", agent.Result(ok=True, runner="replay"), 0)
         record.mark(self.run, "diff", patch=(self.root / "sample/replay/build.patch").read_text())
         chat = chats.chat_add("")
         incident, _ = incidents.record_incident(Sighting("check", "expected", "fixture", "", "fixture incident", 1, "", ""))
+        incidents.alert_set("fixture-alert", None)
+        fixture_item = inbox_store.get_open_by_subject("alert:fixture-alert")
+        sub_id = push.push_add("http://127.0.0.1:9999/fixture-push", "fixturep256dh", "fixtureauth", "Fixture", LOGIN)
         ticket = triage.Candidate("demo#7", "7", "Fixture ticket", "https://example.invalid/7", "old")
         triage_store.triage_put(triage.row(triage.GitHubSource("demo/repo", []), ticket, updated="old"))
         insights.research_set(ticket.ref, status="done", title="Fixture research")
@@ -449,7 +453,8 @@ class Check:
         identities = {"task": self.task, "run": self.run, "step": str(runs.steps(self.run)[0]["id"]),
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
                       "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
-                      "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}"}
+                      "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}",
+                      "item": fixture_item["id"], "subscription": f"PS-{sub_id}"}
         for op in self.published["operations"]:
             name, method, path = (op[key] for key in ("name", "method", "path"))
             values = op["example"]["input"].copy()
@@ -464,6 +469,8 @@ class Check:
             if name in ("task.update", "run.stop"):
                 row = self.read(f"/api/v1/{resource}s/{self.task if resource == 'task' else stopped}")[resource]
                 values["base_version"] = row["version"]
+            if name in ("inbox.snooze", "inbox.shelve", "inbox.resolve"):
+                values["base_version"] = self.read(f"/api/v1/inbox/{identities['item']}")["item"]["version"]
             if name == "config.diff":
                 values["from"], values["to"] = "1", "2"
             if name == "settings.update":
@@ -475,7 +482,7 @@ class Check:
             else:
                 key = {"Idempotency-Key": f"check-{name}"} if contract.keyed_write(op) else None
                 denied = {"token.issue": 426, "token.rotate": 426, "pairing.claim": 426, "session.end": 401,
-                          "secret.set": 426, "secret.remove": 403, "webhook.rotate": 426}
+                          "secret.set": 426, "secret.remove": 202, "webhook.rotate": 426, "push.subscribe": 202}
                 if name in denied:
                     self.request(method, path, values, headers=key, status=denied[name])
                     continue

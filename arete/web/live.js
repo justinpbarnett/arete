@@ -5,6 +5,7 @@ function drawLive(d, renderProgress) {
     heading(1, "Running now"),
     panelParts(d.live, "The live runs", runningParts),
     panelParts(d.waiting, "The review feedback", upNextParts),
+    d.dependency_waits ? panelParts(d.dependency_waits, "Waiting on dependencies", dependencyWaitParts) : null,
     renderProgress ? panelParts(d.ticket_progress, "Ticket progress", (rows) => ticketStatusParts(rows, renderProgress)) : null,
     heading(2, "Needs you"),
     needsParts(d.needs_you),
@@ -23,6 +24,19 @@ function runningParts(live) {
         cell(duration(r.seconds), "num"), paid.cell(r),
         cell(button(r.stopping ? "Stopping" : "Stop", "stop", (b) => stopLiveRun(r, b), { of: r.id, disabled: r.stopping })))), { stack: true }),
     saidLine("running"),
+  ];
+}
+
+function dependencyWaitParts(waits) {
+  if (!waits.length) return null;
+  return [
+    el("h3", { text: "Waiting on dependencies" }),
+    table("", [["Ticket", "c-work"], ["Repo", "c-repo"], ["Reason"], ["Since", "c-time"]],
+      waits.map((w) => el("tr", {},
+        cell(w.url ? link(w.url, w.ticket) : w.ticket),
+        repoCell(w.repo),
+        cell(w.why, "muted-cell"),
+        cell(liveAgo(w.since), "nb"))), { stack: true }),
   ];
 }
 

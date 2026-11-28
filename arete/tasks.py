@@ -463,7 +463,30 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
 
 
 def asks_view(*, owner_only=True) -> dict:
+    from contextlib import nullcontext
+    from .store import inbox as inbox_store
+
     keys = ("id", "repo", "ticket", "run", "step", "asked", "why", "tried", "questions", "reminded")
+    with foundation.one_read() as c:
+        if inbox_store.available(c):
+            items = inbox_store.list_items(
+                state=("open", "snoozed", "shelved"), subject_prefix="ask:", connect=lambda: nullcontext(c)
+            )
+            seen = set()
+            result = []
+            for item in items:
+                detail = item["detail"]
+                ask_id = detail.get("id") or item["subject"].removeprefix("ask:")
+                seen.add(ask_id)
+                row = {**detail, "reminded": item["reminded"]}
+                if row.get("questions"):
+                    result.append({k: row.get(k, "") for k in keys})
+            if not owner_only:
+                for raw in ask_store.open_asks(connect=lambda: nullcontext(c), owner_only=False, group_runners=True):
+                    if raw["id"] not in seen and (ask := owner_asks.unstaged(raw))["questions"]:
+                        result.append({k: ask[k] for k in keys})
+            result.sort(key=lambda r: (r["asked"], r["id"]))
+            return {"asks": result}
     rows = ask_store.open_asks(connect=foundation.reader, owner_only=owner_only, group_runners=True)
     return {"asks": [{k: ask[k] for k in keys} for row in rows
                      if (ask := owner_asks.unstaged(row))["questions"]]}
