@@ -53,7 +53,7 @@ PRELOAD_MODULES = (
 
 def default_jobs():
     cpus = os.cpu_count() or 4
-    return max(4, min(cpus, 12))
+    return max(2, min(cpus, 12))
 
 if __spec__ is None:
     sys.path.insert(0, os.path.dirname(TESTS))

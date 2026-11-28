@@ -844,7 +844,7 @@ def run_jira_post_fault(exc_factory):
             raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", Message(), io.BytesIO(b""))
     client = jira.Client("http://127.0.0.1", "a@b.test", "tok")
     raised = None
-    with mock.patch.object(jira, "_opener", Opener()):
+    with mock.patch.object(jira, "_opener", Opener()), mock.patch("time.sleep"):
         try:
             client.comment("APP-1", "hello")
         except Exception as e:
