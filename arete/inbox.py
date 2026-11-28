@@ -59,6 +59,7 @@ RESERVED_MANUAL_PREFIXES = (
     "ask:",
     "run:",
     "proposal:",
+    "draft:",
     "skipped:",
     "ticket:",
     "chat:",
@@ -223,36 +224,90 @@ def _runs_items(c) -> list[dict]:
 
 
 def _proposals_items(c) -> list[dict]:
-    rows = [
-        dict(r)
-        for r in c.execute(
-            "SELECT * FROM proposals WHERE status IN ('memory', 'hand', 'approve', 'filing') ORDER BY id DESC"
-        )
-    ]
+    from . import drafts, miner
+
+    if not drafts.available(c):
+        return []
+    cfg = config.load_or_problem()[0]
+    rows = c.execute(
+        "SELECT * FROM config_drafts WHERE "
+        "(state = 'valid' AND COALESCE(pr_url, '') = '') "
+        "OR (state = 'draft' AND (kind = 'miner' OR (gate = 'C' AND author LIKE 'run:%'))) "
+        "ORDER BY id DESC"
+    ).fetchall()
     items = []
-    for p in rows:
-        priority = 2 if p["status"] in ("approve", "filing") else 3
-        detail = {
-            "id": p["id"],
-            "repo": p["repo"] or "",
-            "file": p["file"] or "",
-            "change": p["change"] or "",
-            "why": p["why"] or "",
-            "status": p["status"],
-            "stamp": f"{p['status']}:{p['id']}",
-        }
-        items.append({
-            "kind": "proposal",
-            "subject": f"proposal:{p['id']}",
-            "task_id": "",
-            "run_id": p["run_id"] or "",
-            "line": p["repo"] or "",
-            "priority": priority,
-            "title": p["file"] or p["change"] or f"Proposal #{p['id']}",
-            "detail": detail,
-            "verbs": ["accept", "decline"],
-            "options": [],
-        })
+    for raw in rows:
+        d = drafts.decode(raw)
+        num_id = d["numeric_id"]
+        if d["kind"] == "miner":
+            ev = d["evidence"] if isinstance(d["evidence"], dict) else {}
+            repo = (d["origin"] or "").removeprefix("repo:")
+            bucket = miner.classify_draft(cfg, d)
+            legacy_status = ev.get("legacy_status")
+            priority = 2 if bucket in ("approve", "pending") or d["state"] == "draft" else 3
+            if legacy_status is not None:
+                title = f"Miner proposal #{num_id} (unknown status {legacy_status})"
+            else:
+                title = d["path"] or d["body"] or f"Proposal #{num_id}"
+            detail = {
+                "id": num_id,
+                "draft_id": d["id"],
+                "kind": "miner",
+                "name": d["name"],
+                "repo": repo,
+                "file": d["path"],
+                "change": d["body"],
+                "why": d["why"],
+                "status": d["state"],
+                "state": d["state"],
+                "bucket": bucket,
+                "gate": d["gate"],
+                "check_report": d["check_report"],
+                **({"legacy_status": legacy_status} if legacy_status is not None else {}),
+                "stamp": f"{d['state']}:{num_id}:{d['version']}",
+            }
+            items.append({
+                "kind": "proposal",
+                "subject": f"draft:{num_id}",
+                "task_id": "",
+                "run_id": str(ev.get("run") or ""),
+                "line": repo,
+                "priority": priority,
+                "title": title,
+                "detail": detail,
+                "verbs": ["accept", "decline"],
+                "options": [],
+            })
+        else:
+            title = f"Config draft {d['id']}: {d['kind']}/{d['name']}"
+            if d["why"]:
+                title += f" — {util.first_line(d['why'], 100)}"
+            detail = {
+                "id": num_id,
+                "draft_id": d["id"],
+                "kind": d["kind"],
+                "name": d["name"],
+                "path": d["path"],
+                "author": d["author"],
+                "why": d["why"],
+                "gate": d["gate"],
+                "state": d["state"],
+                "base_version": d["base_version"],
+                "check_report": d["check_report"],
+                "stamp": f"{d['state']}:{num_id}:{d['version']}",
+            }
+            items.append({
+                "kind": "proposal",
+                "subject": f"draft:{num_id}",
+                "task_id": "",
+                "run_id": d["author"].removeprefix("run:").partition("/")[0] if d["author"].startswith("run:") else "",
+                "line": d["name"],
+                "priority": 2,
+                "title": title,
+                "detail": detail,
+                "verbs": ["accept", "decline"],
+                "options": [],
+            })
     return items
 
 
@@ -592,6 +647,49 @@ def _config_items(c) -> list[dict]:
                     "problems": [entry],
                     "summary": detail_text,
                     "stamp": util.digest(json.dumps([entry], sort_keys=True, default=str)),
+                },
+                "verbs": ["continue"],
+                "options": [],
+            })
+    from . import drafts
+
+    if drafts.available(c):
+        seen_subjects = {item["subject"] for item in items}
+        invalid_hands = c.execute(
+            "SELECT * FROM config_drafts WHERE author = 'hand' AND state = 'invalid' ORDER BY id DESC"
+        ).fetchall()
+        for raw in invalid_hands:
+            d = drafts.decode(raw)
+            rel = d["path"]
+            if rel:
+                disk = paths.CONFIG_DIR / rel
+                try:
+                    if not disk.is_file() or disk.read_bytes() != d["body"].encode("utf-8"):
+                        continue
+                except OSError:
+                    continue
+            subj = f"config:{d['kind']}/{d['name']}"
+            if subj in seen_subjects:
+                continue
+            seen_subjects.add(subj)
+            report = d.get("check_report") or {}
+            probs = [p for st in report.get("stages", ()) for p in st.get("problems", ())]
+            summary = "; ".join(probs) or f"Invalid hand edit on {d['path']}"
+            items.append({
+                "kind": "config_invalid",
+                "subject": subj,
+                "task_id": "",
+                "run_id": "",
+                "line": d["name"] if d["name"] != "defaults" else "",
+                "priority": 1,
+                "title": f"Invalid hand edit in {d['path'] or subj}",
+                "detail": {
+                    "path": d["path"],
+                    "draft_id": d["id"],
+                    "problems": probs,
+                    "summary": summary,
+                    "check_report": report,
+                    "stamp": f"hand_invalid:{d['numeric_id']}:{d['version']}",
                 },
                 "verbs": ["continue"],
                 "options": [],
@@ -1250,7 +1348,7 @@ ADAPTERS: dict[str, tuple[str, Callable[..., builtins.list[dict]]]] = {
     "stops": ("run:%", _stops_items),
     "faults": ("step:%", _faults_items),
     "evidence": ("evidence:%", _evidence_items),
-    "proposals": ("proposal:%", _proposals_items),
+    "proposals": ("draft:%", _proposals_items),
     "skipped": ("skipped:%", _skipped_items),
     "ready": ("ticket:%", _ready_items),
     "chats": ("chat:%/draft", _chats_items),
@@ -1307,6 +1405,8 @@ def sync(c, source: str) -> None:
     desired = producer(c)
     wanted = {(spec["kind"], spec["subject"]): spec for spec in desired}
     existing_rows = inbox_store.unresolved_for_pattern(c, pattern, kinds=kinds)
+    if source == "proposals":
+        existing_rows = [r for r in existing_rows if r["kind"] == "proposal"]
     present_keys: set[tuple[str, str]] = set()
     for row in existing_rows:
         key = (row["kind"], row["subject"])
@@ -1416,8 +1516,10 @@ def subject_object(item: dict, connect=foundation.reader) -> dict | None:
             return asks_store.ask_get(ident, connect=lambda: nullcontext(c))
         if kind == "run":
             return run_store.run_get(ident, connect=lambda: nullcontext(c))
-        if kind == "proposal" and ident.isdecimal():
-            return approvals_store.proposal(int(ident), connect=lambda: nullcontext(c))
+        if kind == "draft":
+            from . import drafts
+
+            return drafts.public(drafts.get(ident, connect=lambda: nullcontext(c)))
         if kind == "incident" and ident.isdecimal():
             return incident_store.incident(int(ident), connect=lambda: nullcontext(c))
         if kind == "alert":
@@ -1665,6 +1767,7 @@ def defer_presence(
     secret_value: str | None = None,
     fingerprint: str | None = None,
     before_defer: Callable[[], None] | None = None,
+    extra_detail: dict | None = None,
 ) -> dict:
     from . import dashboard, idempotency
 
@@ -1729,6 +1832,7 @@ def defer_presence(
                     "args": summary,
                     "expires": expires,
                     "stamp": f"{actor}/{key}",
+                    **(extra_detail or {}),
                 },
                 verbs=["approve", "reject"],
                 options=[],
@@ -1796,6 +1900,48 @@ def _execute_pending_command(req: dict, secret_value: str | None) -> tuple[int, 
 
         updated = outbox.reject(values["item"], reason=str(values.get("reason") or ""), base_version=values["base_version"])
         return 200, api.with_seq({"item": updated})
+    if op_name == "config.activate":
+        from . import drafts
+
+        draft_id = values.get("draft") or ""
+        if not draft_id:
+            found = drafts.list_drafts(state="valid", kind=values["kind"], name=values["name"], limit=1)
+            if not found:
+                raise contract.Problem("not_found", f"No valid draft for {values['kind']}/{values['name']}")
+            draft_id = found[0]["id"]
+        activated = drafts.activate(
+            draft_id,
+            actor,
+            values["base_version"],
+            idem=req.get("idem", ""),
+            presence_passed=True,
+        )
+        return 200, api.with_seq(activated)
+    if op_name == "config.rollback":
+        from . import drafts
+
+        rolled = drafts.rollback(
+            values["kind"],
+            values["name"],
+            values["to"],
+            values["base_version"],
+            actor,
+            idem=req.get("idem", ""),
+            presence_passed=True,
+        )
+        return 200, api.with_seq(rolled)
+    if op_name == "settings.update":
+        from . import settings
+
+        saved = settings.save(
+            values["values"],
+            base_version=values["base_version"],
+            actor=actor,
+            source="dashboard",
+            idem=req.get("idem", ""),
+            presence_passed=True,
+        )
+        return 200, api.with_seq({"settings": saved})
     raise contract.Problem("not_found", f"Unsupported pending operation {op_name}")
 
 
@@ -1907,15 +2053,15 @@ def _resolve_presence(
         if not ok:
             raise contract.Problem("version_conflict", f"Inbox item {current['id']} changed.", current=resolved)
 
-        req = pending["request"]
-        legacy_outbox = False
+        req = {**pending["request"], "idem": key}
+        run_outside_tx = req["operation"] in ("config.activate", "config.rollback", "settings.update")
         if req["operation"] in ("outbox.approve", "outbox.retry", "outbox.reject"):
             from .store import outbox as outbox_store
 
             ob_row = outbox_store.get_raw(req["values"]["item"], connect=lambda: nullcontext(c))
-            legacy_outbox = ob_row is not None and ob_row.get("legacy_approval") is not None
+            run_outside_tx = ob_row is not None and ob_row.get("legacy_approval") is not None
 
-        if legacy_outbox:
+        if run_outside_tx:
             inbox_store.delete_pending(c, actor, key)
         else:
             with principals.acting(actor), event_store.caused_by(approval_seq), event_store.collect_receipts() as collected:
@@ -2213,25 +2359,148 @@ def resolve(
                 handler_result = {"run_id": run_id, "node": node, "dismissed": True}
                 resolution = "dismissed"
                 stored_answer = verb
-        elif prefix == "proposal":
-            pid = int(ident)
-            prop = approvals_store.proposal(pid)
-            status = (prop or {}).get("status") or item["detail"].get("status")
-            if status in ("approve", "filing"):
-                if verb == "decline":
-                    if status == "filing":
-                        raise contract.Problem("invalid_state", f"Proposal #{pid} is filing and cannot be declined.")
-                    handler_result = dashboard.reject_rule(pid)
-                    resolution = "declined"
+        elif prefix == "draft":
+            from . import drafts, miner
+
+            draft_num = drafts.parse_id(ident)
+            draft_row = drafts.get(draft_num) if draft_num is not None else None
+            if draft_row is None:
+                sync_source("proposals")
+                current = inbox_store.get(numeric) or item
+                raise contract.Problem("already_resolved", f"Draft {ident} no longer exists.", current=current)
+            if item["kind"] == "watch":
+                if verb == "roll_back":
+                    prev_ver = item["detail"].get("previous_version")
+                    if not prev_ver:
+                        prev_info, _ = drafts._previous_and_new_version_info(draft_row)
+                        if prev_info is not None:
+                            prev_ver = (
+                                str(prev_info["version"]) if prev_info.get("version") is not None
+                                else prev_info.get("content_version") or prev_info.get("commit_sha") or ""
+                            )
+                    if not prev_ver:
+                        raise contract.Problem("validation", f"No previous version recorded for {draft_row['id']}.")
+                    rel = draft_row["path"] or drafts.default_path(draft_row["kind"], draft_row["name"])
+                    live_ver = drafts._live_ver_for(draft_row["kind"], draft_row["name"], rel)
+                    presence_ok = (credential is None and allow_legacy_auth) or (
+                        credential is not None and credential.kind == "session"
+                    )
+                    try:
+                        handler_result = drafts.rollback(
+                            draft_row["kind"],
+                            draft_row["name"],
+                            prev_ver,
+                            live_ver,
+                            actor,
+                            presence_passed=presence_ok,
+                        )
+                    except drafts.PresenceRequired:
+                        raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required") from None
+                    resolution = "rolled_back"
+                else:
+                    handler_result = {"draft": draft_row["id"], "continued": True}
+                    resolution = "continued"
+                stored_answer = verb
+            elif draft_row["kind"] == "miner":
+                cfg = config.load_or_problem()[0]
+                if draft_row["state"] == "draft":
+                    drafts.move(draft_row["numeric_id"], "draft", "valid", sync_inbox=False)
+                    draft_row = drafts.get(draft_row["numeric_id"]) or draft_row
+                bucket = miner.classify_draft(cfg, draft_row)
+                if bucket in ("memory", "hand"):
+                    if not drafts.move(draft_row["numeric_id"], "valid", "discarded", sync_inbox=False):
+                        raise contract.Problem("invalid_state", f"Draft {draft_row['id']} is no longer open.")
+                    handler_result = {"id": draft_row["numeric_id"]}
+                    resolution = "accepted" if verb == "accept" else "declined"
+                    stored_answer = verb
+                elif bucket == "approve":
+                    if verb == "decline":
+                        if not drafts.move(
+                            draft_row["numeric_id"], "valid", "declined",
+                            reason=str(reason or answer or "declined"), sync_inbox=False,
+                        ):
+                            raise contract.Problem("invalid_state", f"Draft {draft_row['id']} is no longer open.")
+                        handler_result = {"id": draft_row["numeric_id"]}
+                        resolution = "declined"
+                        stored_answer = verb
+                    else:
+                        handler_result = dashboard.approve_rule(draft_row["numeric_id"])
+                        keep_open = True
+                        stored_answer = verb
+                else:
+                    if verb == "decline":
+                        if not drafts.move(
+                            draft_row["numeric_id"], "valid", "declined",
+                            reason=str(reason or answer or "declined"), sync_inbox=False,
+                        ):
+                            raise contract.Problem("invalid_state", f"Draft {draft_row['id']} is no longer open.")
+                        handler_result = {"id": draft_row["numeric_id"]}
+                        resolution = "declined"
+                        stored_answer = verb
+                    else:
+                        handler_result = miner.apply_miner_draft(draft_row["numeric_id"])
+                        resolution = "accepted"
+                        stored_answer = verb
+            else:
+                if draft_row["gate"] == "C" and draft_row["author"].startswith("run:"):
+                    if verb == "accept":
+                        new_draft, _ = drafts.create_and_check(
+                            draft_row["kind"],
+                            draft_row["name"],
+                            draft_row["body"],
+                            author=actor,
+                            path=draft_row["path"],
+                            base_version=draft_row["base_version"],
+                            why=draft_row["why"] or f"accepted from {draft_row['id']}",
+                            evidence=draft_row["evidence"],
+                            run_check=True,
+                        )
+                        drafts.move(
+                            draft_row["numeric_id"],
+                            draft_row["state"],
+                            "discarded",
+                            reason=f"accepted as {new_draft['id']}",
+                            sync_inbox=False,
+                        )
+                        handler_result = {"draft": drafts.public(new_draft), "discarded": draft_row["id"]}
+                        resolution = "accepted"
+                    else:
+                        if draft_row["state"] == "valid":
+                            drafts.move(draft_row["numeric_id"], "valid", "declined",
+                                        reason=str(reason or answer or ""), sync_inbox=False)
+                        else:
+                            drafts.move(draft_row["numeric_id"], draft_row["state"], "discarded",
+                                        reason=str(reason or answer or ""), sync_inbox=False)
+                        handler_result = {"draft": draft_row["id"], "declined": True}
+                        resolution = "declined"
+                    stored_answer = verb
+                elif verb == "accept":
+                    rel = draft_row["path"] or drafts.default_path(draft_row["kind"], draft_row["name"])
+                    base_ver = draft_row["base_version"]
+                    if not (base_ver and base_ver.isascii() and base_ver.isdecimal()):
+                        base_ver = drafts._live_ver_for(draft_row["kind"], draft_row["name"], rel)
+                    presence_ok = (credential is not None and credential.kind == "session") or allow_legacy_auth
+                    try:
+                        handler_result = drafts.activate(
+                            draft_row["id"],
+                            actor,
+                            base_ver,
+                            presence_passed=presence_ok,
+                        )
+                    except drafts.PresenceRequired:
+                        raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required") from None
+                    resolution = "accepted"
                     stored_answer = verb
                 else:
-                    handler_result = dashboard.approve_rule(pid)
-                    keep_open = True
+                    if draft_row["state"] == "valid":
+                        drafts.move(draft_row["numeric_id"], "valid", "declined",
+                                    reason=str(reason or answer or ""), sync_inbox=False)
+                    elif draft_row["state"] == "draft":
+                        drafts.move(draft_row["numeric_id"], "draft", "discarded",
+                                    reason=str(reason or answer or ""), sync_inbox=False)
+                    handler_result = {"draft": draft_row["id"], "declined": True}
+                    resolution = "declined"
                     stored_answer = verb
-            else:
-                handler_result = dashboard.forget_proposal(pid)
-                resolution = "accepted" if verb == "accept" else "declined"
-                stored_answer = verb
         elif prefix == "skipped":
             if verb == "accept":
                 handler_result = pipeline.run_skipped(ident)

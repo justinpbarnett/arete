@@ -62,7 +62,6 @@ from . import (
     webpush,
 )
 from .refusals import Stated as Refusal
-from .store import approvals as approvals_store
 from .store import db as foundation
 from .store import events as event_store
 from .store import idempotency as claims
@@ -474,6 +473,14 @@ class Handler(BaseHTTPRequestHandler):
             tag = None
             if conditional and self.route == "/api/v1/screen" and query.get("view") == "board":
                 tag = api_http.board_etag(result)
+            elif (
+                method != "GET"
+                and self.operation
+                and self.operation[0]["name"].startswith(("config.", "draft."))
+                and isinstance(result, dict)
+                and isinstance(result.get("seq"), str)
+            ):
+                tag = api_http.etag(api_http.json_bytes(result), "application/json", result["seq"])
             if self.route == "/api/v1/meta" and method == "GET":
                 self.instance_header = result["instance"]["id"]
             self.send_json(self.success_status, result, conditional=conditional, tag=tag)
@@ -993,7 +1000,7 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._scrub_payload(status, payload, kind)
         if conditional and tag is None:
             tag = api_http.etag(payload, kind, self.read_seq)
-        if tag and api_http.matches_etag(self.headers, tag):
+        if conditional and tag and api_http.matches_etag(self.headers, tag):
             status, payload = 304, b""
         self.head(status, kind, cache, None if status in (204, 304) else len(payload))
         if tag:
@@ -1072,20 +1079,41 @@ def research_ticket(ref: str, force: bool) -> dict:
 
 
 def forget_proposal(proposal_id: int) -> dict:
-    if not approvals_store.forget_proposal(proposal_id):
+    from . import drafts, miner
+
+    item = inbox_store.get_open_by_subject(f"draft:{proposal_id}")
+    if item is not None and item["kind"] == "proposal":
+        return inbox.resolve(
+            item["id"], base_version=item["version"], verb="accept", allow_legacy_auth=True
+        )["result"]
+    row = drafts.get(proposal_id)
+    if row is None or row["kind"] != "miner" or row["state"] != "valid":
+        raise control.NotFound(f"#{proposal_id} is not an open memory fact or harness fix")
+    if miner.classify_draft(config.load_or_problem()[0], row) not in ("memory", "hand"):
+        raise control.NotFound(f"#{proposal_id} is not an open memory fact or harness fix")
+    if not drafts.move(row["numeric_id"], "valid", "discarded"):
         raise control.NotFound(f"#{proposal_id} is not an open memory fact or harness fix")
     return {"id": proposal_id}
 
 
 def approve_rule(proposal_id: int) -> dict:
-    if (approvals_store.proposal(proposal_id, connect=foundation.reader) or {}).get("status") not in ("approve", "filing"):
+    from . import drafts, miner
+
+    row = drafts.get(proposal_id, connect=foundation.reader)
+    if (row is None or row["kind"] != "miner" or row["state"] != "valid"
+            or miner.classify_draft(config.load_or_problem()[0], row) != "approve"):
         raise control.NotFound(f"#{proposal_id} is not a rule waiting for approval")
     control.detach(["file-rule", str(proposal_id), "--local"])
     return {"id": proposal_id}
 
 
 def reject_rule(proposal_id: int) -> dict:
-    if not approvals_store.move_proposal(proposal_id, ("approve",), "rejected"):
+    from . import drafts
+
+    row = drafts.get(proposal_id)
+    if row is None or row["kind"] != "miner" or row["state"] != "valid":
+        raise control.NotFound(f"#{proposal_id} is not a rule waiting for approval")
+    if not drafts.move(row["numeric_id"], "valid", "declined", reason="rejected by owner"):
         raise control.NotFound(f"#{proposal_id} is not a rule waiting for approval")
     return {"id": proposal_id}
 
@@ -1596,8 +1624,8 @@ def post_proposal(handler, rest, query):
     if action not in ("done", "approve", "reject"):
         raise NoRoute
     pid = whole_number(proposal_id)
-    item = inbox_store.get_open_by_subject(f"proposal:{pid}")
-    if item is not None:
+    item = inbox_store.get_open_by_subject(f"draft:{pid}")
+    if item is not None and item["kind"] == "proposal":
         verb = "decline" if action == "reject" else "accept"
         return inbox.resolve(
             item["id"],

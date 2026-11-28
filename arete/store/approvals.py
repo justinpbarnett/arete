@@ -10,7 +10,6 @@ from .db import db, reader
 
 TABLES = {
     "approvals": "kept",
-    "proposals": "kept",
     "mined": "kept",
 }
 
@@ -129,94 +128,6 @@ def settle_approval(approval_id: int, status: str, outcome: str, result: str = "
         _sync_inbox(c, "approvals")
         _sync_inbox(c, "outbox")
         return True
-
-
-def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:
-    with db() as c:
-        c.execute(
-            "INSERT INTO proposals (run_id, layer, repo, file, change, why, evidence, confidence, status, pr_url, created)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                run_id,
-                p.get("layer"),
-                p.get("repo"),
-                p.get("file"),
-                p.get("change"),
-                p.get("why"),
-                json.dumps(p.get("evidence", [])),
-                float(p.get("confidence", 0)),
-                status,
-                pr_url,
-                util.iso(),
-            ),
-        )
-        _sync_inbox(c, "proposals")
-
-
-def check_proposal_revisions(layer: str, repo: str, family: str, revisions: str) -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute("SELECT id, file, evidence, status FROM proposals WHERE layer = ? AND repo = ? "
-                                          "AND (file = ? OR file GLOB ?)", (layer, repo, family, revisions))]
-
-
-def record_check_proposal(run_id: str, p: dict, family: str, revisions: str, legacy_ids: list[int]) -> None:
-    scope = (p["layer"], p["repo"])
-    with db() as c:
-        if c.execute("SELECT 1 FROM proposals WHERE layer = ? AND repo = ? AND file = ? LIMIT 1",
-                     (*scope, p["file"])).fetchone():
-            return
-        c.execute("UPDATE proposals SET status = 'superseded' WHERE layer = ? AND repo = ? AND status = 'hand' "
-                  "AND (file = ? OR file GLOB ?)", (*scope, family, revisions))
-        c.executemany("UPDATE proposals SET status = 'superseded' WHERE id = ? AND status = 'hand'",
-                      ((proposal_id,) for proposal_id in legacy_ids))
-        add_proposal(run_id, p, "hand")
-
-
-RELEASING_PROPOSALS = ("rejected", "skipped", "filed", "superseded")
-
-
-def runs_cited_by_kept_proposals(run_ids, connect=reader) -> set[str]:
-    marks = ",".join("?" * len(RELEASING_PROPOSALS))
-    with connect() as c:
-        rows = c.execute(f"SELECT run_id, evidence FROM proposals WHERE status IS NULL OR status NOT IN ({marks})",  # noqa: S608
-                         RELEASING_PROPOSALS).fetchall()
-    return {r for r in run_ids if any(r == row["run_id"] or r in (row["evidence"] or "") for row in rows)}
-
-
-def proposals(status: list[str] | None = None, limit: int = 200, connect=reader) -> list[dict]:
-    q, args = "SELECT * FROM proposals", []
-    if status:
-        q += f" WHERE status IN ({','.join('?' * len(status))})"
-        args += status
-    q += " ORDER BY id DESC LIMIT ?"
-    args.append(limit)
-    with connect() as c:
-        return [dict(r) for r in c.execute(q, args)]
-
-
-def proposal(proposal_id: int, connect=reader) -> dict | None:
-    with connect() as c:
-        row = c.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def move_proposal(proposal_id: int, before: tuple[str, ...], after: str) -> bool:
-    with db() as c:
-        moved = c.execute(f"UPDATE proposals SET status = ? WHERE id = ? AND status IN ({','.join('?' * len(before))})",  # noqa: S608
-                          (after, proposal_id, *before)).rowcount > 0
-        if moved:
-            _sync_inbox(c, "proposals")
-        return moved
-
-
-def forget_proposal(proposal_id: int) -> bool:
-    return move_proposal(proposal_id, ("memory", "hand"), "filed")
-
-
-def set_proposal_status_by_pr(pr_url: str, status: str) -> None:
-    with db() as c:
-        if c.execute("UPDATE proposals SET status = ? WHERE pr_url = ?", (status, pr_url)).rowcount > 0:
-            _sync_inbox(c, "proposals")
 
 
 def add_mined(pr_url: str, repo: str, issue: str, run_id: str, status: str, why: str = "", task: str = "") -> None:

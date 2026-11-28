@@ -558,7 +558,7 @@ def keep(file: Path, data: bytes) -> None:
 def standing(found: list[dict]) -> dict | None:
     current = None
     for e in found:
-        if e.get("event") == "apply" and e.get("status") == "applied":
+        if e.get("event") == "apply" and e.get("status") in ("applied", "drafted"):
             current = e
         elif e.get("event") == "rollback":
             current = None
@@ -641,7 +641,40 @@ def refusal_for(cfg: config.Config, layer: config.RepoLayer, atom: str, wanted: 
     return refusal
 
 
+def _trial_run_ids(folder: Path, found: list[dict]) -> list[str]:
+    seen: dict[str, None] = {}
+
+    def _collect(ev: dict) -> None:
+        for key in ("run_id", "run"):
+            val = ev.get(key)
+            if isinstance(val, str) and val.strip():
+                seen.setdefault(val.strip(), None)
+        for key in ("trial_runs", "runs"):
+            vals = ev.get(key)
+            if isinstance(vals, list):
+                for item in vals:
+                    if isinstance(item, str) and item.strip():
+                        seen.setdefault(item.strip(), None)
+
+    for ev in found:
+        if isinstance(ev, dict):
+            _collect(ev)
+    if folder.is_dir():
+        for file in sorted(folder.glob("*.jsonl")):
+            if file.name == "trail.jsonl":
+                continue
+            try:
+                for ev in events(file):
+                    if isinstance(ev, dict) and ev.get("event") == "trial":
+                        _collect(ev)
+            except OSError:
+                continue
+    return list(seen)
+
+
 def apply_winner(folder: Path, trail: Path, found: list[dict], end: dict) -> int:
+    from .. import drafts
+
     search = last(found, "search")
     atom = search["design"]["atom"]
     if not end["promotable"]:
@@ -660,85 +693,98 @@ def apply_winner(folder: Path, trail: Path, found: list[dict], end: dict) -> int
             return 0
         if now != search["baseline"]["settings"] or inheritors != search["baseline"]["inheritors"]:
             raise Refused(f"settings for {atom} changed since the search began; run a new search")
-        before_text, base_blob = configrepo.read("config.toml")
+        before_text, _ = configrepo.read("config.toml")
         before = before_text.encode()
         old = tomllib.loads(before_text)
         table = table_name(old, atom)
         text = edited(before_text, table, keys)
         outcome = "config.toml is unchanged"
         try:
-            keep(folder / SAVED, before)
             expected = deepcopy(old)
             expected.setdefault("steps", {}).setdefault(table.removeprefix("steps."), {}).update(keys)
             if tomllib.loads(text) != expected:
                 raise Refused("the edit would change more than the chosen keys")
-            settings.write_checked(
+            settings.check_draft(text, refusal_for(cfg, layer, atom, end))
+            live_ver = settings.current_version()
+            trial_ids = _trial_run_ids(folder, found)
+            draft_row, report = drafts.create_and_check(
+                "step_settings",
+                "defaults",
                 text,
-                refusal_for(cfg, layer, atom, end),
-                base=base_blob,
-                actor=principals.current(),
-                source="agent",
-                note=f"optimize apply {end['champion']}",
-                fence=fence,
+                author="optimize",
+                path="config.toml",
+                base_version=live_ver,
+                why=f"optimize apply {end['champion']}",
+                evidence=trial_ids,
+                run_check=True,
             )
-            if paths.CONFIG_FILE.read_bytes() != text.encode():
-                raise Refused("it read back differently from what was written")
+            if not report or not report["ok"]:
+                probs = [p for st in (report or {}).get("stages", ()) for p in st.get("problems", ())]
+                raise Refused("; ".join(probs) or "configcheck failed")
             changed = {k: {"before": held_table(old, table).get(k), "after": v} for k, v in keys.items()}
-            append(trail, {"event": "apply", "status": "applied", "table": table, "keys": changed,
-                           "before_sha": sha(before), "after_sha": sha(text.encode()), "at": util.iso()})
+            append(trail, {
+                "event": "apply",
+                "status": "drafted",
+                "draft": draft_row["id"],
+                "before_ver": live_ver,
+                "table": table,
+                "keys": changed,
+                "before_sha": sha(before),
+                "after_sha": sha(text.encode()),
+                "evidence": trial_ids,
+                "at": util.iso(),
+            })
         except (OSError, settings.Refused, Refused, configrepo.ConfigRepoError, configrepo.StaleBase) as e:
             with contextlib.suppress(OSError):
                 append(trail, {"event": "apply", "status": "failed", "why": str(e), "at": util.iso()})
             raise Refused(f"apply failed: {e}; {outcome}") from e
-    print(f"applied: [{table}] " + ", ".join(f"{k} {json.dumps(c['before'])} -> {json.dumps(c['after'])}"
-                                             for k, c in changed.items()))
+    print(f"drafted {draft_row['id']}: [{table}] " + ", ".join(
+        f"{k} {json.dumps(c['before'])} -> {json.dumps(c['after'])}" for k, c in changed.items()
+    ))
     print(f"roll back with: {rollback_command(folder)}")
     return 0
 
 
 def roll_back(folder: Path, trail: Path, found: list[dict]) -> int:
+    from .. import contract, drafts
+
     applied = standing(found)
     if applied is None:
         raise Refused("nothing applied from this trail")
-    saved = folder / SAVED
-    with configrepo.writer_lock() as fence:
-        configrepo.ensure_repo(fence=fence)
-        current_text, base_blob = configrepo.read("config.toml")
-        current = current_text.encode()
-        try:
-            if sha(current) == applied["after_sha"] and saved.is_file():
-                restored_text = saved.read_bytes().decode()
-                settings.write_checked(
-                    restored_text,
-                    lambda cfg: "",
-                    base=base_blob,
-                    actor=principals.current(),
-                    source="revert",
-                    note="optimize rollback",
-                    fence=fence,
-                )
-                how = "restored the saved config.toml byte for byte"
-            else:
-                table, lines = applied["table"], current_text.splitlines(keepends=True)
-                for key, c in applied["keys"].items():
-                    write_key(lines, table, key, c["before"])
-                text = "".join(lines)
-                got = held_table(tomllib.loads(text), table)
-                if any(got.get(k) != c["before"] for k, c in applied["keys"].items()):
-                    raise Refused("the keys would not read back as they were")
-                settings.write_checked(
-                    text,
-                    lambda cfg: "",
-                    base=base_blob,
-                    actor=principals.current(),
-                    source="revert",
-                    note="optimize rollback",
-                    fence=fence,
-                )
-                how = "config.toml changed since the apply, so only the applied keys were put back"
-        except (OSError, settings.Refused, configrepo.ConfigRepoError, configrepo.StaleBase) as e:
-            raise Refused(f"rollback failed: {e}; config.toml is unchanged") from e
-    append(trail, {"event": "rollback", "how": how, "at": util.iso()})
+    try:
+        configrepo.ensure_repo()
+        live_ver = settings.current_version()
+        target_to: str | int | None = None
+        if draft_id := applied.get("draft"):
+            d = drafts.get(draft_id)
+            if d is not None and d["activated_commit"]:
+                prev_info, _ = drafts._previous_and_new_version_info(d)
+                if prev_info is not None:
+                    target_to = (
+                        prev_info["version"] if prev_info.get("version") is not None
+                        else prev_info.get("content_version") or prev_info.get("commit_sha")
+                    )
+        if target_to is None and applied.get("before_ver"):
+            target_to = applied["before_ver"]
+        if target_to is None:
+            history = configrepo.version_history("step_settings", "defaults", "config.toml")
+            if len(history) >= 2:
+                target_to = history[1]["version"]
+        if target_to is None:
+            raise Refused("no previous config version is available to roll back to")
+        drafts.rollback(
+            "step_settings",
+            "defaults",
+            target_to,
+            live_ver,
+            principals.current(),
+            presence_passed=False,
+        )
+        how = f"rolled back config.toml to version {target_to} via config.rollback"
+    except (OSError, settings.Refused, configrepo.ConfigRepoError, configrepo.StaleBase,
+            contract.Problem, drafts.PresenceRequired) as e:
+        raise Refused(f"rollback failed: {e}; config.toml is unchanged") from e
+    append(trail, {"event": "rollback", "how": how, "to": target_to, "at": util.iso()})
     print(f"rolled back: {how}")
     return 0
 

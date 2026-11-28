@@ -37,7 +37,7 @@ def diff(args):
 
 
 def config_operations():
-    return (op for op in contract.OPERATIONS if op["name"].startswith("config."))
+    return (op for op in contract.OPERATIONS if op["name"].startswith("config.") and op["method"] == "GET")
 
 
 def config_read(operation, values):

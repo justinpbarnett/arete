@@ -5,7 +5,7 @@ import sqlite3
 
 from . import db as foundation
 
-TABLES = {"config_index": "kept"}
+TABLES = {"config_index": "kept", "config_drafts": "kept"}
 
 COLUMNS = (
     "kind", "name", "origin", "path", "sha256", "version", "n",

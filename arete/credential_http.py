@@ -23,7 +23,7 @@ PAIRING_CLAIM_ROUTE = "/api/v1/auth/pairings/claim"
 TLS_OPERATIONS = {"token.issue", "token.rotate", "pairing.claim", "secret.set", "webhook.rotate"}
 PRESENCE = {"token.issue", "token.rotate", "secret.set", "secret.remove", "webhook.rotate", "push.subscribe"}
 WRITES = ("POST", "PATCH", "PUT", "DELETE")
-SCOPE = re.compile(r"read|[a-z_]+:(?:read|write)|inbox:(?:raise|resolve)|config:activate|run:start")
+SCOPE = re.compile(r"read|[a-z_]+:(?:read|write)|inbox:(?:raise|resolve)|config:(?:draft|activate)|run:start")
 AUTH_MESSAGES = {error["code"]: error["description"] for error in contract.ERRORS}
 LEGACY_SCOPES = {"skipped": "task", "checks": "check", "sessions": "session", "stage": "capture"}
 

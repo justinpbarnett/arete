@@ -77,19 +77,22 @@ def print_records(s: dict, limits) -> None:
 
 
 def print_proposals(p: dict) -> None:
-    if p["memory"]:
+    if p.get("memory"):
         print("memory facts the miner noticed (file them by hand, then `arete forget ID`):")
-    for m in p["memory"]:
+    for m in p.get("memory", ()):
         print(f"  {m['id']:<4} {m['change']}"[:200])
-    if p["hand"]:
+    if p.get("hand"):
         print("miner proposals to review by hand (use `arete forget ID` when finished):")
-    for h in p["hand"]:
+    for h in p.get("hand", ()):
         print(f"  {h['id']:<4} {h['repo']}/{h['file']}: {h['change']}"[:400])
-    if p["approve"]:
+    if p.get("approve"):
         print("global rules waiting for approval (`arete file-rule ID` writes and pushes one, `arete reject-rule ID` drops it):")
-    for r in p["approve"]:
-        writing = " (being written now)" if r["status"] == "filing" else ""
-        print(f"  {r['id']:<4} {r['repo']}/{r['file']}{writing}: {r['change']}"[:400])
+    for r in p.get("approve", ()):
+        print(f"  {r['id']:<4} {r['repo']}/{r['file']}: {r['change']}"[:400])
+    if p.get("pending"):
+        print("miner repo proposals held back (--no-apply):")
+    for r in p.get("pending", ()):
+        print(f"  {r['id']:<4} {r['repo']}/{r['file']}: {r['change']}"[:400])
 
 
 def print_skipped(skipped: list[dict]) -> None:

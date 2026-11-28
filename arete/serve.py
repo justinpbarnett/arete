@@ -589,6 +589,7 @@ class Server:
             ("workspaces", self.sweep_workspaces_when_due, ()),
             ("asks", self.expire_asks, ()), ("closed", self.release_closed_when_due, ()),
             ("inbox", self.sync_inbox, ()),
+            ("watch", self.watch_drafts, ()),
             ("remind", self.remind, ()),
         )
         for name, action, args in stages:
@@ -734,6 +735,11 @@ class Server:
         from . import inbox
 
         inbox.tick()
+
+    def watch_drafts(self) -> None:
+        from . import drafts
+
+        drafts.watch_tick()
 
     def sync_config_inbox(self) -> None:
         from . import inbox

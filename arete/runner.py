@@ -1104,6 +1104,44 @@ def _step_inputs_for(prompt: str, trace: tuple[str, str], kw: dict, resume: Sess
         if (seam := factory.inside(trace[0])) is not None:
             seam.schema = sver
 
+    if pin is not None and pin.config_dir is not None:
+        cfg_file = pin.config_dir / "config.toml"
+        if cfg_file.is_file():
+            try:
+                cfg_sha = blob_store.digest(cfg_file.read_bytes())
+                items.append({
+                    "role": "step_settings",
+                    "name": "defaults",
+                    "version": f"step_settings/defaults@{cfg_sha[:12]}",
+                    "level": "config",
+                    "sha256": cfg_sha,
+                    "call": call_no,
+                })
+            except OSError:
+                pass
+        if pin.adw and pin.adw_version:
+            items.append({
+                "role": "adw",
+                "name": pin.adw,
+                "version": pin.adw_version,
+                "level": "config",
+                "call": call_no,
+            })
+        routes_file = pin.config_dir / "routes" / "adw.toml"
+        if routes_file.is_file():
+            try:
+                rt_sha = blob_store.digest(routes_file.read_bytes())
+                items.append({
+                    "role": "routes",
+                    "name": "adw",
+                    "version": f"routes/adw@{rt_sha[:12]}",
+                    "level": "config",
+                    "sha256": rt_sha,
+                    "call": call_no,
+                })
+            except OSError:
+                pass
+
     if pin is not None and pin.expertise:
         items.append({"role": "expertise", "name": pin.expertise["path"],
                       "sha256": pin.expertise["sha256"], "call": call_no})
