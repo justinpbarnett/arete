@@ -375,8 +375,7 @@ assert (v1_run["adw"], v1_run["adw_version"], v1_run["adw_rule"]) == ("feature",
 
 # 2. Seed PR feedback on an open PR -> next run routes to revise / feedback-revise
 pr_url = "https://github.com/owner/sample/pull/1"
-with db.tx() as c:
-    c.execute("UPDATE runs SET status = 'pr', pr_url = ? WHERE id = ?", (pr_url, r1["id"]))
+assert record.move(r1["id"], "pr", ("done",), pr_url=pr_url)
 insights_store.add_feedback([{
     "pr_url": pr_url, "repo": "replay-sample", "issue": tid, "kind": "comment",
     "gh_id": 1, "body": "Please tweak", "pr_state": "OPEN", "status": "new",

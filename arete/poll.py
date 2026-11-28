@@ -62,6 +62,7 @@ from .store import orchestration as orchestration_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import specs as spec_store
+from .store import tasks as task_store
 
 MAX_STARTS_PER_POLL = 64
 FEEDBACK_PICK = "revising the PR for your review comments"
@@ -208,9 +209,10 @@ def priority_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLo
         if (ordinary_history(tid) and (row := run_store.newest_live_whole_run(repo.name, tid))
                 and not environment_gaps.was_retry(row)):
             if pipeline.recorded_path(row["id"]) not in ("feature", "patch"):
-                if tid in feedback_due:
+                pending = pending_feedback(repo.name, tid)
+                if tid in feedback_due or insights_store.feedback_turn_due(pending, quiet_since):
                     return Pick(tid, FEEDBACK_PICK, from_feedback=True)
-                if insights_store.has_new_feedback(pending_feedback(repo.name, tid)):
+                if insights_store.has_new_feedback(pending):
                     excluded.add(tid)
                     continue
             return Pick(tid, "restarting after an interruption")
@@ -224,6 +226,9 @@ def priority_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLo
             if ticket.open and not ticket.blocker and not other_routes.intersection(ticket.labels):
                 return Pick(tid, "the owner confirmed the shared check runner is ready")
     for tid in feedback_due:
+        if ordinary_history(tid):
+            return Pick(tid, FEEDBACK_PICK, from_feedback=True)
+    for tid in insights_store.feedback_due_for_open_asks(repo.name, quiet_since):
         if ordinary_history(tid):
             return Pick(tid, FEEDBACK_PICK, from_feedback=True)
     for tid in feedback_store.tickets_needing_worker(repo.name):
@@ -304,7 +309,7 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
         if repairing:
             first = ("review_repair",)
         elif feedback:
-            source = next(iter(run_store.open_runs(repo.name, ticket.id)), None)
+            source = next(iter(task_store.open_pr_runs(repo.name, ticket.id)), None)
             if not source or pipeline.recorded_path(source["id"]) not in (pipeline.ORCHESTRATED, "orchestrate"):
                 first = ("build",)
             else:
