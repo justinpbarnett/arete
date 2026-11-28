@@ -1,15 +1,21 @@
 {
-  "type": "object",
-  "properties": {
-    "step": {"type": "string", "enum": ["plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat", "classify", "loop", "session", "research", "research_plan", "research_search", "research_synthesis", "research_audit", "explain", "document", "capture_evidence", "config_ask", "check_repair", "review_repair", "ci_repair", "eval_grade", "orchestrate", "implement"]},
-    "kind": {"type": "string", "enum": ["", "feat", "fix"]},
-    "share": {"type": "number"},
-    "arm": {"$ref": "#/$defs/arm"}
-  },
-  "additionalProperties": false,
-  "required": ["step", "share", "arm"],
-  "x-arete-reach": true,
+  "anyOf": [
+    {"$ref": "#/$defs/manifest"},
+    {"$ref": "#/$defs/ab"}
+  ],
   "$defs": {
+    "ab": {
+      "type": "object",
+      "properties": {
+        "step": {"type": "string", "enum": ["plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat", "classify", "loop", "session", "research", "research_plan", "research_search", "research_synthesis", "research_audit", "explain", "document", "capture_evidence", "config_ask", "check_repair", "review_repair", "ci_repair", "eval_grade", "orchestrate", "implement"]},
+        "kind": {"type": "string", "enum": ["", "feat", "fix"]},
+        "share": {"type": "number"},
+        "arm": {"$ref": "#/$defs/arm"}
+      },
+      "additionalProperties": false,
+      "required": ["step", "share", "arm"],
+      "x-arete-reach": true
+    },
     "arm": {
       "type": "object",
       "properties": {
@@ -24,7 +30,88 @@
     },
     "experiments": {
       "type": "object",
-      "additionalProperties": {"$ref": "#"}
+      "additionalProperties": {"$ref": "#/$defs/ab"}
+    },
+    "codex_headroom": {
+      "type": "object",
+      "properties": {
+        "tokens": {"type": "integer", "minimum": 1},
+        "spend_usd": {"type": "number"}
+      },
+      "additionalProperties": false,
+      "required": ["tokens"]
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "spend_usd": {"type": "number"},
+        "minutes": {"type": "number"},
+        "calls": {"type": "integer", "minimum": 1},
+        "tokens": {"type": "integer", "minimum": 1},
+        "rounds": {"type": "integer", "minimum": 1},
+        "codex_headroom": {"$ref": "#/$defs/codex_headroom"}
+      },
+      "additionalProperties": false,
+      "required": ["spend_usd", "minutes", "calls", "tokens"]
+    },
+    "task": {
+      "type": "object",
+      "properties": {
+        "base": {"type": "string"},
+        "split": {"type": "string", "enum": ["train", "validation", "holdout"]}
+      },
+      "additionalProperties": false,
+      "required": ["split"]
+    },
+    "accept": {
+      "type": "object",
+      "properties": {
+        "baseline": {"type": "string"},
+        "split": {"type": "string", "enum": ["train", "validation", "holdout"]},
+        "min_pairs": {"type": "integer", "minimum": 1},
+        "min_difference": {"type": "number", "minimum": 0, "maximum": 1},
+        "confidence": {"type": "number"}
+      },
+      "additionalProperties": false
+    },
+    "floor": {
+      "type": "object",
+      "properties": {
+        "accept_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "max_drop": {"type": "number", "minimum": 0, "maximum": 1},
+        "min_saving": {"type": "number"}
+      },
+      "additionalProperties": false,
+      "required": ["accept_rate", "max_drop"]
+    },
+    "round": {
+      "type": "object",
+      "properties": {
+        "vary": {"type": "string"},
+        "candidates": {"type": "object", "additionalProperties": {"type": "object"}}
+      },
+      "additionalProperties": false,
+      "required": ["vary", "candidates"]
+    },
+    "manifest": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+        "repo": {"type": "string", "minLength": 1},
+        "atom": {"type": "string"},
+        "executor": {"type": "string"},
+        "repeats": {"type": "integer", "minimum": 1},
+        "cache_policy": {"type": "string"},
+        "vary": {"type": "array", "items": {"type": "string"}},
+        "arms": {"type": "object", "additionalProperties": {"type": "object"}},
+        "rounds": {"type": "array", "items": {"$ref": "#/$defs/round"}, "minItems": 1},
+        "tasks": {"type": "object", "additionalProperties": {"$ref": "#/$defs/task"}},
+        "accept": {"$ref": "#/$defs/accept"},
+        "floor": {"$ref": "#/$defs/floor"},
+        "limits": {"$ref": "#/$defs/limits"}
+      },
+      "additionalProperties": false,
+      "required": ["name", "repo", "repeats", "tasks", "limits"]
     }
   }
 }

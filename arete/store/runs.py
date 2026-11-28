@@ -14,6 +14,7 @@ from .db import (
     RECORD_TURNS_SCHEMA,
     RUN_RETENTION_SCHEMA,
     RUNS_ADW_SCHEMA,
+    RUNS_ARM_SCHEMA,
     RUNS_LINEAGE_SCHEMA,
     RUNS_PINS_SCHEMA,
     RUNS_PROMPT_BINDING_SCHEMA,
@@ -29,12 +30,17 @@ STEP_LABEL_FIELDS = frozenset(("atom", "ab", "ab_side", "effort", "tier", "kind"
 PINS_RUN_FIELDS = frozenset(("config_commit", "resolved_sha"))
 LINEAGE_RUN_FIELDS = frozenset(("continues", "chain", "restart", "started_by", "payer", "seq"))
 ADW_RUN_FIELDS = frozenset(("adw", "adw_version", "adw_rule"))
+ARM_RUN_FIELDS = frozenset(("arm",))
 TASK_IDENTITY_RUN_FIELDS = frozenset(("task_id", "issue_key", "capabilities"))
 _CHAT_STEP_RE = re.compile(r"^chat (\d+)(?: (.+))?$")
 
 
 def has_pins(c) -> bool:
     return migration_applied(RUNS_PINS_SCHEMA, c)
+
+
+def has_arm(c) -> bool:
+    return migration_applied(RUNS_ARM_SCHEMA, c)
 
 
 def has_prompt_binding(c) -> bool:
@@ -108,6 +114,8 @@ def filter_run_fields(c, fields: dict) -> dict:
         drop |= LINEAGE_RUN_FIELDS
     if not has_adw(c):
         drop |= ADW_RUN_FIELDS
+    if not has_arm(c):
+        drop |= ARM_RUN_FIELDS
     if not has_task_identity(c):
         drop |= TASK_IDENTITY_RUN_FIELDS
     if not drop:

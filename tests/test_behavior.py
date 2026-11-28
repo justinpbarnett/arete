@@ -9727,8 +9727,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 165)
-        self.assertEqual(len({op["name"] for op in operations}), 165)
+        self.assertEqual(len(operations), 168)
+        self.assertEqual(len({op["name"] for op in operations}), 168)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -21119,7 +21119,8 @@ class OptimizeDraftWatchAndTryTests(_ConfigDraftsCase):
             assert opt_draft["state"] == "valid", opt_draft
             assert opt_draft["author"] == "optimize", opt_draft
             assert opt_draft["gate"] == "B", opt_draft
-            assert opt_draft["evidence"] == ["trial-1", "trial-2"], opt_draft["evidence"]
+            assert opt_draft["evidence"]["experiment"] == "experiment:opt-search", opt_draft["evidence"]
+            assert opt_draft["evidence"]["trials"] == ["trial-1", "trial-2"], opt_draft["evidence"]
             assert configrepo.live_bytes("config.toml") == live_before
             assert paths.CONFIG_FILE.read_text(encoding="utf-8") == disk_before
             prop_items = [i for i in inbox.list(state="open", kind="proposal") if i["subject"] == f"draft:{opt_draft['numeric_id']}"]

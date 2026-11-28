@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 30
+MINOR = 31
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -127,7 +127,7 @@ RUN_TEXT = ("id", "kind", "repo", "issue", "loop", "loop_kind", "started", "fini
             "branch", "only_step", "files_purged", "records_purged", "mined_until", "stop_asked", "ab_held",
             "measured_at", "landed", "device", "model", "runner", "log", "trigger", "queue", "grp", "lock", "moved",
             "engine_sha", "label_pending", "wait_minutes", "config_commit", "resolved_sha", "continues", "chain",
-            "restart", "started_by", "payer", "adw", "adw_version", "adw_rule", "task", "issue_key", "line")
+            "restart", "started_by", "payer", "adw", "adw_version", "adw_rule", "arm", "task", "issue_key", "line")
 RUN_NUMBERS = ("pid", "cost_usd", "tokens_in", "tokens_out", "active_seconds", "verify_seconds", "verify_open_seconds",
                "repair_calls", "schema_version", "attempts", "version", "seq", "lease_id", "task_id")
 RUN_STEP_SUMMARY = obj({
@@ -754,7 +754,8 @@ OPERATIONS += [
     {**operation("config.draft", "config/{kind}/{name}/draft",
                  envelope({"draft": CONFIG_DRAFT, "report": {"anyOf": [CHECK_REPORT, {"type": "null"}]}}, ["seq", "draft"]),
                  obj({**CONFIG_ID, "body": STRING, "base_version": CONFIG_BASE_VER, "why": STRING,
-                      "instruction": STRING, "model": STRING, "path": STRING, "level": STRING, "check": BOOLEAN},
+                      "instruction": STRING, "model": STRING, "path": STRING, "level": STRING, "check": BOOLEAN,
+                      "evidence": JSON, "diff": STRING},
                      [*CONFIG_ID, "body"]),
                  {**CONFIG_EXAMPLE, "body": "max_parallel = 2\n"}, "PUT",
                  errors=("validation", "invalid_state"), success_status=201),
@@ -1350,6 +1351,37 @@ OPERATIONS += [
         obj({"view": STRING, "limit": STRING, "after": STRING}, ["view"]),
         {"view": "ready-view"},
     ),
+]
+EXPERIMENT_ARM = obj({
+    "name": STRING,
+    "ref": NULL_TEXT,
+    "commit": NULL_TEXT,
+    "resolved_sha": NULL_TEXT,
+    "settings": mapping(JSON),
+}, ["name"])
+EXPERIMENT = obj({
+    "id": STRING,
+    "subject": STRING,
+    "version": INTEGER,
+    "arms": array(EXPERIMENT_ARM),
+    "results": {"anyOf": [mapping(JSON), {"type": "null"}]},
+}, ["id", "subject", "version", "arms", "results"])
+EXPERIMENT_RUN_RESULT = {"anyOf": [
+    envelope({"experiment": EXPERIMENT, "run": NULL_RUN, "code": INTEGER}, ["seq", "experiment"]),
+    envelope({"accepted": BOOLEAN, "run": RUN, "experiment": STRING}, ["seq", "accepted", "run"]),
+]}
+OPERATIONS += [
+    operation("experiment.list", "experiments", envelope({"experiments": array(EXPERIMENT)})),
+    operation("experiment.get", "experiments/{experiment}", envelope({"experiment": EXPERIMENT}),
+              obj({"experiment": STRING}), {"experiment": "sample"}),
+    {**operation("experiment.run", "experiments/{experiment}/run", EXPERIMENT_RUN_RESULT,
+                 obj({"experiment": STRING,
+                      "mode": {**STRING, "enum": ["run", "optimize"]},
+                      "args": mapping(JSON)},
+                     ["experiment"]),
+                 {"experiment": "sample", "mode": "run"}, "POST",
+                 errors=("validation", "invalid_state")),
+     "scope": "run:start"},
 ]
 for _op in OPERATIONS:
     if _op["name"] in ("run.stop", "serve.install"):

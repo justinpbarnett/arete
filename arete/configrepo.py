@@ -709,6 +709,128 @@ def commit_bytes(commit_sha: str, path: str | Path, root: Path | None = None) ->
     return done.stdout if done.returncode == 0 else None
 
 
+def resolve_ref(ref: str, root: Path | None = None) -> str:
+    base = root or _root()
+    if not is_repo(base) or not ref:
+        return ""
+    done = _git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], base, check=False)
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def tree_sha(ref: str, root: Path | None = None) -> str:
+    base = root or _root()
+    if not is_repo(base) or not ref:
+        return ""
+    done = _git(["rev-parse", "--verify", "--quiet", f"{ref}^{{tree}}"], base, check=False)
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def parents_of(commit_sha: str, root: Path | None = None) -> list[str]:
+    base = root or _root()
+    if not is_repo(base) or not commit_sha:
+        return []
+    done = _git(["show", "-s", "--format=%P", commit_sha], base, check=False)
+    return done.stdout.strip().split() if done.returncode == 0 else []
+
+
+def parent_sha(commit_sha: str, root: Path | None = None, which: int = 1) -> str:
+    parents = parents_of(commit_sha, root)
+    return parents[which - 1] if 0 < which <= len(parents) else ""
+
+
+def blob_at(commit_sha: str, path: str | Path, root: Path | None = None) -> str:
+    base = root or _root()
+    if not is_repo(base) or not commit_sha:
+        return ABSENT
+    rel = _normalize_rel(path)
+    done = _git(["rev-parse", "--verify", "--quiet", f"{commit_sha}:{rel}"], base, check=False)
+    return done.stdout.strip() if done.returncode == 0 else ABSENT
+
+
+def commit_changed_paths(commit_sha: str, root: Path | None = None, *, base: str = "") -> list[str]:
+    repo_root = root or _root()
+    if not is_repo(repo_root) or not commit_sha:
+        return []
+    parent = base or parent_sha(commit_sha, repo_root)
+    args = (
+        ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", parent, commit_sha]
+        if parent
+        else ["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "-z", commit_sha]
+    )
+    done = _git(args, repo_root, check=False, text=False)
+    if done.returncode != 0:
+        return []
+    return sorted(p.decode("utf-8", errors="replace") for p in done.stdout.split(b"\0") if p)
+
+
+def commit_diff(base_sha: str, head_sha: str, root: Path | None = None) -> str:
+    repo_root = root or _root()
+    if not is_repo(repo_root) or not base_sha or not head_sha:
+        return ""
+    done = _git(["diff", "--no-color", base_sha, head_sha], repo_root, check=False)
+    return done.stdout if done.returncode == 0 else ""
+
+
+def _commit_ref_locked(
+    root: Path,
+    ref: str,
+    changes: dict[str, bytes | None],
+    actor: str,
+    source: str,
+    *,
+    run_id: str = "",
+    idem: str = "",
+    note: str = "",
+    draft_id: str = "",
+    allow_empty: bool = False,
+) -> str:
+    if not ref.startswith(("refs/arete/arms/", "refs/drafts/")):
+        raise ConfigRepoError(f"refused non-arm config ref {ref!r}")
+    parent = live_sha(root)
+    if not parent:
+        raise ConfigRepoError("config repo has no live commit")
+    if not changes and not allow_empty:
+        raise ConfigRepoError("configrepo.commit requires at least one file")
+    with tempfile.TemporaryDirectory(prefix="arete-ref-commit-") as tmp:
+        idx_file = Path(tmp) / "index"
+        env = _git_env(root, actor=actor)
+        env["GIT_INDEX_FILE"] = str(idx_file)
+        subprocess.run(
+            ["git", "--no-pager", "read-tree", parent],
+            cwd=root, env=env, capture_output=True, check=True, timeout=30,
+        )
+        for rel in sorted(changes):
+            data = changes[rel]
+            if data is None:
+                subprocess.run(
+                    ["git", "--no-pager", "update-index", "--force-remove", "--", rel],
+                    cwd=root, env=env, capture_output=True, check=True, timeout=30,
+                )
+            else:
+                hashed = subprocess.run(
+                    ["git", "--no-pager", "hash-object", "-w", "--stdin"],
+                    cwd=root, env=env, input=data, capture_output=True, check=True, timeout=30,
+                ).stdout.decode("ascii").strip()
+                subprocess.run(
+                    ["git", "--no-pager", "update-index", "--add", "--cacheinfo", f"100644,{hashed},{rel}"],
+                    cwd=root, env=env, capture_output=True, check=True, timeout=30,
+                )
+        tree = subprocess.run(
+            ["git", "--no-pager", "write-tree"],
+            cwd=root, env=env, capture_output=True, text=True, check=True, timeout=30,
+        ).stdout.strip()
+        msg = _format_commit_message(
+            note or f"arm commit on {ref}",
+            actor, source, run_id, idem, draft_id=draft_id,
+        )
+        commit_sha = subprocess.run(
+            ["git", "--no-pager", "commit-tree", tree, "-p", parent],
+            cwd=root, env=env, input=msg, capture_output=True, text=True, check=True, timeout=30,
+        ).stdout.strip()
+        _git(["update-ref", ref, commit_sha], root, actor=actor)
+    return commit_sha
+
+
 def commit_draft_ref(draft_id: str, path: str | Path, data: bytes, actor: str,
                      root: Path | None = None) -> tuple[str, str]:
     """Commit draft bytes over live onto refs/drafts/<draft_id> without touching live or working tree."""
@@ -1025,7 +1147,8 @@ def live_tree_files(root: Path | None = None) -> dict[str, bytes]:
 def _commit_files_locked(root: Path, changes: dict[str, bytes | None], actor: str, source: str, *,
                          run_id: str = "", idem: str = "", note: str = "", draft_id: str = "",
                          activate_c: bool = False, fence: Fence,
-                         modes: dict[str, int] | None = None, write_files: bool = True) -> str:
+                         modes: dict[str, int] | None = None, write_files: bool = True,
+                         merge_parent: str = "") -> str:
     from . import lines as lines_mod
 
     lines_mod.validate_config_line_references(changes, root)
@@ -1033,6 +1156,11 @@ def _commit_files_locked(root: Path, changes: dict[str, bytes | None], actor: st
         validator(changes, root)
     paths_sorted = sorted(changes)
     old_blobs = {rel: _live_blob(root, rel) for rel in paths_sorted}
+    merge_sha = ""
+    if merge_parent:
+        merge_sha = resolve_ref(merge_parent, root)
+        if not merge_sha:
+            raise ConfigRepoError(f"invalid merge parent commit {merge_parent!r}")
     previous_working: dict[str, bytes | None] = {}
     if write_files:
         for rel in paths_sorted:
@@ -1050,7 +1178,7 @@ def _commit_files_locked(root: Path, changes: dict[str, bytes | None], actor: st
         _git(["add", "--", *to_add], root)
     if to_del:
         _git(["rm", "-q", "-f", "--ignore-unmatch", "--", *to_del], root)
-    if _git(["diff", "--cached", "--quiet", "--", *paths_sorted], root, check=False).returncode == 0:
+    if not merge_sha and _git(["diff", "--cached", "--quiet", "--", *paths_sorted], root, check=False).returncode == 0:
         return live_sha(root)
     msg = _format_commit_message(
         note or f"config: update {', '.join(paths_sorted)}",
@@ -1058,10 +1186,42 @@ def _commit_files_locked(root: Path, changes: dict[str, bytes | None], actor: st
     )
     try:
         with _active_hook_fence(root, fence) as token:
-            _git(
-                ["commit", "-q", "-m", msg, "--", *paths_sorted],
-                root, actor=actor, fence_token=token, use_hooks=True, activate_c=activate_c,
-            )
+            if merge_sha:
+                hook = root / ".git" / "hooks" / "pre-commit"
+                if hook.is_file():
+                    hook_env = _git_env(root, actor=actor, fence_token=token, use_hooks=True, activate_c=activate_c)
+                    hook_done = subprocess.run(
+                        [str(hook)],
+                        cwd=root,
+                        env=hook_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    if hook_done.returncode != 0:
+                        raise ConfigRepoError(hook_done.stderr.strip() or hook_done.stdout.strip() or "pre-commit hook failed")
+                parent = live_sha(root)
+                tree = _git(["write-tree"], root, actor=actor).stdout.strip()
+                commit_env = _git_env(root, actor=actor, fence_token=token, activate_c=activate_c)
+                commit_done = subprocess.run(
+                    ["git", "--no-pager", "commit-tree", tree, "-p", parent, "-p", merge_sha],
+                    cwd=root,
+                    env=commit_env,
+                    input=msg,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if commit_done.returncode != 0:
+                    raise ConfigRepoError(commit_done.stderr.strip() or "git commit-tree failed")
+                new_sha = commit_done.stdout.strip()
+                _git(["update-ref", f"refs/heads/{branch_name(root)}", new_sha], root, actor=actor)
+            else:
+                _git(
+                    ["commit", "-q", "-m", msg, "--", *paths_sorted],
+                    root, actor=actor, fence_token=token, use_hooks=True, activate_c=activate_c,
+                )
     except ConfigRepoError:
         for rel in paths_sorted:
             live_data = _live_bytes(root, rel)
@@ -1166,11 +1326,12 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
 def commit(changes: dict[str, str | bytes | None], base: dict[str, str], actor: str, source: str,
            run_id: str = "", idem: str = "", *, note: str = "", draft_id: str = "",
            activate_c: bool = False, fence: Fence | None = None,
-           modes: dict[str, int] | None = None, write_files: bool = True) -> str:
+           modes: dict[str, int] | None = None, write_files: bool = True,
+           ref: str = "", allow_empty: bool = False, merge_parent: str = "") -> str:
     actor = validate_actor(actor)
     if source not in SOURCES:
         raise ConfigRepoError(f"invalid config commit source {source!r}")
-    if not changes:
+    if not changes and not (ref and allow_empty):
         raise ConfigRepoError("configrepo.commit requires at least one file")
     normalized: dict[str, bytes | None] = {}
     norm_base: dict[str, str] = {}
@@ -1179,12 +1340,13 @@ def commit(changes: dict[str, str | bytes | None], base: dict[str, str], actor: 
         rel = _normalize_rel(raw_path)
         data = None if content is None else (content.encode("utf-8") if isinstance(content, str) else bytes(content))
         normalized[rel] = data
-        if raw_path in base:
-            norm_base[rel] = base[raw_path]
-        elif rel in base:
-            norm_base[rel] = base[rel]
-        else:
-            raise ConfigRepoError(f"missing base blob for {rel}")
+        if not ref:
+            if raw_path in base:
+                norm_base[rel] = base[raw_path]
+            elif rel in base:
+                norm_base[rel] = base[rel]
+            else:
+                raise ConfigRepoError(f"missing base blob for {rel}")
         if modes and raw_path in modes:
             norm_modes[rel] = modes[raw_path]
         elif modes and rel in modes:
@@ -1195,6 +1357,21 @@ def commit(changes: dict[str, str | bytes | None], base: dict[str, str], actor: 
     with writer_lock(fence) as owned:
         if paths.DB_FILE.exists() and config_store.available():
             _reconcile_locked(root, owned)
+        if ref:
+            if normalized:
+                _validate_batch(normalized, root)
+            return _commit_ref_locked(
+                root,
+                ref,
+                normalized,
+                actor,
+                source,
+                run_id=run_id,
+                idem=idem,
+                note=note,
+                draft_id=draft_id,
+                allow_empty=allow_empty,
+            )
         if idem and (prior := _find_idem_commit(root, actor, idem)):
             return prior
         # Check each path independently for uncommitted hand edits and stale base.
@@ -1245,6 +1422,7 @@ def commit(changes: dict[str, str | bytes | None], base: dict[str, str], actor: 
             fence=owned,
             modes=norm_modes,
             write_files=write_files,
+            merge_parent=merge_parent,
         )
 
 
