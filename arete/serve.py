@@ -1487,6 +1487,7 @@ class Server:
         util.write_json(control.BEAT_FILE, {
             "release": codebase.RELEASE,
             "schema": foundation.LATEST,
+            "capabilities": list(foundation.PROCESS_CAPABILITIES),
             "db": db,
             "pid": os.getpid(), "engine": codebase.STAMP, "checkout_head": codebase.checkout_head(),
             "at": at, "started": util.iso(self.started), "ticks": self.ticks,
@@ -1545,6 +1546,7 @@ def startup_beat() -> foundation.ServeChildren:
     if beat.get("pid") != os.getpid():
         beat = {}
     util.write_json(control.BEAT_FILE, {**beat, "pid": os.getpid(), "schema": foundation.LATEST,
+                                       "capabilities": list(foundation.PROCESS_CAPABILITIES),
                                        **foundation.workspace_child_fields(children),
                                        "db": beat.get("db") or {
                                            **dbstats.empty_collection(), "status": "initial",

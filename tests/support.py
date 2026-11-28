@@ -98,3 +98,45 @@ def isolate_live_state():
         patch.start()
         unittest.addModuleCleanup(patch.stop)
     seed_db(root / "state")
+
+
+def ensure_task_id(repo, issue, *, cfg=None) -> tuple[int, str]:
+    from arete.store import principals, tasks as task_store
+
+    raw = str(issue or "").strip()
+    with foundation.tx() as c:
+        if task_store.CANONICAL_TASK_RE.fullmatch(raw) or (
+            task_store.LEGACY_TASK_RE.fullmatch(raw) and not task_store.is_contracted(c)
+        ):
+            num = task_store.parse_task_num(raw, c)
+            if num is not None:
+                return num, task_store.format_task_id(num)
+        if not raw or task_store.LEGACY_TASK_RE.fullmatch(raw):
+            repo_name = repo.name if hasattr(repo, "name") else str(repo or "")
+            created = task_store.TaskStore.create(
+                c,
+                {
+                    "repo": repo_name,
+                    "title": raw or "fixture",
+                    "body": "",
+                    "kind": "feat",
+                    "state": "ready",
+                    "owner": principals.current(),
+                    "origin": f"u:{principals.current()}",
+                },
+                principals.current(),
+            )
+            num = int(created["num"])
+            return num, task_store.format_task_id(num)
+        return task_store.TaskStore.task_for_ticket(c, repo, raw, principals.current(), cfg=cfg)
+
+
+def start_pipeline(*, repo="", issue="", cfg=None, **fields) -> str:
+    from arete import record
+
+    if "task_id" not in fields:
+        task_id, issue_key = ensure_task_id(repo, issue, cfg=cfg)
+        fields["task_id"] = task_id
+        fields.setdefault("issue_key", issue_key)
+    repo_name = repo.name if hasattr(repo, "name") else repo
+    return record.start("pipeline", repo=repo_name, issue=issue, **fields)

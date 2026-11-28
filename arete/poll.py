@@ -563,7 +563,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
             feedback = unblock.replies_after_hold(newest, held, pending_feedback(repo.name, str(tid)), attached)
             held_feedback = insights_store.has_fresh_feedback(feedback)
         if not held_feedback:
-            queued = (tracker.task_state(tid) == "todo" if isinstance(source, tracker.LocalTracker)
+            queued = (tracker.task_state(tid) in ("todo", "ready") if isinstance(source, tracker.LocalTracker)
                       else tracker.item_state(source, ticket) == "open")
             from .store import outbox as outbox_store
 

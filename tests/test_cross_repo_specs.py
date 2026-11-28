@@ -397,7 +397,7 @@ class CrossRepoCoordinationTests(unittest.TestCase):
         self.assertIn("waiting for linked spec pkg#10 to reach its required mypkg 1.2.0", why)
 
         # Package publishes and merges PR, but no release proof yet -> app STILL blocked.
-        record.start("pipeline", run_id="run-pkg-10", repo="pkg", issue="10")
+        support.start_pipeline(run_id="run-pkg-10", repo="pkg", issue="10")
         record.settle("run-pkg-10", "done", summary="Published pkg PR")
         specs.bind(pkg_ticket.spec_identity, "pkg", "10", "", lambda: "run-pkg-10")
         pkg_done = {"criterion": "mypkg 1.2.0 exports formatBadge", "procedure": "check release", "environment": "production"}
@@ -473,7 +473,7 @@ class CrossRepoCoordinationTests(unittest.TestCase):
             self.assertEqual(peers[0]["receipt_id"], "rcpt-pkg-120")
 
             # Consuming app's own orchestrator builds, verifies integrated user action, and lands its PR.
-            record.start("pipeline", run_id="run-app-20", repo="app", issue="20")
+            support.start_pipeline(run_id="run-app-20", repo="app", issue="20")
             record.settle("run-app-20", "done", summary="Verified integrated app action")
             specs.bind(app_ticket.spec_identity, "app", "20", "", lambda: "run-app-20")
             app_done = {"criterion": "User sees formatted badge from mypkg 1.2.0",
@@ -600,7 +600,7 @@ class ExplicitTwoRepoSpecTests(unittest.TestCase):
         self.assertEqual(receipt["authorized_repos"], ["pkg", "app"])
         self.assertEqual(set(receipt["delivery_obligations"]), {"pkg", "app"})
 
-        record.start("pipeline", run_id="run-two-30", repo="pkg", issue="30")
+        support.start_pipeline(run_id="run-two-30", repo="pkg", issue="30")
         record.settle("run-two-30", "done", summary="Published both PRs")
         specs.bind(ticket.spec_identity, "pkg", "30", "", lambda: "run-two-30")
         specs.advance(ticket.spec_identity, "run-two-30", "building", "published", receipt)

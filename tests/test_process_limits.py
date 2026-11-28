@@ -135,7 +135,7 @@ class Isolated(unittest.TestCase):
             return super().run(result)
 
     def made_run(self, previous="", forced=False):
-        rid = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
+        rid = support.start_pipeline(repo=self.repo.name, issue=self.ticket)
         directory = paths.RUNS_DIR / rid
         directory.mkdir()
         source = tracker.for_ticket(self.cfg, self.repo, self.ticket)
@@ -298,7 +298,7 @@ pipeline = true
                                      pilot.TASK_KIND, self.policy.signal(base).task(),
                                      {"config": digest, "engine": codebase.STAMP})
         with principals.acting("rule:poll"):
-            run_id = record.start("pipeline", repo=repo.name, issue=delivery.task)
+            run_id = support.start_pipeline(repo=repo.name, issue=delivery.task)
         tasks_store.task_set_state(delivery.task, "running")
         dispatch = zte_store.transition(delivery, "dispatching")
         running = zte_store.transition(dispatch, "running", run=run_id)
@@ -695,7 +695,7 @@ pipeline = true
                                          pilot.TASK_KIND, policy.signal(base).task(),
                                          {"config": digest, "engine": codebase.STAMP})
             with principals.acting("rule:poll"):
-                run_id = record.start("pipeline", repo=repo.name, issue=delivery.task)
+                run_id = support.start_pipeline(repo=repo.name, issue=delivery.task)
             tasks_store.task_set_state(delivery.task, "running")
             dispatch = zte_store.transition(delivery, "dispatching")
             running = zte_store.transition(dispatch, "running", run=run_id)
@@ -3382,7 +3382,7 @@ class FeedbackRevisionBudgetTests(FeedbackRevisionBudgetFixture):
 
     def test_feedback_cleanup_uses_step_execution_and_claim_owner(self):
         self.feedback_ticket()
-        other = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
+        other = support.start_pipeline(repo=self.repo.name, issue=self.ticket)
         insights_store.add_feedback([{**self.feedback_row, "gh_id": 2}])
         url = self.feedback_row["pr_url"]
         rows = insights_store.open_feedback([url])
@@ -5468,7 +5468,7 @@ class OrchestratedFinishBudgetTests(PollFixture):
             return self.dispatch_failed_finish(controller)
 
         self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, script=pipeline.Script("orchestrate", drive)), 1)
-        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "failed")
+        self.assertEqual((tasks_store.task_get(self.ticket)["state"], tasks_store.task_get(self.ticket)["fault"]), ("needs-you", 1))
         return run_store.newest_whole_run(self.repo.name, self.ticket)
 
     def test_failed_finish_on_spent_repair_chain_parks_and_ticket_edit_readmits(self):
@@ -5511,7 +5511,7 @@ class OrchestratedFinishBudgetTests(PollFixture):
         delivery = zte_store.reserve("fixture-policy", self.repo.name, "a" * 40, deadline,
                                      "Fixture ZTE task", "fix", "Fixture ZTE specification", {})
         tid = delivery.task
-        rid = record.start("pipeline", repo=self.repo.name, issue=tid)
+        rid = support.start_pipeline(repo=self.repo.name, issue=tid)
         delivery = zte_store.transition(delivery, "dispatching")
         zte_store.transition(delivery, "running", run=rid)
         directory = paths.RUNS_DIR / rid
@@ -5526,7 +5526,7 @@ class OrchestratedFinishBudgetTests(PollFixture):
 
         self.assertEqual(status, "failed")
         self.assertEqual(summary, "the orchestrator stopped without delivery")
-        self.assertEqual(tasks_store.task_get(tid)["state"], "failed")
+        self.assertEqual((tasks_store.task_get(tid)["state"], tasks_store.task_get(tid)["fault"]), ("needs-you", 1))
         self.assertFalse((directory / "parked.json").exists())
 
 
@@ -5923,7 +5923,7 @@ class OrchestrationFinishTests(Isolated):
         row = self.run_controller(lambda controller: self.controller_action(controller, *next(decisions)), code=1)
 
         self.assertEqual((row["status"], row["summary"]), ("failed", "the orchestrator stopped without delivery"))
-        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "failed")
+        self.assertEqual((tasks_store.task_get(self.ticket)["state"], tasks_store.task_get(self.ticket)["fault"]), ("needs-you", 1))
         comment, = tasks_store.task_comments(self.ticket)
         self.assertIn(row["id"], comment["body"])
         self.assertIn("Échec \\ud800 de la fusion.", comment["body"])
@@ -6428,7 +6428,7 @@ class EnvironmentRequeueTests(Isolated):
             self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, dry_run=True), 1)
         dry = run_store.newest_whole_run(self.repo.name, self.issue)
         self.assertEqual((dry["dry_run"], dry["status"], dry["failure"]), (1, "failed", None))
-        abandoned = record.start("pipeline", repo=self.repo.name, issue=self.issue, dry_run=1, pid=None)
+        abandoned = support.start_pipeline(repo=self.repo.name, issue=self.issue, dry_run=1, pid=None)
         self.time += timedelta(minutes=5)
         comments = list(self.comments)
         self.assertEqual(poll.poll(), 0)
@@ -6487,7 +6487,7 @@ class EnvironmentRequeueTests(Isolated):
                 self.assertEqual(json.loads(row["failure"])["class"], "work")
                 self.assertEqual(poll.poll(), 0)
                 self.assertIn("agent:failed", self.labels)
-            legacy = record.start("pipeline", repo=self.repo.name, issue=self.issue)
+            legacy = support.start_pipeline(repo=self.repo.name, issue=self.issue)
             record.settle(legacy, "failed", summary="crashed: Expecting value")
             self.assertEqual(poll.poll(), 0)
             self.assertIn("agent:failed", self.labels)

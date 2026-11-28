@@ -133,6 +133,7 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", resolut
         "pid": os.getpid(),
         "engine_sha": resolution.engine_sha if resolution is not None else codebase.STAMP,
         "schema_version": resolution.schema_version if resolution is not None else foundation.LATEST,
+        "capabilities": json.dumps(list(foundation.PROCESS_CAPABILITIES)),
         "continues": continues_val,
         "restart": restart_val,
         "started_by": actor,
@@ -210,7 +211,11 @@ def attach_pin(run_id: str, resolution, *, pid: int | None = None) -> None:
 def claim(run_id: str, *, pid: int | None = None, resolution=None, **fields) -> bool:
     actual_pid = os.getpid() if pid is None else pid
     blob_rows: tuple[tuple[str, str, int], ...] = ()
-    update_fields = {**fields, "pid": actual_pid}
+    update_fields = {
+        "capabilities": json.dumps(list(foundation.PROCESS_CAPABILITIES)),
+        **fields,
+        "pid": actual_pid,
+    }
     continues_val = update_fields.get("continues")
     if continues_val and not update_fields.get("chain"):
         parent = run_store.run_get(str(continues_val))
@@ -380,8 +385,12 @@ def dead_status(row: dict) -> str:
     if row.get("only_step"):
         return "interrupted"
     if row["kind"] == "pipeline":
-        earlier = [r for r in run_store.ticket_runs(row["repo"], row["issue"], limit=2, whole=True, live=True)
-                   if r["id"] != row["id"]]
+        target = int(row["task_id"]) if row.get("task_id") is not None else row["repo"]
+        earlier = [r for r in (
+            run_store.ticket_runs(target, limit=2, whole=True, live=True)
+            if isinstance(target, int)
+            else run_store.ticket_runs(row["repo"], row["issue"], limit=2, whole=True, live=True)
+        ) if r["id"] != row["id"]]
         if earlier and earlier[0]["status"] == "interrupted" and not specgraphs.unfinished(row["repo"], row["issue"]):
             return "failed"
         return "interrupted"

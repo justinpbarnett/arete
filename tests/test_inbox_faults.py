@@ -28,6 +28,7 @@ from arete.store import devices as device_store
 from arete.store import inbox as inbox_store
 from arete.store import runs as run_store
 from arete.store import tasks as task_store
+from tests import support
 from tests.test_behavior import _InboxCase
 
 
@@ -255,7 +256,7 @@ class InboxFaultsTests(_InboxCase):
 
             tid = task_store.task_add("fixture", "Verify task", "Verify task", "feat")
             with principals.acting(principals.owner()):
-                rid = record.start("pipeline", repo="fixture", issue=tid, status="failed")
+                rid = support.start_pipeline(repo="fixture", issue=tid, status="failed")
             log_path = paths.RUNS_DIR / rid / "run.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text("\n".join(f"log-line-{i}" for i in range(1, 31)) + "\n")
@@ -343,7 +344,7 @@ class InboxFaultsTests(_InboxCase):
 
             tid_ni = task_store.task_add("fixture", "Needs info task", "Needs info task", "feat")
             with principals.acting(principals.owner()):
-                rid_ni = record.start("pipeline", repo="fixture", issue=tid_ni, status="needs-info")
+                rid_ni = support.start_pipeline(repo="fixture", issue=tid_ni, status="needs-info")
             ni_s1 = run_store.queue_step(rid_ni, "plan", 1)
             run_store.fail_step(ni_s1, "ValueError: missing spec detail")
             ni_s2 = run_store.queue_step(rid_ni, "plan", 2)
@@ -354,7 +355,7 @@ class InboxFaultsTests(_InboxCase):
 
             tid_f = task_store.task_add("fixture", "Fault retry task", "Fault retry task", "feat")
             with principals.acting(principals.owner()):
-                rid_f = record.start("pipeline", repo="fixture", issue=tid_f, status="failed")
+                rid_f = support.start_pipeline(repo="fixture", issue=tid_f, status="failed")
             fs1 = run_store.queue_step(rid_f, "build", 1)
             run_store.fail_step(fs1, "TimeoutError: build timed out")
             fs2 = run_store.queue_step(rid_f, "build", 2)
@@ -391,7 +392,7 @@ class InboxFaultsTests(_InboxCase):
 
             tid_s = task_store.task_add("fixture", "Stop verbs task", "Stop verbs task", "feat")
             with principals.acting(principals.owner()):
-                rid_s = record.start("pipeline", repo="fixture", issue=tid_s, status="failed")
+                rid_s = support.start_pipeline(repo="fixture", issue=tid_s, status="failed")
             for tno in (1, 2):
                 st = run_store.queue_step(rid_s, "checks", tno)
                 run_store.fail_step(st, "OSError: disk full")
@@ -412,7 +413,7 @@ class InboxFaultsTests(_InboxCase):
 
             tid_d = task_store.task_add("fixture", "Dismiss fault task", "Dismiss fault task", "feat")
             with principals.acting(principals.owner()):
-                rid_d = record.start("pipeline", repo="fixture", issue=tid_d, status="failed")
+                rid_d = support.start_pipeline(repo="fixture", issue=tid_d, status="failed")
             ds = run_store.queue_step(rid_d, "plan", 1)
             run_store.fail_step(ds, "502 Bad Gateway from tracker")
             d_item = inbox_store.get_open_by_kind_and_subject("fault", f"step:{rid_d}/plan")
