@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from . import outbound, paths, util
+from . import environment, outbound, paths, util
 
 MAX_MEDIA_ITEMS = 6
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
@@ -420,6 +420,7 @@ def _probe_video_duration(video_path: Path) -> float | None:
             text=True,
             timeout=FFMPEG_TIMEOUT,
             check=False,
+            env=environment.build(()),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -488,6 +489,7 @@ def extract_video_keyframes(
                     text=True,
                     timeout=FFMPEG_TIMEOUT,
                     check=False,
+                    env=environment.build(()),
                 )
             except (OSError, subprocess.SubprocessError):
                 continue
@@ -516,6 +518,7 @@ def extract_video_keyframes(
                 text=True,
                 timeout=FFMPEG_TIMEOUT,
                 check=False,
+                env=environment.build(()),
             )
         except (OSError, subprocess.SubprocessError):
             pass
