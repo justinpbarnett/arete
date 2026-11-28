@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -413,11 +414,8 @@ class GitHubTracker:
         return ticket
 
     def prepare(self) -> list[str]:
-        made = [gh.ensure_label(self.repo.github, LABEL, *APPROVAL_LABEL_STYLE),
-                gh.ensure_label(self.repo.github, "arete", "5319e7", "Arete pipeline state")]
-        made += [gh.ensure_label(self.repo.github, self.label_name(s), STATE_COLORS[s], "Arete pipeline state")
-                 for s in config.STATES]
-        return [err for err in made if err]
+        err = gh.ensure_label(self.repo.github, "arete", "5319e7", "Arete pipeline state")
+        return [err] if err else []
 
     def in_zte_queue(self, tid: str) -> bool:
         issue = gh.issue(self.repo.github, int(tid))
@@ -427,18 +425,109 @@ class GitHubTracker:
         if self.in_zte_queue(tid):
             raise TaskError(ZTE_QUEUE)
 
-    def approve(self, tid: str) -> None:
-        self.require_ordinary(tid)
-        if failed := gh.ensure_label(self.repo.github, LABEL, *APPROVAL_LABEL_STYLE, restyle=False):
-            raise gh.GhError(failed)
-        gh.issue_labels(self.repo.github, int(tid), add=[LABEL])
+    def _check_cached_ordinary(self, tid: str) -> None:
+        if (cached := self._tickets.get(str(tid))) is not None and ZTE_LABEL in cached.labels:
+            raise TaskError(ZTE_QUEUE)
 
-    def label(self, tid: str, add=(), remove=()) -> str:
-        return error_of(lambda: self.require_ordinary(tid) or gh.issue_labels(
-            self.repo.github, int(tid), add=[self.label_name(s) for s in add], remove=[self.label_name(s) for s in remove]))
+    def approve(self, tid: str, *, approved_by: str | None = None, c=None) -> None:
+        from . import outbox
 
-    def comment(self, tid: str, body: str) -> str:
-        return error_of(lambda: self.require_ordinary(tid) or gh.issue_comment(self.repo.github, int(tid), body))
+        self._check_cached_ordinary(tid)
+        obj = f"github:{self.repo.github}#{int(tid)}"
+        outbox.draft(
+            c,
+            target="github",
+            kind="label",
+            object=obj,
+            body=json.dumps({"add": [LABEL], "remove": [], "family": ""}),
+            drafted_by=approved_by or "arete",
+            approved_by=approved_by,
+            slot=f"approve:{self.repo.github}#{int(tid)}:{secrets.token_hex(6)}",
+            summary=f"add {LABEL} on {self.repo.github}#{int(tid)}",
+        )
+
+    def label(self, tid: str, add=(), remove=(), *, run_id: str = "", family: str = "state",
+              slot_name: str = "", approved_by: str | None = None, c=None) -> str:
+        from . import outbox
+        from .store import db as foundation
+        from .store import outbox as outbox_store
+
+        if (cached := self._tickets.get(str(tid))) is not None and ZTE_LABEL in cached.labels:
+            return ZTE_QUEUE
+        obj = f"github:{self.repo.github}#{int(tid)}"
+        payload = json.dumps({
+            "add": [self.label_name(s) for s in add],
+            "remove": [self.label_name(s) for s in remove],
+            "family": family,
+        })
+
+        def _draft(conn) -> None:
+            if run_id:
+                name = slot_name or f"state:{outbox_store.run_kind_count(conn, run_id, 'label') + 1}"
+                slot = outbox.agent_slot(run_id, "", "label", obj, name)
+                drafted_by = f"run:{run_id}"
+            else:
+                slot = slot_name or f"label:{self.repo.github}#{int(tid)}:{secrets.token_hex(6)}"
+                drafted_by = approved_by or "arete"
+            outbox.draft(
+                conn,
+                target="github",
+                kind="label",
+                object=obj,
+                body=payload,
+                drafted_by=drafted_by,
+                approved_by=approved_by,
+                slot=slot,
+                run_id=run_id or None,
+                task_id=f"{self.repo.name}#{int(tid)}",
+                summary=f"label {self.repo.github}#{int(tid)}",
+            )
+
+        if c is not None:
+            _draft(c)
+        else:
+            with foundation.tx() as conn:
+                _draft(conn)
+        return ""
+
+    def comment(self, tid: str, body: str, *, run_id: str = "", slot_name: str = "",
+                approved_by: str | None = None, c=None) -> str:
+        from . import outbox
+        from .store import db as foundation
+        from .store import outbox as outbox_store
+
+        if (cached := self._tickets.get(str(tid))) is not None and ZTE_LABEL in cached.labels:
+            return ZTE_QUEUE
+        obj = f"github:{self.repo.github}#{int(tid)}"
+
+        def _draft(conn) -> None:
+            if run_id:
+                name = slot_name or f"say:{outbox_store.run_kind_count(conn, run_id, 'comment') + 1}"
+                slot = outbox.agent_slot(run_id, "", "comment", obj, name)
+                drafted_by = f"run:{run_id}"
+            else:
+                slot = slot_name or f"comment:{self.repo.github}#{int(tid)}:{secrets.token_hex(6)}"
+                drafted_by = approved_by or "arete"
+            outbox.draft(
+                conn,
+                target="github",
+                kind="comment",
+                object=obj,
+                body=body,
+                drafted_by=drafted_by,
+                approved_by=approved_by,
+                slot=slot,
+                run_id=run_id or None,
+                task_id=f"{self.repo.name}#{int(tid)}",
+                summary=f"comment on {self.repo.github}#{int(tid)}",
+            )
+
+        if c is not None:
+            _draft(c)
+        else:
+            with foundation.tx() as conn:
+                _draft(conn)
+        return ""
 
     def move(self, tid: str, state: str) -> str:
         return ""
@@ -658,11 +747,11 @@ class JiraTracker:
     def prepare(self) -> list[str]:
         return []
 
-    def label(self, tid: str, add=(), remove=()) -> str:
+    def label(self, tid: str, add=(), remove=(), *, run_id: str = "") -> str:
         return error_of(lambda: self.client.edit_labels(tid, [self.label_name(s) for s in add],
                                                         [self.label_name(s) for s in remove]))
 
-    def comment(self, tid: str, body: str) -> str:
+    def comment(self, tid: str, body: str, *, run_id: str = "") -> str:
         return error_of(lambda: self.client.comment(tid, body))
 
     def move(self, tid: str, state: str, *, keep_open: bool = False) -> str:
@@ -780,7 +869,7 @@ class LocalTracker:
         if not tasks_store.task_set_state(tid, "todo"):
             raise TaskError(f"no task {tid}")
 
-    def label(self, tid: str, add=(), remove=()) -> str:
+    def label(self, tid: str, add=(), remove=(), *, run_id: str = "") -> str:
         if tasks_store.task_get(tid) is None:
             return f"no task {tid}"
         if add:
@@ -791,7 +880,7 @@ class LocalTracker:
             tasks_store.task_set_state(tid, "todo", from_states=tuple(remove))
         return ""
 
-    def comment(self, tid: str, body: str) -> str:
+    def comment(self, tid: str, body: str, *, run_id: str = "") -> str:
         return "" if tasks_store.task_comment(tid, "arete", body) else f"no task {tid}"
 
     def move(self, tid: str, state: str) -> str:

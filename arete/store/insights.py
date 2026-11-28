@@ -265,7 +265,7 @@ def add_usage(row: dict, keep_days: float) -> None:
         c.execute("DELETE FROM usage WHERE at < ?", (util.iso(util.now() - timedelta(days=keep_days)),))
 
 
-OPEN_CAPTURE = "status IN ('draft', 'checking', 'filing')"
+OPEN_CAPTURE = "status IN ('draft', 'checking', 'filing', 'queued')"
 
 
 EDITABLE_CAPTURE = "status IN ('draft', 'checking')"
@@ -323,7 +323,7 @@ def capture_filed(draft_id: int, number: int, url: str, title: str) -> bool:
     now = util.iso()
     with tx() as c:
         changed = c.execute("UPDATE captures SET status = 'filed', issue = ?, issue_url = ?, issue_title = ?, filed = ?, "
-                            "updated = ?, delivery = '' WHERE id = ? AND status = 'filing'",
+                            "updated = ?, delivery = '' WHERE id = ? AND status IN ('filing', 'queued')",
                             (number, url, title, now, now, draft_id)).rowcount
         if changed:
             c.execute("UPDATE verdicts SET outcome = 'filed', outcome_at = ? WHERE run_id = ? AND kind = 'capture'",
@@ -385,7 +385,7 @@ def capture_checking(connect=reader) -> bool:
 def capture_evidence(evidence_id: int, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT e.* FROM capture_evidence e JOIN captures k ON k.id = e.capture "
-                      "WHERE e.id = ? AND k.status IN ('draft', 'checking', 'filing')", (evidence_id,)).fetchone()
+                      "WHERE e.id = ? AND k.status IN ('draft', 'checking', 'filing', 'queued')", (evidence_id,)).fetchone()
         return dict(r) if r else None
 
 
@@ -430,7 +430,7 @@ def capture_save(**fields) -> bool:
                             (*fields.values(), now)).rowcount
         if changed:
             return True
-        if c.execute("SELECT 1 FROM captures WHERE status = 'filing'").fetchone():
+        if c.execute("SELECT 1 FROM captures WHERE status IN ('filing', 'queued')").fetchone():
             return False
         cols = f"{', '.join(names)}, " if names else ""
         marks = f"{', '.join('?' * len(names))}, " if names else ""

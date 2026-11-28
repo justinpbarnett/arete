@@ -106,6 +106,12 @@ class PushedPrDraftTests(unittest.TestCase):
     URL = "https://github.com/fixture/repo/pull/7"
 
     def setUp(self):
+        from arete.store import db
+        from tests import support
+
+        state_root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(support.workspace_state(state_root))
+        db.migrate()
         # Checkout contents and model replies are inputs; publication rules stay real.
         self.root = Path("/fixture")
         self.head = "a" * 40
@@ -224,9 +230,15 @@ class PushedPrDraftTests(unittest.TestCase):
                 self.automerge(approval, "", self.verified, self.review, ready)
                 self.assertEqual(self.names("api", "-X", "PUT"), [])
                 if reason == "risk":
-                    comments = [body for args, body in self.calls if args[:2] == ["pr", "comment"]]
-                    self.assertEqual(len(comments), 1)
-                    self.assertIn("Automerge stays off for this PR", comments[0])
+                    from arete import outbox
+
+                    items = [
+                        outbox.get(it["id"])
+                        for it in outbox.list_items(state="approved")
+                        if it["kind"] == "comment" and it["object"] == "github:fixture/repo#7"
+                    ]
+                    self.assertEqual(len(items), 1)
+                    self.assertIn("Automerge stays off for this PR", items[0]["revisions"][-1]["body"])
 
     def test_unreviewed_heads_and_person_owned_prs_are_left_alone(self):
         for reason in ("moved head", "missing head", "missing lease", "unreadable", "ci stopped", "repair", "feedback"):

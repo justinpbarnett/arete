@@ -436,10 +436,46 @@ def store_answer(cfg: config.Config, repo: config.Repo, tid: str, text: str) -> 
             raise control.NotFound(f"no task {tid}")
         return ""
     tk = tracker.for_ticket(cfg, repo, tid)
+    if isinstance(tk, tracker.GitHubTracker):
+        import json
+        import secrets
+
+        from . import outbox
+
+        actor = principals.current()
+        obj = f"github:{tk.repo.github}#{int(tid)}"
+        nonce = secrets.token_hex(6)
+        now = util.iso()
+        with foundation.tx() as c:
+            outbox.draft(
+                c,
+                target="github",
+                kind="comment",
+                object=obj,
+                body=text,
+                drafted_by=actor,
+                approved_by=actor,
+                opened_at=now,
+                slot=f"answer:{tk.repo.github}#{int(tid)}:{nonce}:comment",
+                task_id=f"{repo.name}#{int(tid)}",
+                summary=f"post answer on {tk.repo.github}#{int(tid)}",
+            )
+            outbox.draft(
+                c,
+                target="github",
+                kind="label",
+                object=obj,
+                body=json.dumps({"add": [], "remove": [tk.label_name("needs-info")], "family": "state"}),
+                drafted_by=actor,
+                approved_by=actor,
+                opened_at=now,
+                slot=f"answer:{tk.repo.github}#{int(tid)}:{nonce}:label",
+                task_id=f"{repo.name}#{int(tid)}",
+                summary=f"remove {tk.label_name('needs-info')} on {tk.repo.github}#{int(tid)}",
+            )
+        return ""
     if error := tk.comment(tid, text):
         raise TrackerFailed(f"could not post the answer on {tk.ref(tid)}, so it was not stored: {error}")
-    if isinstance(tk, tracker.GitHubTracker) and (error := tk.label(tid, remove=["needs-info"])):
-        return f"the {tk.label_name('needs-info')} label stayed on {tk.ref(tid)}: {util.first_line(error, 300)}"
     return ""
 
 

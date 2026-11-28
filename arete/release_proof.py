@@ -773,7 +773,8 @@ def finish_standing(repo, ticket, tk, receipt):
                 return
             tk.require_ordinary(ticket)
             reason = f"Verified {receipt['path']} on production at {receipt['revision']}. Receipt {receipt['receipt_id']}."
-            gh.issue_close(repo.github, int(ticket), gh.marked(reason))
+            gh.issue_comment(repo.github, int(ticket), gh.marked(reason))
+            gh.issue_close(repo.github, int(ticket))
             if gh.issue_state(repo.github, int(ticket)) != "CLOSED":
                 return
         serve_guard.write(file, {"run": run["id"], "receipt": receipt["receipt_id"]})
@@ -801,7 +802,8 @@ def finish_verified(cfg, repo, ticket, revision, delivered=None):
     reason = f"Verified {proof['path']} on {proof['destination']} at {revision}. Receipt {proof['receipt_id']}."
     if isinstance(tk, tracker.GitHubTracker):
         tk.require_ordinary(ticket)
-        gh.issue_close(repo.github, int(ticket), gh.marked(reason))
+        gh.issue_comment(repo.github, int(ticket), gh.marked(reason))
+        gh.issue_close(repo.github, int(ticket))
     elif isinstance(tk, tracker.JiraTracker):
         branch = data.get("production_branch", repo.target_branch) if proof["destination"] == "production" else repo.target_branch
         tk.move_to(ticket, cfg.jira.landed.get(branch, ""))

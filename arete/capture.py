@@ -66,11 +66,9 @@ MOST_ISSUES = 100
 MOST_ISSUE_BODY = 6000
 INTERRUPTED = "The dashboard restarted before this check finished. Submit again."
 READY = "Every check passed. Press Submit to file it."
-MARK = "<!-- arete-capture:{} -->"
 FILING = "This request is being filed, so it cannot change. Press Submit to see where it stands."
-UNCERTAIN = "Filing was interrupted. Press Submit: arete looks for the issue before it files again."
-RESTARTED = ("The dashboard restarted while this request was being filed. Press Submit: arete looks for the issue "
-             "before it files again.")
+UNCERTAIN = "Filing was interrupted before queuing in the outbox. Press Submit to queue it."
+RESTARTED = "The dashboard restarted while this request was being filed. Press Submit to queue it in the outbox."
 BUG_FIELDS = (("expected", "Expected"), ("actual", "Actual"), ("steps", "Steps"))
 working: set[int] = set()
 VISION_QUESTION = ("Does the request fit what the app is for, according to the product vision? Pick whether the "
@@ -586,6 +584,8 @@ def shown(draft: dict) -> dict:
 
 def summary(draft: dict, checks: list[dict], ready: bool, uncertain: bool) -> str:
     status = draft["status"]
+    if status == "queued":
+        return draft["delivery"] or "Queued in the outbox; if a send attempt fails, it retries automatically."
     if status == "filing":
         return (draft["delivery"] or UNCERTAIN) if uncertain else "Filing the issue. This updates when it is filed."
     if draft["delivery"] and status == "draft":
@@ -873,25 +873,10 @@ def finish(draft_id: int, number: int, repo: str, title: str) -> None:
         shutil.rmtree(CAPTURES_DIR / str(draft_id), ignore_errors=True)
 
 
-def found_marker(draft_id: int, repo: str) -> dict | None:
-    mark = MARK.format(draft_id)
-    listed = gh.issues(repo, state="all", limit=MOST_ISSUES, author=gh.me())
-    return next((i for i in listed if isinstance(i, dict) and mark in str(i.get("body") or "")), None)
+def deliver(draft_id: int, revision: int, cfg: config.Config, *, submitted_by: str = "") -> None:
+    from . import outbox, principals
 
-
-def deliver(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> None:
     repo = chat.arete_repo(cfg).github
-    if resumed:
-        try:
-            if not repo:
-                raise RuntimeError("the arete repo has no github setting")
-            if found := found_marker(draft_id, repo):
-                finish(draft_id, found["number"], repo, str(found.get("title") or ""))
-                return
-        except Exception as e:
-            insights_store.capture_note(draft_id, f"GitHub did not answer ({unfinished(e)}), so arete cannot tell whether the "
-                                         f"issue was filed. Submit again.")
-            return
     draft = insights_store.capture_draft(foundation.reader)
     if not draft or draft["id"] != draft_id or draft["status"] != "filing":
         return
@@ -911,18 +896,34 @@ def deliver(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> 
     except Exception as e:
         hold_delivery(draft_id, revision, f"Not filed: {unfinished(e)}")
         return
-    try:
-        number = gh.issue_create(repo, title, f"{body}\n\n{MARK.format(draft_id)}")
-    except Exception as e:
-        insights_store.capture_note(draft_id, f"GitHub did not confirm the issue ({unfinished(e)}). Press Submit: arete looks "
-                                     f"for it before it files again.")
-        return
-    finish(draft_id, number, repo, title)
+    actor = submitted_by or principals.current()
+    now = util.iso()
+    payload = json.dumps({"title": title, "body": body, "labels": []})
+    with foundation.tx() as c:
+        item_id = outbox.draft(
+            c,
+            target="github",
+            kind="issue",
+            object=f"github:{repo}",
+            body=payload,
+            drafted_by=actor,
+            approved_by=actor,
+            opened_at=now,
+            slot=f"capture:{draft_id}",
+            summary=f"file feedback capture #{draft_id} on {repo}",
+        )
+        note = (
+            f"Queued in outbox as OB-{item_id}; if a send attempt fails, it stays in the outbox and retries automatically."
+        )
+        c.execute(
+            "UPDATE captures SET status = 'queued', delivery = ?, updated = ? WHERE id = ? AND status = 'filing'",
+            (note, now, draft_id),
+        )
 
 
-def work(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> None:
+def work(draft_id: int, revision: int, cfg: config.Config, *, skip_checks: bool = False, submitted_by: str = "") -> None:
     try:
-        if not resumed:
+        if not skip_checks:
             draft = insights_store.capture_draft(foundation.reader)
             if not draft or draft["id"] != draft_id or draft["status"] != "checking":
                 return
@@ -943,10 +944,9 @@ def work(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> Non
                 return
             if not insights_store.capture_move(draft_id, revision, "checking", "filing"):
                 return
-        deliver(draft_id, revision, cfg, resumed)
+        deliver(draft_id, revision, cfg, submitted_by=submitted_by)
     except Exception as e:
-        insights_store.capture_note(draft_id, f"Filing stopped ({unfinished(e)}). Press Submit: arete looks for the issue "
-                                     f"before it files again.")
+        insights_store.capture_note(draft_id, f"Filing stopped ({unfinished(e)}). Submit again to queue it in the outbox.")
     finally:
         insights_store.capture_end_checks(draft_id, INTERRUPTED)
         with SUBMITTING:
@@ -954,11 +954,11 @@ def work(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> Non
 
 
 def submit(body: dict) -> dict:
+    from . import factory_control, principals
     from .store import factory as factory_state
 
-    from . import factory_control
-
     version = factory_state.admit()
+    submitted_by = principals.current()
     revision = body.get("revision") if isinstance(body, dict) else None
     if type(revision) is not int:
         raise Refused("Send the draft's revision as a whole number.")
@@ -975,12 +975,12 @@ def submit(body: dict) -> dict:
         if wanted is not None and draft["id"] != wanted:
             raise Conflict("The draft changed since this page last read it. Read it again, then Submit.")
         draft_id, status = draft["id"], draft["status"]
-        if status == "checking" or draft_id in working:
+        if status in ("checking", "queued") or draft_id in working:
             return view()
         if status == "filing":
             revision = draft["revision"]
             working.add(draft_id)
-            resumed = True
+            skip_checks = True
         else:
             if draft["revision"] != revision:
                 raise Conflict("The draft changed since this page last read it. Read it again, then Submit.")
@@ -989,11 +989,12 @@ def submit(body: dict) -> dict:
             if not insights_store.capture_move(draft_id, revision, "draft", "checking", delivery=""):
                 raise Conflict("The draft changed since this page last read it. Read it again, then Submit.")
             working.add(draft_id)
-            resumed = False
+            skip_checks = False
+
         def file_draft():
             try:
                 with factory_control.activity("capture", version):
-                    work(draft_id, revision, cfg, resumed)
+                    work(draft_id, revision, cfg, skip_checks=skip_checks, submitted_by=submitted_by)
             except factory_state.Off:
                 insights_store.capture_end_checks(draft_id, INTERRUPTED)
                 with SUBMITTING:

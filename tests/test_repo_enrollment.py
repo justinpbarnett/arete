@@ -35,6 +35,8 @@ class Trackers:
     def github_call(self, args, *, input=None, write=False, **options):
         if args[:2] == ["label", "create"]:
             return ""
+        if args[:2] == ["issue", "comment"]:
+            return ""
         if args[:2] == ["issue", "create"]:
             slug = args[args.index("--repo") + 1]
             issues = self.github.setdefault(slug, {})

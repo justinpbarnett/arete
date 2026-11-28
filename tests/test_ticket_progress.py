@@ -47,7 +47,7 @@ def poll_fixture(root, state, *, dry_run=False, can_start=False, preflight=None,
 
     def comment(url, body, *, key, single_attempt):
         assert url == DRAFT and single_attempt, body
-        comments.append({"body": gh.outgoing(body, mark=True, key=key)})
+        comments.append({"body": gh.outgoing(gh.marked(body), key=key)})
         posted.write_text(json.dumps(comments))
         if state == "lost-reply" and "needs owner review" in body:
             raise gh.GhUnsure("response lost after comment was accepted")
@@ -250,7 +250,7 @@ class TicketProgressTests(ProgressFixture):
         run_lines.write(RETRY, "step_end", step="review", result="fail")
         run_lines.write(RETRY, "report", status="pr", held=why)
         key = "environment-gap-" + hashlib.sha256(f"{DRAFT}\n{RETRY}-retry".encode()).hexdigest()
-        legacy = json.dumps([{"body": gh.outgoing("", mark=True, key=key)}])
+        legacy = json.dumps([{"body": gh.outgoing(gh.marked(""), key=key)}])
         self.comments.write_text(legacy)
         self.poll_hold("deployed")
         self.assert_review_blocker({"review": why})

@@ -855,7 +855,36 @@ class Run(AgentRun):
         if self.dry_run:
             return
         others = [s for s in self.tracker.states if s != status]
-        labeled = self.tracker.label(self.tid, add=[status], remove=others)
+        if isinstance(self.tracker, tracker.GitHubTracker):
+            from . import outbox
+            from .store import db as foundation
+            from .store import outbox as outbox_store
+
+            obj = f"github:{self.tracker.repo.github}#{int(self.tid)}"
+            payload = json.dumps({
+                "add": [self.tracker.label_name(status)],
+                "remove": [self.tracker.label_name(s) for s in others],
+                "family": "state",
+            })
+            with foundation.tx() as c:
+                n = outbox_store.run_kind_count(c, self.id, "label") + 1
+                item_id = outbox.draft(
+                    c,
+                    target="github",
+                    kind="label",
+                    object=obj,
+                    body=payload,
+                    drafted_by=f"run:{self.id}",
+                    slot=outbox.agent_slot(self.id, "", "label", obj, f"state:{n}"),
+                    run_id=self.id,
+                    task_id=f"{self.repo.name}#{int(self.tid)}",
+                    summary=f"label {self.tracker.repo.github}#{int(self.tid)} {self.tracker.label_name(status)}",
+                )
+            self.log(f"drafted OB-{item_id}")
+            if moved := self.tracker.move(self.tid, status):
+                self.log(f"tracker: {util.first_line(moved, 300)}")
+            return
+        labeled = self.tracker.label(self.tid, add=[status], remove=others, run_id=self.id)
         record.note(self.id, label_pending=status if labeled else "")
         from . import release_proof
 
@@ -870,7 +899,36 @@ class Run(AgentRun):
             record.note(self.id, moved=status)
 
     def leave(self, status: str) -> None:
-        if not self.dry_run and (err := self.tracker.label(self.tid, remove=[status])):
+        if self.dry_run:
+            return
+        if isinstance(self.tracker, tracker.GitHubTracker):
+            from . import outbox
+            from .store import db as foundation
+            from .store import outbox as outbox_store
+
+            obj = f"github:{self.tracker.repo.github}#{int(self.tid)}"
+            payload = json.dumps({
+                "add": [],
+                "remove": [self.tracker.label_name(status)],
+                "family": "state",
+            })
+            with foundation.tx() as c:
+                n = outbox_store.run_kind_count(c, self.id, "label") + 1
+                item_id = outbox.draft(
+                    c,
+                    target="github",
+                    kind="label",
+                    object=obj,
+                    body=payload,
+                    drafted_by=f"run:{self.id}",
+                    slot=outbox.agent_slot(self.id, "", "label", obj, f"state:{n}"),
+                    run_id=self.id,
+                    task_id=f"{self.repo.name}#{int(self.tid)}",
+                    summary=f"remove {self.tracker.label_name(status)} on {self.tracker.repo.github}#{int(self.tid)}",
+                )
+            self.log(f"drafted OB-{item_id}")
+            return
+        if err := self.tracker.label(self.tid, remove=[status], run_id=self.id):
             self.log(f"tracker: {util.first_line(err, 300)}")
 
     def say(self, body: str, *, on_ticket: bool = False) -> str:
@@ -878,21 +936,57 @@ class Run(AgentRun):
             return ""
         body = public_text(self, body)
         if self.feedback and not on_ticket:
-            err = self.say_on_prs(body)
-        else:
-            err = self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}")
+            return self.say_on_prs(body)
+        if isinstance(self.tracker, tracker.GitHubTracker):
+            from . import outbox
+            from .store import db as foundation
+            from .store import outbox as outbox_store
+
+            obj = f"github:{self.tracker.repo.github}#{int(self.tid)}"
+            with foundation.tx() as c:
+                n = outbox_store.run_kind_count(c, self.id, "comment") + 1
+                item_id = outbox.draft(
+                    c,
+                    target="github",
+                    kind="comment",
+                    object=obj,
+                    body=f"{tracker.ARETE_TAG} {body}",
+                    drafted_by=f"run:{self.id}",
+                    slot=outbox.agent_slot(self.id, "", "comment", obj, f"say:{n}"),
+                    run_id=self.id,
+                    task_id=f"{self.repo.name}#{int(self.tid)}",
+                    summary=f"comment on {self.tracker.repo.github}#{int(self.tid)}",
+                )
+            self.log(f"drafted OB-{item_id}")
+            return ""
+        err = self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}", run_id=self.id)
         if err:
             self.log(f"tracker: {util.first_line(err, 300)}")
         return err
 
     def say_on_prs(self, body: str) -> str:
-        errors = []
+        from . import outbox
+        from .store import db as foundation
+        from .store import outbox as outbox_store
+
         for url in self.feedback_prs:
-            try:
-                gh.pr_comment(url, public_text(self, body))
-            except gh.GhError as e:
-                errors.append(f"{url}: {e}")
-        return "; ".join(errors)
+            obj = f"github:{gh.pr_repo(url)}#{gh.pr_number(url)}"
+            with foundation.tx() as c:
+                n = outbox_store.run_kind_count(c, self.id, "comment") + 1
+                item_id = outbox.draft(
+                    c,
+                    target="github",
+                    kind="comment",
+                    object=obj,
+                    body=public_text(self, body),
+                    drafted_by=f"run:{self.id}",
+                    slot=outbox.agent_slot(self.id, "", "comment", obj, f"say:{n}"),
+                    run_id=self.id,
+                    task_id=f"{self.repo.name}#{self.tid}",
+                    summary=f"comment on {url}",
+                )
+            self.log(f"drafted OB-{item_id}")
+        return ""
 
     def retry_gate_evidence(self) -> None:
         if self.dry_run or not self.repo.parts:
@@ -4074,7 +4168,21 @@ def report_automerge(run: Run, c: workspace.Checkout, hold: str, *,
         if recovery:
             recovery.comment(c, body, kind="Recovered automerge decision", during="before reporting the automerge hold")
         else:
-            gh.pr_comment(c.pr, body)
+            from . import outbox
+
+            run_id = run.id if isinstance(getattr(run, "id", None), str) else ""
+            obj = f"github:{gh.pr_repo(c.pr)}#{gh.pr_number(c.pr)}"
+            item_id = outbox.draft(
+                target="github",
+                kind="comment",
+                object=obj,
+                body=body,
+                drafted_by=f"run:{run_id}" if run_id else "arete",
+                slot=outbox.agent_slot(run_id, "", "comment", obj, "automerge-held"),
+                run_id=run_id or None,
+                summary=f"report automerge hold on {c.pr}",
+            )
+            run.log(f"drafted OB-{item_id}")
     except gh.GhError as e:
         run.log(f"automerge could not report the hold on {c.pr}: {e}")
 
@@ -4613,9 +4721,37 @@ def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, lin
         if gh.outgoing(text, kept) != body:
             gh.pr_edit_body(c.pr, text, link=kept)
         if c in pushed and c.pr not in run.feedback_prs:
-            gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report}")
+            from . import outbox
+
+            run_id = run.id if isinstance(getattr(run, "id", None), str) else ""
+            obj = f"github:{gh.pr_repo(c.pr)}#{gh.pr_number(c.pr)}"
+            item_id = outbox.draft(
+                target="github",
+                kind="comment",
+                object=obj,
+                body=f"Pushed more work for {t.ref}.\n\n{report}",
+                drafted_by=f"run:{run_id}" if run_id else "arete",
+                slot=outbox.agent_slot(run_id, "", "comment", obj, "pushed"),
+                run_id=run_id or None,
+                summary=f"report pushed work on {c.pr}",
+            )
+            run.log(f"drafted OB-{item_id}")
         elif not committed and c in standing and c.pr not in run.feedback_prs:
-            gh.pr_comment(c.pr, f"Verified and reviewed {t.ref} again; nothing new was pushed.\n\n{report}")
+            from . import outbox
+
+            run_id = run.id if isinstance(getattr(run, "id", None), str) else ""
+            obj = f"github:{gh.pr_repo(c.pr)}#{gh.pr_number(c.pr)}"
+            item_id = outbox.draft(
+                target="github",
+                kind="comment",
+                object=obj,
+                body=f"Verified and reviewed {t.ref} again; nothing new was pushed.\n\n{report}",
+                drafted_by=f"run:{run_id}" if run_id else "arete",
+                slot=outbox.agent_slot(run_id, "", "comment", obj, "verified-again"),
+                run_id=run_id or None,
+                summary=f"report re-verification on {c.pr}",
+            )
+            run.log(f"drafted OB-{item_id}")
     return ci_stopped
 
 
@@ -5797,7 +5933,20 @@ def comment_catch_up_ci(run: AgentRun, c: workspace.Checkout, ci_section: str,
         if comment:
             gh.pr_edit_comment(c.github, int(comment["id"]), body, key=key)
         else:
-            gh.pr_comment(c.pr, body, key=key)
+            from . import outbox
+
+            run_id = run.id if isinstance(getattr(run, "id", None), str) else ""
+            obj = f"github:{c.github}#{gh.pr_number(c.pr)}"
+            outbox.draft(
+                target="github",
+                kind="comment",
+                object=obj,
+                body=f"{body.rstrip()}\n\n{gh.key_mark(key)}",
+                drafted_by=f"run:{run_id}" if run_id else "arete",
+                slot=outbox.agent_slot(run_id, "", "comment", obj, f"catch-up:{c.lease}"),
+                run_id=run_id or None,
+                summary=f"post catch-up evidence on {c.pr}",
+            )
     except gh.GhError as e:
         run.log(f"ci: could not comment on {c.pr} for head {c.lease}: {util.first_line(str(e), 300)}")
 
@@ -5973,7 +6122,21 @@ def answer_feedback(run: Run, replies: list[dict], fallback: str, *,
                                       "after replying to PR feedback", thread=thread)
         try:
             with write:
-                gh.pr_reply(url, thread, public_text(run, text))
+                from . import outbox
+
+                run_id = run.id if isinstance(getattr(run, "id", None), str) else ""
+                obj = f"github:{gh.pr_repo(url)}#{gh.pr_number(url)}/r{thread}"
+                item_id = outbox.draft(
+                    target="github",
+                    kind="reply",
+                    object=obj,
+                    body=public_text(run, text),
+                    drafted_by=f"run:{run_id}" if run_id else "arete",
+                    slot=outbox.agent_slot(run_id, "", "reply", obj, f"reply:{thread}"),
+                    run_id=run_id or None,
+                    summary=f"reply to review comment {thread} on {url}",
+                )
+                run.log(f"drafted OB-{item_id}")
         except gh.GhError as e:
             run.log(f"reply to comment {thread} on {url} failed: {util.first_line(str(e), 300)}")
 
@@ -6717,6 +6880,8 @@ def sync_labels(cfg: config.Config) -> None:
         except KeyError:
             continue
         tk = tracker.for_ticket(cfg, repo, key[1])
+        if isinstance(tk, tracker.GitHubTracker):
+            continue
         err = tk.label(key[1], add=[want], remove=[s for s in tk.states if s != want])
         if err:
             print(f"{util.iso()} {tracker.run_ticket_name(r)}: could not label it {want}, trying next poll: "

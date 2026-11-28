@@ -1263,11 +1263,21 @@ def post_chat(handler, rest, query):
         return chat.send(whole_number(chat_id), handler.chat_text())
     if action == "file":
         number = whole_number(chat_id)
-        draft = handler.body().get("draft")
-        if "draft" in handler.body() and (not isinstance(draft, str) or not re.fullmatch(r"[0-9a-f]{64}", draft)):
+        body = handler.body()
+        draft = body.get("draft")
+        if "draft" in body and (not isinstance(draft, str) or not re.fullmatch(r"[0-9a-f]{64}", draft)):
             raise Refusal(400, "The draft fingerprint takes 64 lowercase hex digits.")
-        return handler.publish("/api/chats/{n}/file", {"n": str(number)},
-                               lambda publication=None: chat.file_draft(number, publication, draft=draft))
+        repo = body.get("repo")
+        if repo is not None and not isinstance(repo, str):
+            raise Refusal(400, "repo must be a string.")
+        title = body.get("title")
+        if title is not None and not isinstance(title, str):
+            raise Refusal(400, "title must be a string.")
+        return handler.publish(
+            "/api/chats/{n}/file",
+            {"n": str(number)},
+            lambda publication=None: chat.file_draft(number, publication, draft=draft, repo=repo, title=title),
+        )
     if action == "drop":
         return drop_chat(chat_id)
     raise NoRoute

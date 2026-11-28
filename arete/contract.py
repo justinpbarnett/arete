@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 16
+MINOR = 17
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -500,6 +500,10 @@ OPERATIONS += [
                 {"run": "pip-demo-1"}, "POST") for action in ("pin", "unpin")),
     operation("chat.drop", "chats/{chat}", envelope({"chat": mapping(JSON)}), obj({"chat": STRING}),
               {"chat": "1"}, "DELETE"),
+    {**operation("chat.file", "chats/{chat}/file", envelope({"item": OUTBOX_ITEM}),
+                 obj({"chat": STRING, "repo": STRING, "title": STRING, "draft": STRING}, ["chat"]),
+                 {"chat": "1"}, "POST", errors=("invalid_state", "validation"), success_status=201),
+     "scope": "task:write"},
     operation("serve.install", "serve/install", envelope({"restarting": BOOLEAN, "said": STRING}),
               method="POST"),
     operation("hook_event.list", "hook-events", envelope({"events": array(mapping(JSON))}), obj({"since": STRING}, [])),

@@ -4,7 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass, replace
 
-from . import config, factory_control, gh, jev, tracker
+from . import config, factory_control, jev, tracker
 
 FIX, FEATURE, RESEARCH, PERSON = "fix", "feature", "research", "person"
 KINDS = (FIX, FEATURE, RESEARCH, PERSON)
@@ -88,12 +88,20 @@ def classify(cfg: config.Config, repos: list[config.Repo], title: str, text: str
 def add_labels(source: tracker.Tracker, tid: str, labels: list[str]) -> None:
     labels = list(dict.fromkeys(labels))
     if isinstance(source, tracker.GitHubTracker):
-        for label in labels:
-            color, description = LABEL_STYLES[label]
-            if error := gh.ensure_label(source.repo.github, label, color, description, restyle=False):
-                raise gh.GhError(error)
-        source.require_ordinary(tid)
-        gh.issue_labels(source.repo.github, int(tid), add=labels)
+        import secrets
+
+        from . import outbox
+
+        source._check_cached_ordinary(tid)
+        outbox.draft(
+            target="github",
+            kind="label",
+            object=f"github:{source.repo.github}#{int(tid)}",
+            body=json.dumps({"add": labels, "remove": [], "family": ""}),
+            drafted_by="intake",
+            slot=f"intake:{source.repo.github}#{int(tid)}:{','.join(sorted(labels))}:{secrets.token_hex(4)}",
+            summary=f"add {', '.join(labels)} on {source.repo.github}#{int(tid)}",
+        )
     elif isinstance(source, tracker.JiraTracker):
         source.client.edit_labels(tid, labels)
 

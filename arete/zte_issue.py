@@ -140,7 +140,7 @@ def reference(claim: Claim, *, explicit: bool = False) -> str:
 
 
 def pr_body(claim: Claim, *, explicit: bool = False) -> gh.Outgoing:
-    return gh.outgoing("Verified one-line README correction.", link=reference(claim, explicit=explicit), mark=True)
+    return gh.outgoing(gh.marked("Verified one-line README correction."), link=reference(claim, explicit=explicit))
 
 
 def require_issue(identity: Identity, claim: Claim, repo: dict) -> dict:

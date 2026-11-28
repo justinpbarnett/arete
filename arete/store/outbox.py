@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from contextlib import nullcontext
 
@@ -342,6 +343,13 @@ def insert_draft(
     body: str,
     spans: list[dict[str, int | str]],
     now: str,
+    review: str = "",
+    state: str = "draft",
+    opened_at: str | None = None,
+    approved_by: str | None = None,
+    approved_rule: str | None = None,
+    approved_rule_version: str | None = None,
+    send_at: str | None = None,
 ) -> dict:
     tag = foundation.metadata(c)["instance_tag"]
     cur = c.execute(
@@ -349,7 +357,7 @@ def insert_draft(
         "(marker, target, kind, object, audience, posts_as, task_id, ref_id, run_id, step, loop, "
         " drafted_by, slot, rev, state, base_remote_updated, summary, plain_summary, review, "
         " shape, version, created, updated) "
-        "VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'draft', ?, ?, '', '', 1, 1, ?, ?)",
+        "VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'draft', ?, ?, '', ?, 1, 1, ?, ?)",
         (
             target,
             kind,
@@ -365,13 +373,21 @@ def insert_draft(
             slot,
             base_remote_updated,
             summary,
+            review,
             now,
             now,
         ),
     )
     numeric_id = int(cur.lastrowid)
     marker = f"arete:{tag}:ob-{numeric_id}"
-    c.execute("UPDATE outbox SET marker = ? WHERE id = ?", (marker, numeric_id))
+    if state == "approved":
+        c.execute(
+            "UPDATE outbox SET marker = ?, state = 'approved', opened_at = ?, approved_by = ?, "
+            "approved_rule = ?, approved_rule_version = ?, send_at = ? WHERE id = ?",
+            (marker, opened_at, approved_by, approved_rule, approved_rule_version, send_at, numeric_id),
+        )
+    else:
+        c.execute("UPDATE outbox SET marker = ? WHERE id = ?", (marker, numeric_id))
     c.execute(
         "INSERT INTO outbox_revisions (item, rev, base_rev, by, body, at) VALUES (?, 1, NULL, ?, ?, ?)",
         (numeric_id, drafted_by, body, now),
@@ -470,7 +486,14 @@ def due_candidates(now_iso: str, connect=reader) -> list[tuple[int, int]]:
 def claim_due(c, numeric_id: int, expected_version: int, now_iso: str) -> tuple[dict, int] | None:
     changed = c.execute(
         "UPDATE outbox SET state = 'sending', version = version + 1, attempts = attempts + 1, updated = ? "
-        "WHERE id = ? AND state = 'approved' AND send_at <= ? AND version = ? AND legacy_approval IS NULL",
+        "WHERE id = ? AND state = 'approved' AND send_at <= ? AND version = ? AND legacy_approval IS NULL "
+        "AND (object = '' OR NOT EXISTS ("
+        "    SELECT 1 FROM outbox earlier "
+        "    WHERE earlier.object = outbox.object "
+        "      AND earlier.id < outbox.id "
+        "      AND earlier.state IN ('approved', 'sending') "
+        "      AND earlier.legacy_approval IS NULL"
+        "))",
         (now_iso, numeric_id, now_iso, expected_version),
     ).rowcount
     if changed != 1:
@@ -483,6 +506,126 @@ def claim_due(c, numeric_id: int, expected_version: int, now_iso: str) -> tuple[
     )
     emit_event(c, "outbox.changed", row, {"attempt": attempt_n})
     return row, attempt_n
+
+
+def is_state_label_body(body: str) -> bool:
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return False
+    return isinstance(parsed, dict) and parsed.get("family") == "state"
+
+
+def _row_is_state_label(c, row: dict) -> bool:
+    if row["kind"] != "label":
+        return False
+    rev = latest_revision(c, int(row["id"]), int(row["rev"]))
+    return rev is not None and is_state_label_body(rev["body"])
+
+
+def discard_item(
+    c,
+    numeric_id: int,
+    now_iso: str,
+    *,
+    expected_states: tuple[str, ...] = ("draft", "edited", "approved", "held", "failed"),
+) -> dict | None:
+    row = get_row(c, numeric_id)
+    if row is None or row["state"] not in expected_states:
+        return None
+    return cas_update(
+        c,
+        numeric_id,
+        expected_version=int(row["version"]),
+        expected_states=expected_states,
+        fields={"state": "discarded", "send_at": None, "updated": now_iso},
+    )
+
+
+def discard_older_state_labels(c, obj: str, before_id: int, now_iso: str) -> list[int]:
+    if not obj:
+        return []
+    rows = c.execute(
+        "SELECT * FROM outbox WHERE object = ? AND kind = 'label' AND id < ? "
+        "AND state IN ('draft', 'edited', 'approved', 'held', 'failed') AND legacy_approval IS NULL "
+        "ORDER BY id ASC",
+        (obj, before_id),
+    ).fetchall()
+    discarded: list[int] = []
+    for raw in rows:
+        row = dict(raw)
+        if _row_is_state_label(c, row):
+            if discard_item(c, int(row["id"]), now_iso) is not None:
+                discarded.append(int(row["id"]))
+    return discarded
+
+
+def has_newer_active_state_label(c, obj: str, after_id: int) -> bool:
+    if not obj:
+        return False
+    rows = c.execute(
+        "SELECT * FROM outbox WHERE object = ? AND kind = 'label' AND id > ? "
+        "AND state NOT IN ('rejected', 'discarded') AND legacy_approval IS NULL "
+        "ORDER BY id ASC",
+        (obj, after_id),
+    ).fetchall()
+    return any(_row_is_state_label(c, dict(raw)) for raw in rows)
+
+
+def discard_older_board_items(c, obj: str, before_id: int, now_iso: str) -> list[int]:
+    if not obj:
+        return []
+    rows = c.execute(
+        "SELECT id FROM outbox WHERE object = ? AND kind = 'issue' AND slot LIKE 'board:%' AND id < ? "
+        "AND state IN ('draft', 'edited', 'approved', 'held', 'failed') AND legacy_approval IS NULL "
+        "ORDER BY id ASC",
+        (obj, before_id),
+    ).fetchall()
+    discarded: list[int] = []
+    for r in rows:
+        if discard_item(c, int(r["id"]), now_iso) is not None:
+            discarded.append(int(r["id"]))
+    return discarded
+
+
+def run_kind_count(c, run_id: str, kind: str) -> int:
+    if not available(c):
+        return 0
+    row = c.execute(
+        "SELECT COUNT(*) FROM outbox WHERE run_id = ? AND kind = ? AND legacy_approval IS NULL",
+        (run_id, kind),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def pending_label_item(obj: str, connect=reader) -> int | None:
+    if not obj:
+        return None
+    with connect() as c:
+        if not available(c):
+            return None
+        row = c.execute(
+            "SELECT id FROM outbox WHERE kind = 'label' AND object = ? "
+            "AND state NOT IN ('sent', 'rejected', 'discarded') AND legacy_approval IS NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (obj,),
+        ).fetchone()
+        return int(row["id"]) if row is not None else None
+
+
+def newest_sent_board_issue(repo: str, connect=reader) -> int | None:
+    with connect() as c:
+        if not available(c):
+            return None
+        row = c.execute(
+            "SELECT sent_ref FROM outbox WHERE kind = 'issue' AND object = ? AND slot LIKE ? "
+            "AND state = 'sent' AND sent_ref IS NOT NULL AND legacy_approval IS NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (f"github:{repo}", f"board:{repo}:create:%"),
+        ).fetchone()
+        if row is None or not str(row["sent_ref"]).isdigit():
+            return None
+        return int(row["sent_ref"])
 
 
 def settle_sending(

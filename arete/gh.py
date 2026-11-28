@@ -12,12 +12,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
-import uuid
 from collections.abc import Sequence
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import timedelta
 from urllib.parse import quote, urlencode, urlsplit
 
 from . import accounts, config, outbound, paths, secret_move, secretstore, util
@@ -145,7 +143,7 @@ def marked(body: str) -> str:
 def has_arete_mark(body: str | None) -> bool:
     text = body or ""
     tag, accepts_bare = _mark_meta()
-    if tag and f"<!-- arete:{tag} -->" in text:
+    if tag and (f"<!-- arete:{tag} -->" in text or f"<!-- arete:{tag}:" in text):
         return True
     return accepts_bare and ARETE_MARK in text
 
@@ -321,11 +319,10 @@ def ensure_sub_issue(repo: str, parent: int, child: int) -> None:
        input=Outgoing(json.dumps({"sub_issue_id": child_id, "replace_parent": False})), write=True, retry=False)
 
 
-def outgoing(text: str, link: str = "", mark: bool = False, key: str = "") -> Outgoing:
+def outgoing(text: str, link: str = "", key: str = "") -> Outgoing:
     text = outbound.inert(outbound.screen(text))
     if link:
         text = f"{outbound.screen(link)}\n\n{text}"
-    text = marked(text) if mark else text
     return Outgoing(f"{text.rstrip()}\n\n{key_mark(key)}" if key else text)
 
 
@@ -342,28 +339,59 @@ def recovery_lookup(lookup):
         raise GhUnsure(f"GitHub reply was lost; could not reconcile the write: {e}") from e
 
 
-def comment_key(path: str, key: str, start):
-    query = urlencode({"since": util.iso(start - timedelta(seconds=60)), "per_page": 100})
-    pages = gh_json(["api", f"{path}?{query}", "--paginate", "--slurp"])
-    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-        raise GhUnsure("GitHub comment lookup returned no list")
-    return next((row for page in pages for row in page if key_mark(key) in (row.get("body") or "")), None)
-
-
-def keyed_comment(args: list[str], body: str, path: str, mark: bool = False, envelope: bool = False,
-                  *, key: str = "", single_attempt: bool = False) -> str:
-    key, start = key or uuid.uuid4().hex, util.now()
-    payload = outgoing(body, mark=mark, key=key)
-    if envelope:
-        payload = Outgoing(json.dumps({"body": payload}))
+def _parse_json_reply(raw: str, label: str) -> dict:
     try:
-        return gh(args, input=payload, write=True).strip()
-    except GhUnsure:
-        if single_attempt:
-            raise
-        if found := recovery_lookup(lambda: comment_key(path, key, start)):
-            return found.get("html_url", "")
-        return gh(args, input=payload, write=True).strip()
+        parsed = json.loads(raw) if raw.strip() else None
+    except ValueError as error:
+        raise GhUnsure(f"GitHub {label} reply was not valid JSON") from error
+    if not isinstance(parsed, dict):
+        raise GhUnsure(f"GitHub {label} reply was not an object")
+    return parsed
+
+
+def api_create_issue(repo: str, title: str, body: str, labels: Sequence[str] = ()) -> tuple[int, str]:
+    _safe_repo(repo)
+    data: dict[str, object] = {"title": outbound.screen(title), "body": str(outgoing(body))}
+    if labels:
+        data["labels"] = list(labels)
+    raw = gh(
+        ["api", "--method", "POST", f"repos/{repo}/issues", "--input", "-"],
+        input=Outgoing(json.dumps(data)),
+        write=True,
+    )
+    reply = _parse_json_reply(raw, "issue")
+    number = reply.get("number")
+    if number is None:
+        raise GhUnsure("GitHub issue reply did not include a number")
+    return int(number), str(reply.get("html_url") or issue_url(repo, number))
+
+
+def api_create_comment(repo: str, number: int, body: str) -> tuple[str, str]:
+    _safe_repo(repo)
+    raw = gh(
+        ["api", "--method", "POST", f"repos/{repo}/issues/{int(number)}/comments", "--input", "-"],
+        input=Outgoing(json.dumps({"body": str(outgoing(body))})),
+        write=True,
+    )
+    reply = _parse_json_reply(raw, "comment")
+    comment_id = reply.get("id")
+    if comment_id is None:
+        raise GhUnsure("GitHub comment reply did not include an id")
+    return str(comment_id), str(reply.get("html_url") or "")
+
+
+def api_create_reply(repo: str, number: int, comment_id: int, body: str) -> tuple[str, str]:
+    _safe_repo(repo)
+    raw = gh(
+        ["api", "--method", "POST", f"repos/{repo}/pulls/{int(number)}/comments/{int(comment_id)}/replies", "--input", "-"],
+        input=Outgoing(json.dumps({"body": str(outgoing(body))})),
+        write=True,
+    )
+    reply = _parse_json_reply(raw, "reply")
+    reply_id = reply.get("id")
+    if reply_id is None:
+        raise GhUnsure("GitHub reply response did not include an id")
+    return str(reply_id), str(reply.get("html_url") or "")
 
 
 def split_link(body: str, links) -> tuple[str, str]:
@@ -381,27 +409,12 @@ def split_link(body: str, links) -> tuple[str, str]:
     return "", body
 
 
-def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *, key: str = "",
+def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *,
                  single_attempt: bool = False) -> int:
-    key = key or uuid.uuid4().hex
     args = ["issue", "create", "--repo", repo, "--title", outbound.screen(title), "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
-    payload = outgoing(body, key=key)
-    try:
-        reply = gh(args, input=payload, write=True)
-    except GhUnsure:
-        if single_attempt:
-            raise
-
-        def find():
-            rows = gh_json(["issue", "list", "--repo", repo, "--state", "all", "--limit", "20", "--json", "number,body"])
-            if not isinstance(rows, list):
-                raise GhUnsure("GitHub issue lookup returned no list")
-            return next((r["number"] for r in rows if key_mark(key) in (r.get("body") or "")), None)
-        if number := recovery_lookup(find):
-            return int(number)
-        reply = gh(args, input=payload, write=True)
+    reply = gh(args, input=outgoing(body), write=True)
     parts = reply.strip().splitlines()
     if not parts or not (number := re.fullmatch(r"https://[^/]+/[^/]+/[^/]+/issues/([1-9][0-9]*)/?", parts[-1])):
         raise GhUnsure("GitHub did not confirm the created issue number")
@@ -451,30 +464,16 @@ def find_pr_marker(repo: str, branch: str, marker: str, *, author: str = "") -> 
 
 def issue_comment(repo: str, number: int, body: str, *, return_url: bool = False,
                   single_attempt: bool = False) -> str | None:
-    url = keyed_comment(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], body,
-                        f"repos/{repo}/issues/{number}/comments", single_attempt=single_attempt)
+    url = gh(
+        ["issue", "comment", str(number), "--repo", repo, "--body-file", "-"],
+        input=outgoing(body),
+        write=True,
+    ).strip()
     return url if return_url else None
 
 
-def issue_close(repo: str, number: int, comment: str = "") -> None:
-    key, start = uuid.uuid4().hex, util.now()
-    args = ["issue", "close", str(number), "--repo", repo]
-    if comment:
-        args += ["--comment", outgoing(comment, key=key)]
-    try:
-        gh(args, write=True)
-    except GhUnsure:
-        def reconcile():
-            status = issue_state(repo, number)
-            if status == "CLOSED":
-                return None
-            if status != "OPEN":
-                raise GhUnsure(f"GitHub issue state is {status!r}")
-            found = comment and comment_key(f"repos/{repo}/issues/{number}/comments", key, start)
-            return args[:5] if found else args
-        retry = recovery_lookup(reconcile)
-        if retry is not None:
-            gh(retry, write=True)
+def issue_close(repo: str, number: int) -> None:
+    gh(["issue", "close", str(number), "--repo", repo], write=True)
 
 
 def issue_labels(repo: str, number: int, add: list[str] = (), remove: list[str] = (), *, single_attempt=False) -> None:
@@ -484,7 +483,7 @@ def issue_labels(repo: str, number: int, add: list[str] = (), remove: list[str] 
     for lb in remove:
         args += ["--remove-label", lb]
     if len(args) > 5:
-        gh(args, write=single_attempt)
+        gh(args, write=True)
 
 
 def issue_state(repo: str, number: int) -> str:
@@ -496,8 +495,12 @@ def issue_state(repo: str, number: int) -> str:
         raise
 
 
+def issue_body(repo: str, number: int) -> str:
+    return ((gh_json(["issue", "view", str(number), "--repo", repo, "--json", "body"]) or {}).get("body") or "").replace("\r\n", "\n")
+
+
 def issue_edit_body(repo: str, number: int, body: str) -> None:
-    gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
+    gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body), write=True)
 
 
 def issue_graph(repo: str, number: int, query: str, *, paginate: bool = False) -> list[dict]:
@@ -593,7 +596,7 @@ def prerequisite_pulls(repo: str, number: int) -> dict[tuple[str, int], tuple[st
 
 
 def issue_reopen(repo: str, number: int) -> None:
-    gh(["issue", "reopen", str(number), "--repo", repo])
+    gh(["issue", "reopen", str(number), "--repo", repo], write=True)
 
 
 def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Sequence[str] = (),
@@ -656,11 +659,9 @@ def pr_write_body(url: str, body: Outgoing) -> None:
     gh(["pr", "edit", _safe_target(url, "PR"), "--body-file", "-"], input=body)
 
 
-def pr_comment(url: str, body: str, *, key: str = "", single_attempt: bool = False) -> None:
+def pr_comment(url: str, body: str, *, single_attempt: bool = False) -> None:
     url = _safe_target(url, "PR")
-    keyed_comment(["pr", "comment", url, "--body-file", "-"], body,
-                  f"repos/{pr_repo(url)}/issues/{pr_number(url)}/comments", mark=True,
-                  key=key, single_attempt=single_attempt)
+    gh(["pr", "comment", url, "--body-file", "-"], input=outgoing(body), write=True)
 
 
 def find_own_pr_comment(repo: str, number: int, *markers: str) -> dict | None:
@@ -674,15 +675,18 @@ def find_own_pr_comment(repo: str, number: int, *markers: str) -> dict | None:
 
 
 def pr_edit_comment(repo: str, comment_id: int, body: str, *, key: str = "") -> None:
-    payload = Outgoing(json.dumps({"body": outgoing(body, mark=True, key=key)}))
+    payload = Outgoing(json.dumps({"body": outgoing(marked(body), key=key)}))
     gh(["api", "-X", "PATCH", f"repos/{repo}/issues/comments/{comment_id}", "--input", "-"],
        input=payload, write=True)
 
 
 def pr_reply(url: str, comment_id: int, body: str) -> None:
-    keyed_comment(["api", f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments/{comment_id}/replies", "-X", "POST",
-                   "--input", "-"], body, f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments",
-                  mark=True, envelope=True)
+    payload = Outgoing(json.dumps({"body": outgoing(body)}))
+    gh(
+        ["api", f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments/{comment_id}/replies", "-X", "POST", "--input", "-"],
+        input=payload,
+        write=True,
+    )
 
 
 def ensure_branch(repo: str, branch: str) -> None:
@@ -729,9 +733,31 @@ def blob_url(repo: str, commit: str, path: str) -> str:
     return f"https://github.com/{_safe_repo(repo)}/blob/{_safe_ref_path(commit)}/{_safe_content_path(path)}"
 
 
-def api_list(path: str) -> list[dict]:
-    pages = gh_json(["api", f"{path}?per_page=100", "--paginate", "--slurp"]) or []
-    return [item for page in pages for item in page]
+def api_list(path: str, query: dict[str, object] | None = None, *, strict: bool = False) -> list[dict]:
+    params: dict[str, object] = {**(query or {}), "per_page": 100}
+    if query and "per_page" in query:
+        params["per_page"] = query["per_page"]
+    endpoint = f"{path}?{urlencode(params)}"
+    pages = gh_json(["api", endpoint, "--paginate", "--slurp"])
+    if pages is None:
+        if strict:
+            raise GhUnsure("GitHub lookup returned no list")
+        return []
+    if not isinstance(pages, list):
+        raise GhUnsure("GitHub lookup returned no list")
+    rows: list[dict] = []
+    for entry in pages:
+        if isinstance(entry, list):
+            for item in entry:
+                if isinstance(item, dict):
+                    rows.append(item)
+                elif strict:
+                    raise GhUnsure("GitHub lookup returned an unexpected entry")
+        elif isinstance(entry, dict):
+            rows.append(entry)
+        elif strict:
+            raise GhUnsure("GitHub lookup returned an unexpected entry")
+    return rows
 
 
 DEPENDABOT_OFF = "Dependabot alerts are disabled"

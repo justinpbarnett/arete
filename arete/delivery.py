@@ -51,6 +51,8 @@ class AlreadyDecided(ValueError):
 def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, trial: bool, log,
             cfg: config.Config) -> None:
     for spec in loop.emits:
+        if not trial and spec["type"] == "ticket" and spec.get("tracker", "github") == "github":
+            continue
         emit = EMITS[spec["type"]]
         for batch in emit.batches(findings, outcome):
             target = emit.resolve(spec, batch, outcome, cfg) if isinstance(emit, Ticket) else spec
@@ -102,11 +104,14 @@ def objections(loop: Loop, run_id: str, outcome: dict, cfg: config.Config) -> di
 
 @factory_control.work
 def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, *, wrap_crashes: bool = False,
-         publication=None) -> str:
+         publication=None, approval_id: int | None = None, approver: str = "") -> str:
     kind = delivery["type"]
     try:
         args = delivery["item"], delivery.get("batch") or [], loop_name, run_id, cfg
-        return EMITS[kind].execute(*args, publication=publication) if publication else EMITS[kind].execute(*args)
+        emit = EMITS[kind]
+        if isinstance(emit, Ticket):
+            return emit.execute(*args, publication=publication, approval_id=approval_id, approver=approver)
+        return emit.execute(*args, publication=publication) if publication else emit.execute(*args)
     except (*SAYS_WHY, KeyError) as e:
         raise Failed(why_failed(kind, e), e) from e
     except Exception as e:
@@ -259,7 +264,8 @@ def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...]
 
     with renewed(approval_id, token):
         try:
-            done = send(delivery, row["loop"], row["run_id"], cfg, wrap_crashes=True, publication=publication)
+            done = send(delivery, row["loop"], row["run_id"], cfg, wrap_crashes=True, publication=publication,
+                        approval_id=approval_id, approver=by)
             with foundation.tx():
                 landed = settle_as("done", "approved", done)
                 if landed and publication:

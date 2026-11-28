@@ -612,8 +612,20 @@ def eval_pr(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, fork: 
             if md and miner_pr(repo, url, pr.base) == pr:
                 if require_automerge and not decides_repo(cfg, repo):
                     return
-                gh.pr_comment(url, md)
-                print(f"{repo.name}: {what} posted to {url}")
+                from . import outbox
+
+                obj = f"github:{repo.github}#{pr.number}"
+                kind_key = what.replace(" ", "-")
+                item_id = outbox.draft(
+                    target="github",
+                    kind="comment",
+                    object=obj,
+                    body=md,
+                    drafted_by="miner",
+                    slot=f"miner-eval:{repo.github}#{pr.number}:{kind_key}:{pr.head}",
+                    summary=f"post {what} on {url}",
+                )
+                print(f"{repo.name}: {what} drafted as OB-{item_id} for {url}")
         except Exception as e:
             print(f"{repo.name}: {what} on {pr.branch} failed: {type(e).__name__}: {e}")
 
@@ -697,12 +709,23 @@ def post_eval_feedback(cfg: config.Config, repo: config.Repo, url: str, pr: Mine
         status = "Incomplete eval tasks: none."
     body = "\n\n".join(filter(None, [closing, status, pr.commits(), report.markdown.strip(), answer, marker,
                                      incomplete_marker if incomplete else ""]))
-    if previous.startswith(gh.outgoing(body, mark=True)):
+    if previous.startswith(gh.outgoing(body.rstrip())):
         return ""
     if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before eval feedback could be posted"):
         return refusal
     if comment is None:
-        gh.pr_comment(url, body)
+        from . import outbox
+
+        obj = f"github:{repo.github}#{pr.number}"
+        outbox.draft(
+            target="github",
+            kind="comment",
+            object=obj,
+            body=body,
+            drafted_by="miner",
+            slot=f"miner-eval-feedback:{repo.github}#{pr.number}:{pr.head}",
+            summary=f"post eval feedback on {url}",
+        )
     else:
         gh.pr_edit_comment(repo.github, int(comment["id"]), body)
     return ""

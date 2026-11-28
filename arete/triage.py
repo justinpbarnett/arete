@@ -306,19 +306,48 @@ class GitHubSource(Source):
     def route(self, repo: str) -> str:
         return ""
 
-    def comment(self, ref: str, text: str, *, return_url=False) -> str | None:
+    def comment(self, ref: str, text: str, *, return_url=False, approved_by: str | None = None, c=None) -> str | None:
+        import secrets
+
+        from . import outbox
+
         tid = self.tid(ref)
-        self.issues.require_ordinary(tid)
-        number = int(tid)
-        if return_url:
-            return gh.issue_comment(self.key, number, text, return_url=True, single_attempt=True)
-        return gh.issue_comment(self.key, number, text)
+        obj = f"github:{self.key}#{int(tid)}"
+        outbox.draft(
+            c,
+            target="github",
+            kind="comment",
+            object=obj,
+            body=text,
+            drafted_by=approved_by or "triage",
+            approved_by=approved_by,
+            slot=f"triage:{ref}:comment:{secrets.token_hex(6)}",
+            summary=f"comment on {self.key}#{int(tid)}",
+        )
+        return "" if return_url else None
 
     def find_comment(self, ref: str, marker: str) -> str:
         return gh.find_issue_comment_marker(self.key, int(self.tid(ref)), marker)
 
-    def approve(self, r: dict) -> None:
-        intake.add_labels(self.issues, self.tid(r["ref"]), labels_to_add(r))
+    def approve(self, r: dict, *, approved_by: str | None = None, c=None) -> None:
+        import secrets
+
+        from . import outbox
+
+        tid = self.tid(r["ref"])
+        labels = list(dict.fromkeys(labels_to_add(r)))
+        obj = f"github:{self.key}#{int(tid)}"
+        outbox.draft(
+            c,
+            target="github",
+            kind="label",
+            object=obj,
+            body=json.dumps({"add": labels, "remove": [], "family": ""}),
+            drafted_by=approved_by or "triage",
+            approved_by=approved_by,
+            slot=f"triage:{r['ref']}:{r.get('updated') or secrets.token_hex(6)}:approve",
+            summary=f"add {', '.join(labels)} on {self.key}#{int(tid)}",
+        )
 
 
 TriageSource = JiraSource | GitHubSource
@@ -668,6 +697,11 @@ def approve(cfg: config.Config, src: TriageSource, r: dict) -> str:
 
 
 def to_pipeline(src: TriageSource, r: dict, sent_by: str) -> None:
+    if isinstance(src, GitHubSource):
+        with foundation.tx() as c:
+            src.approve({**r, "automatic": sent_by == "triage"}, c=c)
+            record_send(r, sent_by)
+        return
     src.approve({**r, "automatic": sent_by == "triage"})
     with foundation.tx():
         record_send(r, sent_by)
@@ -816,8 +850,49 @@ def comment_target(src, row):
 
 def send_to_tracker(src, row, comment, publication, *, revalidate=None):
     ref = row["ref"]
-    labels = " and ".join(labels_to_add(row))
+    labels_list = list(dict.fromkeys(labels_to_add({**row, "automatic": False})))
+    labels = " and ".join(labels_list)
     url = row["url"]
+    if isinstance(src, GitHubSource):
+        from . import outbox
+
+        actor = principals.current()
+        now = util.iso()
+        tid = src.tid(ref)
+        obj = f"github:{src.key}#{int(tid)}"
+        stamp_key = row.get("updated") or now
+        done = f"posted your answers and added {labels}" if comment else f"added {labels}"
+        result = f"Sent {ref} to the pipeline for {row['repo']}: {done}."
+        with foundation.tx() as c:
+            if comment:
+                outbox.draft(
+                    c,
+                    target="github",
+                    kind="comment",
+                    object=obj,
+                    body=comment,
+                    drafted_by=actor,
+                    approved_by=actor,
+                    opened_at=now,
+                    slot=f"triage:{ref}:{stamp_key}:answers",
+                    summary=f"post triage answers on {src.key}#{int(tid)}",
+                )
+            outbox.draft(
+                c,
+                target="github",
+                kind="label",
+                object=obj,
+                body=json.dumps({"add": labels_list, "remove": [], "family": ""}),
+                drafted_by=actor,
+                approved_by=actor,
+                opened_at=now,
+                slot=f"triage:{ref}:{stamp_key}:approve",
+                summary=f"add {labels} on {src.key}#{int(tid)}",
+            )
+            record_send(row, actor)
+            if publication:
+                publication.record(f"triage:{ref}", url, result)
+        return result
     labels_present = revalidate() if revalidate and not comment else False
     if comment:
         try:
@@ -1211,6 +1286,9 @@ class BoardRefused(Exception):
 
 @factory_control.work
 def publish(cfg: config.Config, v: dict, meta: dict) -> str:
+    from . import outbox
+    from .store import outbox as outbox_store
+
     repo = cfg.alert_repo
     if not repo:
         return "local only: alert_repo is empty"
@@ -1227,24 +1305,47 @@ def publish(cfg: config.Config, v: dict, meta: dict) -> str:
     if changed or not meta.get("changed"):
         meta["changed"] = util.iso()
     body = f"{issue_header(cfg, meta['changed'])}\n\n{sections}\n"
-    number = meta.get("issue") or find_issue(repo)
+    number = meta.get("issue") or outbox_store.newest_sent_board_issue(repo)
     issue_state = gh.issue_state(repo, number) if number else ""
     if not issue_state:
-        gh.ensure_label(repo, ISSUE_LABEL, "c5def5", "Arete triage board")
-        number = gh.issue_create(repo, ISSUE_TITLE, body, [ISSUE_LABEL])
-        said = f"opened {repo}#{number}"
-    elif not changed:
-        said = f"unchanged at {repo}#{number}"
-    else:
-        gh.issue_edit_body(repo, number, body)
-        said = f"updated {repo}#{number}"
+        item_id = outbox.draft(
+            target="github",
+            kind="issue",
+            object=f"github:{repo}",
+            body=json.dumps({"title": ISSUE_TITLE, "body": body, "labels": [ISSUE_LABEL]}),
+            drafted_by="board",
+            slot=f"board:{repo}:create:{digest}",
+            summary=f"create triage board issue on {repo}",
+        )
+        meta.update(issue=None, digest=digest)
+        return f"drafted board issue for {repo} (OB-{item_id})"
+    if not changed and issue_state != "CLOSED":
+        meta.update(issue=number, digest=digest)
+        return f"unchanged at {repo}#{number}"
+    obj = f"github:{repo}#{number}"
+    with foundation.tx() as c:
+        item_id = outbox.draft(
+            c,
+            target="github",
+            kind="issue",
+            object=obj,
+            body=json.dumps({"body": body}),
+            drafted_by="board",
+            slot=f"board:{repo}:{digest}",
+            summary=f"update triage board {repo}#{number}",
+        )
+        said = f"drafted update for {repo}#{number} (OB-{item_id})"
         if issue_state == "CLOSED":
-            gh.issue_reopen(repo, number)
-            said += " and reopened it"
+            outbox.draft(
+                c,
+                target="github",
+                kind="status",
+                object=obj,
+                body=json.dumps({"state": "open"}),
+                drafted_by="board",
+                slot=f"board:{repo}:{digest}:reopen",
+                summary=f"reopen triage board {repo}#{number}",
+            )
+            said += " and reopen"
     meta.update(issue=number, digest=digest)
     return said
-
-
-def find_issue(repo: str) -> int | None:
-    found = [i for i in gh.issues(repo, ISSUE_LABEL, state="all", limit=10) if i["title"] == ISSUE_TITLE]
-    return int(found[0]["number"]) if found else None

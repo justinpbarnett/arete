@@ -495,7 +495,7 @@ class GitHub:
             self.require_issue_reference(issue, explicit)
             body = zte_issue.pr_body(issue, explicit=explicit)
         else:
-            body = gh.outgoing(body, mark=True)
+            body = gh.outgoing(gh.marked(body))
         return api("POST", f"/{self.route}/pulls", token, self.time_left(),
                    {"head": branch, "base": "main", "title": str(gh.outgoing(title)), "body": str(body), "draft": False})
 

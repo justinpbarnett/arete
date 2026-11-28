@@ -446,6 +446,8 @@ class Check:
         fixture_lease = leases.claim("local", devices.version_of("local"), run_id=self.run, start_renewer=False)
         fixture_lease.close("", fenced=False)
         chat = chats.chat_add("")
+        chat_for_file = chats.chat_add("")
+        chats.chat_say(chat_for_file, "arete", "Drafted", draft_title="Fixture draft", draft_body="Fixture draft body")
         incident, _ = incidents.record_incident(Sighting("check", "expected", "fixture", "", "fixture incident", 1, "", ""))
         incidents.alert_set("fixture-alert", None)
         fixture_item = inbox_store.get_open_by_subject("alert:fixture-alert")
@@ -514,6 +516,7 @@ class Check:
             resource = name.partition(".")[0]
             ob_item = outbox_targets.get(name, f"OB-{ob_main}")
             target = {**values, **identities, "id": identities.get(resource, ""),
+                      "chat": str(chat_for_file) if name == "chat.file" else identities["chat"],
                       "item": ob_item if resource == "outbox" else identities["item"],
                       "run": stopped if name == "run.stop" else session if contract.keyed_write(op) else self.run}
             for field in re.findall(r"\{(\w+)\}", path):
@@ -538,6 +541,8 @@ class Check:
             if name == "settings.update":
                 values["base_version"] = self.read("/api/v1/settings")["settings"]["version"]
             if name == "task.create":
+                values["repo"] = replay.SAMPLE_REPO
+            if name == "chat.file":
                 values["repo"] = replay.SAMPLE_REPO
             if method == "GET":
                 data = self.read(path + ("?" + urlencode(values) if values else ""))
@@ -640,7 +645,7 @@ def worker(lifeline):
             require(not paths.DB_FILE.exists(), "state database already exists")
             (root / ".arete-owned").write_bytes(verify_faults.MARKER + b"\n")
             config, has_origin = prepare_replay(root)
-            body = "\n".join(config) + '\n[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n'
+            body = "\n".join(config) + '\ngithub = "sample/replay"\n[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n'
             paths.CONFIG_FILE.write_text("max_parallel = 2\n" + body)
             config_fixture_git("init", "-q", "-b", "main")
             config_fixture_git("add", "--", "config.toml")

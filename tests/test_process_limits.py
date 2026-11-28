@@ -4117,11 +4117,17 @@ class UnansweredRepairBudgetTests(OwnerAnswerBudgetFixture):
         api = support.parentless_github_issue(self.repo.github, self.ticket, issue_view)
         with (patch.object(gh, "issue", side_effect=issue_view), patch.object(gh, "issues", side_effect=issue_list),
               patch.object(gh, "gh_json", side_effect=api), patch.object(gh, "issue_labels", side_effect=edit_labels),
+              patch.object(gh, "ensure_label", return_value=""),
+              patch.object(gh, "api_create_comment", return_value=("1", "https://github.com/owner/project/issues/697#issuecomment-1")),
               patch.object(gh, "issue_comment")):
+            from arete import outbox
+
             first, asked = self.spent_question(structured=True)
+            outbox.send_due()
             self.assertIn(source.label_name("needs-info"), labels)
             self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("launched before label removal")), 0)
             self.assertEqual(source.label(self.ticket, remove=["needs-info"]), "")
+            outbox.send_due()
             started = []
 
             def work(cfg, run, slot):
@@ -5765,7 +5771,8 @@ class OrchestrationFinishTests(Isolated):
             (gh, "issue", self.issue_view),
             (gh, "issue_labels", self.edit_labels),
             (gh, "issue_comment", self.post_comment),
-            (gh, "ensure_label", lambda *args: ""),
+            (gh, "api_create_comment", self.post_api_comment),
+            (gh, "ensure_label", lambda *args, **kw: ""),
             (gh, "default_branch", lambda repo: "main"),
             (gh, "pr_merge_details", self.prs.__getitem__),
             (gh, "pr_set_draft", self.set_draft),
@@ -5787,12 +5794,19 @@ class OrchestrationFinishTests(Isolated):
         drafted = {url for url, pr in self.prs.items() if pr["isDraft"]}
         self.comments.append((body, drafted, self.labels.copy()))
 
+    def post_api_comment(self, repo, number, body):
+        self.post_comment(repo, number, body)
+        return str(len(self.comments)), f"https://github.com/{repo}/issues/{number}#issuecomment-{len(self.comments)}"
+
     def set_draft(self, url, draft):
         self.prs[url]["isDraft"] = draft
 
     def run_controller(self, decide, code):
         def prepare(flow, tree):
+            from arete import outbox
+
             flow.ctx.run.enter("running")
+            outbox.send_due()
             return factory.Outcome("pass", data={
                 "layer": str(self.repo.layer_dir),
                 "checkouts": [replace(self.checkout, pr=url).to_row() for url in self.prs],
@@ -5807,8 +5821,11 @@ class OrchestrationFinishTests(Isolated):
 
         with (patch.dict(factory.STEPS, {"prepare": prepare}),
               patch.object(factory, "fingerprint", return_value="fixture-tree")):
+            from arete import outbox
+
             self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, script=pipeline.Script("orchestrate", drive)),
                              code)
+            outbox.send_due()
         return run_store.newest_whole_run(self.repo.name, self.issue)
 
     def controller_action(self, controller, op, args, rationale):
@@ -6207,8 +6224,9 @@ class EnvironmentRequeueTests(Isolated):
             (gh, "issues", self.issue_list),
             (gh, "issue_labels", self.edit_labels),
             (gh, "issue_comment", self.post_comment),
+            (gh, "api_create_comment", self.post_api_comment),
             (gh, "find_issue_comment_marker", self.find_comment),
-            (gh, "ensure_label", lambda *args: ""),
+            (gh, "ensure_label", lambda *args, **kw: ""),
             (gh, "default_branch", lambda repo: "main"),
             (poll, "network_up_or_skip", lambda *args: True),
             (poll, "mark_loop", lambda *args: None),
@@ -6241,12 +6259,19 @@ class EnvironmentRequeueTests(Isolated):
     def post_comment(self, repo, number, body, **kwargs):
         self.comments.append(body)
 
+    def post_api_comment(self, repo, number, body):
+        self.comments.append(body)
+        return str(len(self.comments)), f"https://github.com/{repo}/issues/{number}#issuecomment-{len(self.comments)}"
+
     def find_comment(self, repo, number, marker):
         return next(("fixture" for body in self.comments if marker in body.splitlines()), "")
 
     def run_failure(self, failure=None, script=None):
+        from arete import outbox
+
         with patch.object(pipeline, "_run", side_effect=failure, wraps=pipeline._run):
             self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, script=script), 1)
+        outbox.send_due()
         self.assertIn("agent:failed", self.labels)
         return run_store.newest_whole_run(self.repo.name, self.issue)
 

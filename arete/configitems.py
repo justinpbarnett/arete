@@ -71,6 +71,24 @@ def _enrich(entry: dict, conn=None) -> dict:
     }
 
 
+def _engine_items(kind: str) -> dict[str, dict]:
+    if kind not in ("target", "rule"):
+        return {}
+    folder = paths.DEFAULTS_DIR / f"{kind}s"
+    if not folder.is_dir():
+        return {}
+    out: dict[str, dict] = {}
+    for file in sorted(folder.glob("*.toml")):
+        if not file.is_file():
+            continue
+        name = file.stem
+        if not re.fullmatch(configkinds.NAME_PATTERN, name):
+            continue
+        rel = f"arete/defaults/{kind}s/{file.name}"
+        out[name] = _enrich({"kind": kind, "name": name, "path": rel, "engine": str(file)})
+    return out
+
+
 def listing(kind: str, *, name: str | None = None, conn=None) -> list[dict]:
     if kind not in configkinds.REGISTRY:
         raise refusals.NotFound(f"Unknown config kind {kind}")
@@ -94,6 +112,10 @@ def listing(kind: str, *, name: str | None = None, conn=None) -> list[dict]:
                 first = found[item_name]["path"]
                 raise refusals.Conflict(f"Config item {kind}/{item_name} is ambiguous: {first} and {relative}")
             found[item_name] = _enrich({"kind": kind, "name": item_name, "path": relative}, conn)
+    for item_name, entry in _engine_items(kind).items():
+        if name is not None and item_name != name:
+            continue
+        found.setdefault(item_name, entry)
     return [found[key] for key in sorted(found)]
 
 
@@ -119,6 +141,18 @@ def _engine_item(kind: str, name: str) -> dict | None:
                 **_enrich({"kind": kind, "name": name, "path": "arete/defaults/devices/local.toml", "engine": str(target)}),
                 "_engine_file": str(target),
             }
+    if kind in ("target", "rule") and re.fullmatch(configkinds.NAME_PATTERN, name):
+        target = paths.DEFAULTS_DIR / f"{kind}s" / f"{name}.toml"
+        if target.is_file():
+            return {
+                **_enrich({
+                    "kind": kind,
+                    "name": name,
+                    "path": f"arete/defaults/{kind}s/{name}.toml",
+                    "engine": str(target),
+                }),
+                "_engine_file": str(target),
+            }
     return None
 
 
@@ -132,6 +166,10 @@ def item(kind: str, name: str, *, level: str | None = None, conn=None) -> dict:
         raise refusals.NotFound(f"No engine config item {kind}/{name}")
     if found := listing(kind, name=name, conn=conn):
         entry = found[0]
+        if entry["level"] == "engine":
+            engine = _engine_item(kind, name)
+            if engine is not None:
+                entry = engine
         if level is not None and entry["level"] != level:
             raise refusals.NotFound(f"No config item {kind}/{name} at level {level}")
         return entry
