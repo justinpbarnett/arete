@@ -80,7 +80,7 @@ export async function sendWrite(request, onResponse = null) {
     if (response.status === 401 && request.url !== "/api/v1/auth/pairings/claim") message = pairingHelp();
     const error = new Error(message);
     error.status = response.status;
-    error.conflict = response.status === 409 && (data?.code ?? data?.error) === "version_conflict";
+    error.conflict = response.status === 409 && ["version_conflict", "task_version_conflict"].includes(data?.code ?? data?.error);
     if (error.conflict) staleWrite.value = "This item changed. Review the latest version before trying again.";
     error.current = data?.current;
     error.answer = data;

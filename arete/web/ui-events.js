@@ -7,12 +7,18 @@ const retryDelay = 2000;
 const recoveryDelay = 60000;
 const leaseDuration = 40000;
 const kinds = new Set(["run.started", "run.changed", "run.ended", "step.started", "step.ended",
-  "turn.appended", "principal.changed", "task.created", "task.changed"]);
+  "turn.appended", "principal.changed", "task.created", "task.changed",
+  "project.changed", "line.changed", "view.changed", "ref.changed",
+  "inbox.raised", "inbox.resolved", "inbox.snoozed", "inbox.shelved", "inbox.woken", "inbox.changed"]);
+
+function taskSubjectMatches(subject, id) {
+  return subject === `task:${id}` || (/^T-\d+$/i.test(id) && subject === `task:${id.slice(2)}`);
+}
 
 export function boardTask(event) {
   const row = event.data;
   if (!row?.id) return null;
-  if (event.kind.startsWith("task.")) return event.subject === `task:${row.id}` ? row : null;
+  if (event.kind.startsWith("task.")) return taskSubjectMatches(event.subject, String(row.id)) ? row : null;
   const task = row.board_task;
   return event.kind.startsWith("run.") && task?.id && task.id === row.issue && event.subject === `run:${row.id}` ? task : null;
 }

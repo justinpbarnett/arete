@@ -76,7 +76,41 @@ export const taskDetail = (id, repo) => `/api/tasks/${encodeURIComponent(id)}${r
 
 export function floor() { return { title: "Floor", subtitle: "The work in flight", queue: "Running work", focus: "Overview" }; }
 export function triage() { return { title: "Triage", subtitle: "Work that needs you", queue: "Queue", focus: "Focus" }; }
-export function board(route) { return { title: route.active === "my-work" ? "Open work" : "Board", subtitle: "Local tasks and their progress", queue: "Tasks", focus: "Overview" }; }
+export function board(view = "") {
+  const isRoute = Boolean(view && typeof view === "object");
+  const slug = isRoute ? (view.path?.[0] ?? "") : String(view ?? "");
+  const query = new URLSearchParams();
+  if (slug && slug !== "projects" && slug !== "open-work") {
+    if (isRoute && view.kind === "project") query.set("project", slug);
+    else if (!isRoute || view.kind === "view") query.set("id", slug);
+  }
+  const qs = query.toString();
+  const screenUrl = qs ? `/api/v1/screens/board?${qs}` : "/api/v1/screens/board";
+  const title = slug === "projects" ? "Projects" : slug === "open-work" ? "Open work" : slug || "Board";
+  const subtitle = slug === "projects" ? "Projects and their tasks" : "Tasks by state";
+  return {
+    title,
+    subtitle,
+    queue: slug === "projects" ? "Projects" : "Board",
+    focus: slug === "projects" ? "Project" : "Overview",
+    screen: screenUrl,
+    boardView: (id) => `/api/v1/screens/board?${new URLSearchParams({ id })}`,
+    boardProject: (project) => `/api/v1/screens/board?${new URLSearchParams({ project })}`,
+    views: "/api/v1/views",
+    view: (id) => `/api/v1/views/${encodeURIComponent(id)}`,
+    tasks: "/api/v1/tasks",
+    task: (id) => `/api/v1/tasks/${encodeURIComponent(id)}`,
+    history: (id) => `/api/v1/tasks/${encodeURIComponent(id)}/history`,
+    inbox: "/api/v1/inbox?state=open",
+  };
+}
+export function projects() {
+  return {
+    list: "/api/v1/projects",
+    views: "/api/v1/views",
+    board: "/api/v1/screens/board",
+  };
+}
 export function task() { return { title: "Task", subtitle: "Work, activity and runs", queue: "Tasks", focus: "Overview" }; }
 export function intake() { return { title: "Intake", subtitle: "Incoming work", queue: "Intake", focus: "Focus" }; }
 export function outbox() { return { title: "Outbox", subtitle: "Drafts and deliveries waiting for review", queue: "Delivery queue", focus: "Review" }; }

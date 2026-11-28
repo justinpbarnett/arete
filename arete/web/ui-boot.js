@@ -15,6 +15,7 @@ import { normalizePrimary } from "./ui-list.js";
 import { pairedBrowser } from "./browser-auth.js";
 import { browserPaired } from "./ui-notice.js";
 import { initSettingsPrefs } from "./ui-settings.js";
+import { observeBoardSignals } from "./ui-board.js";
 
 initSettingsPrefs();
 
@@ -48,13 +49,14 @@ effect(() => {
   const selected = route.value;
   const latest = snapshot.value;
   const runs = runView.value;
+  observeBoardSignals();
   const runFault = selected.screen === "run" && (runs.queueError || runs.detailError);
   connection.value = connectivity(latest, now.value);
   readRetry.value = readFault(selected.screen, latest) || runFault ? retry : null;
   render(h(Shell, { route: selected, snapshot: latest, resources: screenReads.value, now: now.value, retry, runs }), document.getElementById("app"));
   marks();
   normalizePrimary();
-  document.title = `arete · ${selected.screen === "board" && selected.active === "my-work" ? "Open work" : selected.screen}`;
+  document.title = `arete · ${selected.screen === "board" && selected.active === "my-work" ? "My work" : selected.screen}`;
 });
 
 listen((selected) => {
