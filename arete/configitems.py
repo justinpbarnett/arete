@@ -127,6 +127,13 @@ def _engine_item(kind: str, name: str) -> dict | None:
                 **_enrich({"kind": kind, "name": name, "path": "arete/defaults/steps.toml", "engine": str(target)}),
                 "_engine_file": str(target),
             }
+    if kind == "retention" and name == "defaults":
+        target = paths.DEFAULTS_DIR / "retention.toml"
+        if target.is_file():
+            return {
+                **_enrich({"kind": kind, "name": name, "path": "arete/defaults/retention.toml", "engine": str(target)}),
+                "_engine_file": str(target),
+            }
     if kind == "loop":
         target = paths.PACKAGE_DIR / "loops" / name / "loop.toml"
         if target.is_file():

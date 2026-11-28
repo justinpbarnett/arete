@@ -497,22 +497,24 @@ def open_device_wait_blockers(connect=reader) -> list[str]:
 
 # --- Retention Prune ---
 
-def prune(c: sqlite3.Connection) -> None:
+def prune(c: sqlite3.Connection) -> int:
     now = util.now()
+    removed = 0
     if _has_table(c, "device_probes"):
-        c.execute(
+        removed += c.execute(
             "DELETE FROM device_probes WHERE at < ?",
             (util.iso(now - timedelta(days=DEVICE_PROBES_RETENTION_DAYS)),),
-        )
+        ).rowcount
     if _has_table(c, "lease_tokens") and _has_table(c, "leases"):
-        c.execute(
+        removed += c.execute(
             "DELETE FROM lease_tokens WHERE lease_id IN ("
             "  SELECT id FROM leases WHERE released IS NOT NULL AND released < ?"
             ")",
             (util.iso(now - timedelta(days=LEASE_TOKENS_RETENTION_DAYS)),),
-        )
+        ).rowcount
     if _has_table(c, "waits"):
-        c.execute(
+        removed += c.execute(
             "DELETE FROM waits WHERE cleared IS NOT NULL AND cleared < ?",
             (util.iso(now - timedelta(days=WAITS_RETENTION_DAYS)),),
-        )
+        ).rowcount
+    return removed

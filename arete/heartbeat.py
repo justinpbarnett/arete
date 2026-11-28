@@ -19,6 +19,7 @@ from . import (
     launchd,
     paths,
     pi,
+    retention,
     routing,
     runner,
     secretstore,
@@ -382,18 +383,20 @@ def check_db_slow() -> list[Check]:
 
 
 def check_db_size(cfg: config.Config) -> list[Check]:
+    policy = retention.load_live()
     sizes = dbstats.database_bytes()
     total = sizes["db_bytes"] + sizes["wal_bytes"]
-    limit = cfg.retention.db_max_mb * 1024 ** 2
+    limit = policy.db.max_mb * 1024 ** 2
     return [Check("db:size", total <= limit,
-                  f"DB + WAL {total / 1024 ** 2:.2f} MiB; limit {cfg.retention.db_max_mb:g} MiB", "warn")]
+                  f"DB + WAL {total / 1024 ** 2:.2f} MiB; limit {policy.db.max_mb:g} MiB", "warn")]
 
 
 def check_runs_size(cfg: config.Config) -> list[Check]:
+    policy = retention.load_live()
     total = dbstats.runs_bytes()["total_bytes"]
-    limit = cfg.retention.max_gb * 10 ** 9 / 2
+    limit = policy.records.max_gb * 10 ** 9 / 2
     return [Check("runs:size", total <= limit,
-                  f"runs/ {total / 10 ** 9:.3f} GB; half max_gb {cfg.retention.max_gb / 2:g} GB", "warn")]
+                  f"runs/ {total / 10 ** 9:.3f} GB; half max_gb {policy.records.max_gb / 2:g} GB", "warn")]
 
 
 def check_backup_db() -> Check:

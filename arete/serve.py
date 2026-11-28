@@ -45,6 +45,7 @@ from . import (
     principals,
     record,
     release_proof,
+    retention,
     routing,
     runner,
     scratch,
@@ -55,7 +56,6 @@ from . import (
     slots,
     sources,
     startup_excerpt,
-    store,
     tasks,
     tool_events,
     tracker,
@@ -68,6 +68,7 @@ from .store import db as foundation
 from .store import factory as factory_state
 from .store import incidents as incident_store
 from .store import loops as loop_store
+from .store import retention as retention_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import workspaces
@@ -1003,7 +1004,11 @@ class Server:
             return
         if made:
             self.copy_off_machine(made)
-        limits = self.cfg.retention
+        try:
+            policy = retention.load()
+        except Exception as e:
+            self.say(f"retention policy failed, so nothing was pruned: {type(e).__name__}: {util.first_line(str(e), 300)}")
+            return
         try:
             removed = dbstats.prune()
         except Exception as e:
@@ -1011,33 +1016,46 @@ class Server:
         else:
             if removed > 0:
                 self.say(f"dbstats: removed {removed} files")
+        measured = None
         try:
-            store.prune(lines_days=limits.lines_days, keep_days=self.cfg.oncall.keep_days)
+            pool = getattr(self, "pool", None)
+            measured = pool.submit(retention_store.measure).result() if pool is not None else retention_store.measure()
         except Exception as e:
-            self.say(f"state prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+            self.say(f"retention measure failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+        rows_plan = None
+        if measured is not None:
+            try:
+                rows_plan = retention_store.prune_rows(policy, measured)
+            except Exception as e:
+                self.say(f"retention rows prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+        file_result = None
         try:
-            purged = record.purge_folders()
-            if purged.folders:
-                self.say(f"runs: removed {util.count(purged.folders, 'folder')} ({record.size_text(purged.size)})")
-            for error in purged.errors:
-                self.say(f"folder purge failed: {util.first_line(error, 300)}")
+            file_result = retention_store.prune_files()
         except Exception as e:
-            self.say(f"folder purge failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
-        try:
-            found = record.prune(limits.days, limits.max_gb)
-        except Exception as e:
-            self.say(f"record prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+            self.say(f"retention file prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
         else:
-            if found.removed:
-                self.say(f"records: removed {util.count(len(found.removed), 'record')} "
-                         f"({record.size_text(sum(r.size for r in found.removed))}), "
-                         f"{found.left} left; runs/ uses {record.size_text(found.left_bytes)}")
-            if found.over:
-                self.say(f"runs/: {record.size_text(found.left_bytes)} is over max_gb {limits.max_gb:g}; records "
-                         "left are pinned, cited by a kept proposal, running or written in the last hour; "
-                         "bytes outside record/ stay until folder expiry")
+            for error in file_result.errors:
+                self.say(f"file purge failed: {util.first_line(error, 300)}")
+        rows_removed = rows_plan.rows if rows_plan is not None else 0
+        folders_removed = file_result.folders if file_result is not None else 0
+        records_removed = file_result.records if file_result is not None else 0
+        blobs_removed = file_result.blobs if file_result is not None else 0
+        bytes_removed = file_result.size if file_result is not None else 0
+        if rows_removed or folders_removed or records_removed or blobs_removed or bytes_removed:
+            self.say(
+                f"prune: removed {util.count(rows_removed, 'row')}, "
+                f"{util.count(folders_removed, 'folder')}, "
+                f"{util.count(records_removed, 'record')}, "
+                f"{util.count(blobs_removed, 'blob')} ({record.size_text(bytes_removed)})"
+            )
+        if rows_plan is not None and rows_plan.over_budget:
+            self.say(
+                f"runs/: {record.size_text(rows_plan.remaining_bytes)} is over max_gb {policy.records.max_gb:g}; "
+                "records left are pinned, cited by a kept proposal, running, pr, needs-info, waiting on an ask, "
+                "or written in the last hour; bytes outside record/ stay until folder expiry"
+            )
         try:
-            tool_events.rotate_events(limits.lines_days)
+            tool_events.rotate_events(policy.events_file.days)
         except Exception as e:
             self.say(f"event rotation failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
 
@@ -1553,21 +1571,24 @@ def run(with_dashboard: bool = True) -> NoReturn:
         for note in rotation_notes:
             server.say(note)
         server.report_config()
-        if not server.contracts_waiting and not server.config_problem:
-            server.guard("stage:secret-move", server.move_secrets_when_due)
+        if not server.contracts_waiting:
             from . import configrepo, pins
 
+            if not server.config_problem:
+                server.guard("stage:secret-move", server.move_secrets_when_due)
             try:
                 configrepo.init()
                 pins.ensure_automation_payer()
             except configrepo.ConfigRepoError as e:
                 server.say(f"config repo init deferred: {e}")
             server.read_config()
-            from . import inbox
+            if not server.config_problem:
+                server.guard("stage:secret-move", server.move_secrets_when_due)
+                from . import inbox
 
-            server.guard("stage:inbox-start", inbox.on_server_start)
-        elif not server.contracts_waiting:
-            server.guard("stage:inbox-config", server.sync_config_inbox)
+                server.guard("stage:inbox-start", inbox.on_server_start)
+            else:
+                server.guard("stage:inbox-config", server.sync_config_inbox)
         for note in start_notes(server.cfg):
             server.say(note)
         factory_control.notify()

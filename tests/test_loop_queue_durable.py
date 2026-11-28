@@ -26,10 +26,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from arete import api, api_check, cli, config, control, dashboard, inbox, loop_run, loops, paths, principals, record, serve, store, tailnet, util
+from arete import api, api_check, cli, config, control, dashboard, inbox, loop_run, loops, paths, principals, record, retention, serve, tailnet, util
 from arete.store import db as foundation
 from arete.store import inbox as inbox_store
 from arete.store import loops as loop_store
+from arete.store import retention as retention_store
 from arete.store import runs as run_store
 from arete.store import tokens as token_store
 
@@ -407,7 +408,7 @@ with foundation.tx() as c:
 recent_inbox = inbox_store.get_open_by_subject(f"queue:{recent_dead_item}")
 assert recent_inbox is not None
 
-store.prune()
+retention_store.prune_rows(retention.load(), retention_store.measure())
 
 assert loop_store.queue_item(running_item) is not None
 assert loop_store.queue_item(old_dead_item) is None
@@ -492,7 +493,7 @@ dead = loop_store.queue_item(item_id)
 assert dead["dead_at"] is not None and dead["run_id"] == run2_id
 q_items = inbox.list(state="open", kind="queue.dead")
 assert len(q_items) == 1 and q_items[0]["subject"] == f"queue:{item_id}"
-store.prune()
+retention_store.prune_rows(retention.load(), retention_store.measure())
 assert loop_store.queue_item(item_id) is not None
 
 # With max_attempts = 3: 1st kill -> attempts 1, 2nd kill -> attempts 2, 3rd kill -> dead

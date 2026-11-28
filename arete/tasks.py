@@ -912,6 +912,9 @@ def repair(run_id: str, base_version=None) -> dict:
     factory_state.admit()
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = command_run(run_id, base_version)
+        if row.get("files_purged"):
+            raise control.Refused(f"run {run_id} files were removed on {row['files_purged']}; "
+                                  "start the ticket again with POST /api/tasks")
         tid = str(row["issue"])
         if (later := run_store.later_run(row["repo"], row["issue"], run_id)) and pipeline.repaired_by(later["id"]) == run_id:
             return answer(tid, repo.name, later["id"], later["status"],
@@ -962,6 +965,9 @@ def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
     factory_state.admit()
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = command_run(run_id, base_version)
+        if row.get("files_purged"):
+            raise control.Refused(f"run {run_id} files were removed on {row['files_purged']}; "
+                                  "start the ticket again with POST /api/tasks")
         if row["status"] == "running":
             raise control.Refused(f"run {run_id} is running; a step runs alone only on a run that ended")
         if not (path := script_path(row)):

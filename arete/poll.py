@@ -27,6 +27,7 @@ from . import (
     private_evidence,
     queueing,
     requeue,
+    retention,
     routing,
     run_lines,
     run_timing,
@@ -736,7 +737,7 @@ def poll_admitted(dry_run: bool) -> int:
             print(f"{util.iso()} poll already running")
             return 0
         if not dry_run:
-            retry_scratch(cfg.retention.days)
+            retry_scratch(retention.load_live().records.days)
         if any(r.parts or r.tracker != "local" for r in cfg.repos) and not network_up_or_skip("poll", dry_run):
             return 0
         errors: list[str] = []

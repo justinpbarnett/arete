@@ -143,7 +143,7 @@
     ],
     "oncall keys": [
       "ValueError",
-      "[oncall]: unknown key z; use enabled, source, vision, scope, confidence, injection, max_repairs, wakes_per_hour, max_attempts, incident_budget_usd, daily_budget_usd, cooldown_minutes, keep_days"
+      "[oncall]: unknown key z; use enabled, source, vision, scope, confidence, injection, max_repairs, wakes_per_hour, max_attempts, incident_budget_usd, daily_budget_usd, cooldown_minutes"
     ],
     "oncall flag": [
       "ValueError",
@@ -159,7 +159,11 @@
     ],
     "oncall inclusive amount": [
       "ValueError",
-      "[oncall] keep_days must be a number 0 or more, not nan"
+      "[oncall] cooldown_minutes must be a number 0 or more, not nan"
+    ],
+    "oncall keep_days moved": [
+      "ValueError",
+      "[oncall] keep_days moved to [incidents] keep_days in retention.toml"
     ],
     "oncall source keys": [
       "ValueError",
@@ -245,13 +249,9 @@
       "ValueError",
       "[triage] auto_per_refresh must be a whole number from 0 to 1000"
     ],
-    "retention keys": [
+    "retention moved": [
       "ValueError",
-      "[retention]: unknown key z; use days, max_gb, lines_days, db_max_mb"
-    ],
-    "retention number": [
-      "ValueError",
-      "[retention] days must be a number above 0, not nan"
+      "[retention] moved to retention.toml"
     ],
     "backup keys": [
       "ValueError",

@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 17
+MINOR = 18
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -36,10 +36,10 @@ def mapping(values):
 TASK = obj({**dict.fromkeys(("id", "repo", "title", "body", "kind", "state", "parent", "created", "updated"), STRING),
             "version": INTEGER})
 RUN_TEXT = ("id", "kind", "repo", "issue", "loop", "loop_kind", "started", "finished", "status", "summary", "pr_url",
-            "branch", "only_step", "files_purged", "mined_until", "stop_asked", "ab_held", "measured_at", "landed",
-            "device", "model", "runner", "log", "trigger", "queue", "grp", "lock", "moved", "engine_sha",
-            "label_pending", "wait_minutes", "config_commit", "resolved_sha", "continues", "chain", "restart",
-            "started_by", "payer")
+            "branch", "only_step", "files_purged", "records_purged", "mined_until", "stop_asked", "ab_held",
+            "measured_at", "landed", "device", "model", "runner", "log", "trigger", "queue", "grp", "lock", "moved",
+            "engine_sha", "label_pending", "wait_minutes", "config_commit", "resolved_sha", "continues", "chain",
+            "restart", "started_by", "payer")
 RUN_NUMBERS = ("pid", "cost_usd", "tokens_in", "tokens_out", "active_seconds", "verify_seconds", "verify_open_seconds",
                "repair_calls", "schema_version", "attempts", "version", "seq", "lease_id")
 RUN = obj({**{k: {"type": ["string", "null"]} for k in RUN_TEXT},

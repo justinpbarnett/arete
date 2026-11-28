@@ -354,19 +354,34 @@ def loop_lock(name: str) -> str:
     return "loop-" + name.replace("/", ".")
 
 
-def prune(c, days: float = 14) -> None:
-    cutoff = util.iso(util.now() - timedelta(days=days * 4))
+def prune(
+    c,
+    *,
+    queue_days: float = 14,
+    loop_events_days: float = 56,
+    dead_letters_days: float = 56,
+) -> int:
+    removed = 0
+    dead_cutoff = util.iso(util.now() - timedelta(days=dead_letters_days))
     expired = [
         row["id"]
         for row in c.execute(
             "SELECT id FROM queue WHERE dead_at IS NOT NULL AND dead_at < ? ORDER BY id",
-            (cutoff,),
+            (dead_cutoff,),
         ).fetchall()
     ]
     for item_id in expired:
-        c.execute("DELETE FROM queue WHERE id = ?", (item_id,))
+        removed += c.execute("DELETE FROM queue WHERE id = ?", (item_id,)).rowcount
         _resolve_dead_inbox(c, item_id, "expired")
-    c.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+    queue_cutoff = util.iso(util.now() - timedelta(days=queue_days))
+    removed += c.execute(
+        "DELETE FROM queue WHERE run_id IS NOT NULL AND run_id != '' AND dead_at IS NULL AND enqueued < ? "
+        "AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.id = queue.run_id AND runs.status = 'running')",
+        (queue_cutoff,),
+    ).rowcount
+    events_cutoff = util.iso(util.now() - timedelta(days=loop_events_days))
+    removed += c.execute("DELETE FROM events WHERE ts < ?", (events_cutoff,)).rowcount
+    return removed
 
 
 def settled_claims(c):
