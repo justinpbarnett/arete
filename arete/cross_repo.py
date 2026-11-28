@@ -18,11 +18,11 @@ ARTIFACT_RE = re.compile(
     r"artifact=(@?[A-Za-z0-9][A-Za-z0-9._/-]{0,127}):([0-9]+(?:\.[0-9]+)+(?:[-+][0-9A-Za-z.-]+)?)"
 )
 GH_URL_RE = re.compile(
-    r"^https://github\.com/([a-z0-9-]+/[a-z0-9_.-]+)/issues/([1-9][0-9]*)/?$",
+    r"^https://github\.com/([a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9_.-]*)/issues/([1-9][0-9]*)/?$",
     re.IGNORECASE | re.ASCII,
 )
 GH_REF_RE = re.compile(
-    r"^(?:([a-z0-9-]+/[a-z0-9_.-]+))?#([1-9][0-9]*)$",
+    r"^(?:([a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9_.-]*))?#([1-9][0-9]*)$",
     re.IGNORECASE | re.ASCII,
 )
 JIRA_URL_RE = re.compile(r"^https?://[^/\s]+/browse/([A-Z][A-Z0-9_]+-[1-9][0-9]*)/?$", re.IGNORECASE)

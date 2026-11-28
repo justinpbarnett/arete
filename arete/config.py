@@ -1256,7 +1256,7 @@ def github_app_table(app: dict) -> GithubApp:
         installation_id=str(app.get("installation_id", "")).strip(),
         private_key=secret_move.fallback(secret_move.configured_path({"github_app": app}, "github_app")),
     )
-    if found.installation_id and not found.installation_id.isdigit():
+    if found.installation_id and not (found.installation_id.isascii() and found.installation_id.isdigit()):
         raise ValueError("[github_app] installation_id must be digits only")
     return found
 

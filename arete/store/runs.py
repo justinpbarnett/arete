@@ -8,7 +8,10 @@ from datetime import timedelta
 from .. import refusals, util
 from ..agent import billing_of
 from . import events, writes
+from ._rows import json_dict, validate_columns
 from .db import SPEC_DELIVERY_SCHEMA, WORKER_EXCHANGE_SCHEMA, db, migration_applied, reader, tx
+
+STEP_LABEL_FIELDS = frozenset(("atom", "ab", "ab_side", "effort", "tier", "kind", "auth_mode"))
 
 TABLES = {
     "runs": "free command firings: 14 days; others kept",
@@ -281,7 +284,7 @@ def environment_hold(run_id: str) -> dict:
             "SELECT url, head FROM environment_hold_prs WHERE run_id = ? ORDER BY repo, number", (run_id,))}
         hold = dict(row)
         hold = _restore_legacy_owner_review(hold, hold.pop("repo"), hold.pop("issue"), run_id)
-        return {**hold, "heads": heads, "waits": json.loads(hold["waits"])}
+        return {**hold, "heads": heads, "waits": json_dict(hold["waits"])}
 
 
 def set_environment_waits(run_id: str, waits: dict[str, tuple[str, int]]) -> None:
@@ -453,7 +456,7 @@ def pr_gate_refreshes(repo: str, issue: str) -> list[dict]:
             return []
         rows = c.execute("SELECT pr_url, run_id, head, evidence FROM pr_gate_refreshes WHERE repo = ? AND issue = ?",
                          (repo, issue))
-        return [{**row, "evidence": json.loads(row["evidence"])} for row in rows]
+        return [{**row, "evidence": json_dict(row["evidence"])} for row in rows]
 
 
 def save_pr_gate_refresh(repo: str, issue: str, pr_url: str, run_id: str, head: str, evidence: dict) -> bool:
@@ -527,14 +530,17 @@ def ab_placements(since: str, name: str = "", connect=reader) -> list[dict]:
         held = c.execute("SELECT repo, issue, ab_held FROM runs WHERE kind = 'pipeline' AND started >= ? "
                          "AND COALESCE(ab_held, '') != ''", (since,)).fetchall()
     assigned = [{"ab": ab, "ab_side": side, "atom": role, "repo": r["repo"], "issue": r["issue"]}
-                for r in held for role, (ab, side, _) in json.loads(r["ab_held"]).items() if not name or ab == name]
+                for r in held for role, item in json_dict(r["ab_held"]).items()
+                if isinstance(item, (list, tuple)) and len(item) == 3
+                for ab, side, _ in (item,) if not name or ab == name]
     return list({tuple(p.values()): p for p in labelled + assigned}.values())
 
 
 def ab_held(run_id: str, connect=reader) -> dict[str, tuple[str, str, dict]]:
     with connect() as c:
         row = c.execute("SELECT ab_held FROM runs WHERE id = ?", (run_id,)).fetchone()
-    return {role: tuple(held) for role, held in json.loads(row["ab_held"] or "{}").items()} if row else {}
+    return {role: tuple(held) for role, held in json_dict(row["ab_held"]).items()
+            if isinstance(held, (list, tuple))} if row else {}
 
 
 def ticket_runs_since(repo: str, issue: int | str, since: str, connect=reader) -> list[dict]:
@@ -696,6 +702,9 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
 
 
 def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
+    validate_columns(labels, STEP_LABEL_FIELDS, "steps")
+    if not labels:
+        return
     with db() as c:
         c.execute(f"UPDATE steps SET {', '.join(f'{k} = ?' for k in labels)} WHERE run_id = ? AND step = ? AND try = ?",
                   (*labels.values(), run_id, step, try_no))
@@ -704,7 +713,7 @@ def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
 def hold_ab(run_id: str, role: str, name: str, side: str, arm: dict) -> None:
     with writes.atomic() as c:
         row = c.execute("SELECT ab_held FROM runs WHERE id = ?", (run_id,)).fetchone()
-        held = {**json.loads((row["ab_held"] if row else "") or "{}"), role: [name, side, arm]}
+        held = {**json_dict(row["ab_held"] if row else ""), role: [name, side, arm]}
         writes.update("runs", run_id, {"ab_held": json.dumps(held)})
 
 

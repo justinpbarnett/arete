@@ -101,7 +101,7 @@ def by_selector(kind: str, name: str, selector: str, conn: sqlite3.Connection | 
             return by_selector(kind, name, selector, c)
     if not available(conn):
         return None
-    if selector.isdecimal() and has_ver(conn):
+    if selector.isascii() and selector.isdecimal() and len(selector) <= 18 and has_ver(conn):
         row = conn.execute(
             "SELECT * FROM config_index WHERE kind = ? AND name = ? AND ver = ? LIMIT 1",
             (kind, name, int(selector)),

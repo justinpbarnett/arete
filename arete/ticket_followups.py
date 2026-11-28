@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -117,29 +118,29 @@ SENTENCE_PIVOT_RE = re.compile(
 )
 COMPOUND_SPLIT_PATTERNS = (
     re.compile(
-        r"(?:,\s*|\s+)and\s+(?:(?:please\s+)?also\s+|also\s+(?:please\s+)?)"
+        r"(?:,[ \t]*|(?<![ \t])[ \t]+)and[ \t]+(?:(?:please[ \t]+)?also[ \t]+|also[ \t]+(?:please[ \t]+)?)"
         r"(?=(?:add|create|support|implement|include|allow|enable|request(?:ing)?|change|update|fix|build|export|"
-        r"we(?:'d|\s+would)?\s+(?:like|need|want)|can\s+(?:we|you)\b|could\s+(?:we|you)\b|a\s+new\b|please\b))",
+        r"we(?:'d|[ \t]+would)?[ \t]+(?:like|need|want)|can[ \t]+(?:we|you)\b|could[ \t]+(?:we|you)\b|a[ \t]+new\b|please\b))",
         re.I,
     ),
     re.compile(
-        r",\s*and\s+(?=(?:please\s+(?:add|create|support|implement|include|allow|enable|request|change|update|fix|build|export)|"
-        r"request(?:ing)?\s+(?:a\s+)?new\b|add\s+(?:a\s+)?new\b|"
-        r"we(?:'d|\s+would)?\s+(?:also\s+)?(?:like|need|want)\b|"
-        r"can\s+(?:we|you)\s+(?:also\s+)?(?:add|create|support|change|update|fix)\b|"
-        r"could\s+(?:we|you)\s+(?:also\s+)?(?:add|create|support|change|update|fix)\b))",
+        r",[ \t]*and[ \t]+(?=(?:please[ \t]+(?:add|create|support|implement|include|allow|enable|request|change|update|fix|build|export)|"
+        r"request(?:ing)?[ \t]+(?:a[ \t]+)?new\b|add[ \t]+(?:a[ \t]+)?new\b|"
+        r"we(?:'d|[ \t]+would)?[ \t]+(?:also[ \t]+)?(?:like|need|want)\b|"
+        r"can[ \t]+(?:we|you)[ \t]+(?:also[ \t]+)?(?:add|create|support|change|update|fix)\b|"
+        r"could[ \t]+(?:we|you)[ \t]+(?:also[ \t]+)?(?:add|create|support|change|update|fix)\b))",
         re.I,
     ),
     re.compile(
-        r"\s+and\s+(?=(?:request(?:ing)?\s+(?:a\s+)?new\b|please\s+(?:also\s+)?(?:add|create|support|implement|change|update|fix)\b))",
+        r"(?<![ \t])[ \t]+and[ \t]+(?=(?:request(?:ing)?[ \t]+(?:a[ \t]+)?new\b|please[ \t]+(?:also[ \t]+)?(?:add|create|support|implement|change|update|fix)\b))",
         re.I,
     ),
     re.compile(
-        r"(?:,\s*|\s+)plus\s+(?=(?:please\s+|also\s+|add\b|a\s+new\b|fix\b|support\b|change\b|update\b|request\b|"
-        r"we(?:'d|\s+would)?\s+(?:like|need|want)\b|can\s+(?:we|you)\b|could\s+(?:we|you)\b))",
+        r"(?:,[ \t]*|(?<![ \t])[ \t]+)plus[ \t]+(?=(?:please[ \t]+|also[ \t]+|add\b|a[ \t]+new\b|fix\b|support\b|change\b|update\b|request\b|"
+        r"we(?:'d|[ \t]+would)?[ \t]+(?:like|need|want)\b|can[ \t]+(?:we|you)\b|could[ \t]+(?:we|you)\b))",
         re.I,
     ),
-    re.compile(r";\s+(?=(?:also\s+|please\s+|add\b|fix\b|change\b|update\b|support\b|request\b))", re.I),
+    re.compile(r";[ \t]+(?=(?:also[ \t]+|please[ \t]+|add\b|fix\b|change\b|update\b|support\b|request\b))", re.I),
 )
 
 DEPENDENCY_RE = re.compile(
@@ -161,17 +162,20 @@ BUG_STRONG_PATTERNS = (
                r"previously\s+supported|used\s+to\s+work|supposed\s+to|same\s+(?:bug|issue|problem))\b", re.I),
 )
 CHANGE_STRONG_PATTERNS = (
+    re.compile(r"\b(?:change\s+the\s+default|switch\s+(?:the\s+default\s+)?to\b|"
+               r"we(?:'d|\s+would)\s+(?:also\s+)?like\s+(?:a|an|to\s+add|to\s+support)|"
+               r"would\s+be\s+(?:great|nice|helpful)\s+to\s+(?:have|add|support)|"
+               r"allow\s+users?\s+to|enable\s+users?\s+to)\b", re.I),
     re.compile(r"\b(?:change\s+request|feature\s+request|new\s+feature|enhancement|"
                r"(?:add|request(?:ing)?|introduce|build|create)\s+(?:a\s+)?new\b|"
                r"(?:please\s+|can\s+(?:we|you)\s+|could\s+(?:we|you)\s+|let['’]?s\s+)?(?:also\s+)?add\s+(?:a|an|the)?\s*[a-z0-9_-]+|"
                r"new\s+(?:csv|pdf|json|excel|xlsx)?\s*export\b|(?:csv|pdf|json|excel|xlsx)\s+export\b|"
                r"support\s+(?:exporting|importing|filtering|sorting|searching)|"
                r"export\s+(?:to|as)\s+(?:csv|pdf|json|excel|xlsx))\b", re.I),
-    re.compile(r"\b(?:change\s+the\s+default|instead\s+of\b.+\b(?:show|use|display|sort|return|default)|"
-               r"switch\s+(?:the\s+default\s+)?to\b|we(?:'d|\s+would)\s+(?:also\s+)?like\s+(?:a|an|to\s+add|to\s+support)|"
-               r"would\s+be\s+(?:great|nice|helpful)\s+to\s+(?:have|add|support)|"
-               r"allow\s+users?\s+to|enable\s+users?\s+to)\b", re.I),
 )
+_INSTEAD_OF_RE = re.compile(r"\binstead\s+of\b", re.I)
+_INSTEAD_VERB_RE = re.compile(r"\b(?:show|use|display|sort|return|default)\b", re.I)
+_MAX_SPLIT_DEPTH = 16
 REPEAT_BUG_RE = re.compile(
     r"\b(?:same\s+(?:[\w-]+\s+){0,2}(?:bug|issue|problem|regression)|"
     r"(?:also\s+)?seeing\s+(?:this|the\s+same)|"
@@ -277,12 +281,21 @@ def _fingerprint(kind: FollowUpKind, text: str) -> str:
     return ticket_feedback.digest([kind, basis])[:16]
 
 
+def _has_instead_of_change(text: str) -> bool:
+    for line in text.splitlines():
+        if m := _INSTEAD_OF_RE.search(line):
+            if _INSTEAD_VERB_RE.search(line, m.end()):
+                return True
+    return False
+
+
 def _has_action_content(clause: str) -> bool:
     tokens = _domain_tokens(clause)
     if len(tokens) < 2:
         return False
     return bool(
         ticket_feedback.ACTION_SIGNAL_RE.search(clause)
+        or _has_instead_of_change(clause)
         or any(p.search(clause) for p in (*BUG_STRONG_PATTERNS, *CHANGE_STRONG_PATTERNS))
     )
 
@@ -296,16 +309,18 @@ def _is_evidence_sentence(sentence: str) -> bool:
     return bool(EVIDENCE_LEAD_RE.match(stripped))
 
 
-def _split_compound_sentence(sentence: str) -> list[str]:
-    text = sentence.strip()
+def _split_compound_sentence(sentence: str, *, _depth: int = 0) -> list[str]:
+    text = re.sub(r"[ \t\r\n]+", " ", sentence.strip())
     if not text:
         return []
+    if _depth >= _MAX_SPLIT_DEPTH:
+        return [text]
     for pattern in COMPOUND_SPLIT_PATTERNS:
         parts = [p.strip(" ,;") for p in pattern.split(text) if p and p.strip(" ,;")]
         if len(parts) >= 2 and all(_has_action_content(p) and not _is_evidence_sentence(p) for p in parts):
             out: list[str] = []
             for part in parts:
-                out.extend(_split_compound_sentence(part) if part != text else [part])
+                out.extend(_split_compound_sentence(part, _depth=_depth + 1) if part != text else [part])
             return out
     return [text]
 
@@ -400,7 +415,7 @@ def split_requests(text: str) -> list[str]:
         return results
 
     # Paragraph-level splitting, keeping evidence paragraphs attached to the preceding item.
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", cleaned) if p.strip()]
+    paragraphs = [p.strip() for p in re.split(r"\n[ \t]*\n+", cleaned) if p.strip()]
     clauses: list[str] = []
     for para in paragraphs:
         single_line = " ".join(line.strip() for line in para.splitlines() if line.strip())
@@ -417,7 +432,7 @@ def classify_request(clause: str, delivered: DeliveredOutcome) -> FollowUpKind:
     """Compare a follow-up request against the delivered outcome to distinguish bug vs change_request."""
     text = (clause or "").strip()
     bug_hits = sum(1 for pat in BUG_STRONG_PATTERNS if pat.search(text))
-    change_hits = sum(1 for pat in CHANGE_STRONG_PATTERNS if pat.search(text))
+    change_hits = sum(1 for pat in CHANGE_STRONG_PATTERNS if pat.search(text)) + int(_has_instead_of_change(text))
 
     delivered_tokens = set(_domain_tokens(f"{delivered.title} {delivered.body} {delivered.delivery_summary}"))
     clause_tokens = set(_domain_tokens(text))
@@ -718,8 +733,7 @@ def _ensure_local_followup_task(repo: config.Repo, item: dict) -> tuple[str, str
             return tid, tid, f"local:{tid}"
     kind = "fix" if item["kind"] == "bug" else "feat"
     body = f"{item['body'].rstrip()}\n\n{marker}"
-    tid = tasks_store.task_add(repo.name, item["title"], body=body, kind=kind,
-                               state="todo" if repo.pipeline else "draft")
+    tid = tasks_store.task_add(repo.name, body, title=item["title"], kind=kind)
     return tid, tid, f"local:{tid}"
 
 
@@ -753,11 +767,12 @@ def _create_item_ticket(cfg: config.Config, repo: config.Repo, tk: tracker.Track
 
 
 def _ensure_github_dependency(repo: config.Repo, prereq_tid: str, dependent_tid: str) -> None:
-    path = f"repos/{repo.github}/issues/{int(dependent_tid)}/dependencies/blocked_by"
+    slug = gh._safe_repo(repo.github)
+    path = f"repos/{slug}/issues/{int(dependent_tid)}/dependencies/blocked_by"
     existing = gh.api_list(path)
     if any(str(row.get("number")) == str(prereq_tid) for row in existing):
         return
-    prereq_id = gh.issue_node(repo.github, int(prereq_tid))["id"]
+    prereq_id = gh.issue_node(slug, int(prereq_tid))["id"]
     gh.gh(
         ["api", "-X", "POST", path, "--input", "-"],
         input=gh.Outgoing(json.dumps({"issue_id": int(prereq_id)})),
@@ -785,7 +800,7 @@ def _ensure_backlink(repo: config.Repo, tk: tracker.Tracker, followup: dict,
 
 def _find_marker_comment_url(repo: config.Repo, tk: tracker.Tracker, tid: str, marker: str) -> str:
     for row in ticket_feedback.fetch_thread_comments(repo, tk, str(tid)):
-        if marker in (row.body or "").splitlines():
+        if ticket_feedback._is_trusted_marker_author(tk, row) and marker in (row.body or "").splitlines():
             return row.url or f"{tk.name}:{tid}:{marker}"
     return ""
 
@@ -905,7 +920,7 @@ def _build_plan_rows(followup_id: str, repo: config.Repo, tk: tracker.Tracker,
                      open_checker: OpenChecker | None = None) -> tuple[dict, list[dict]]:
     tid = str(comment_row["ticket"])
     cid = str(comment_row["comment_id"])
-    reply_marker = f"{REPLY_MARKER_PREFIX}{followup_id}"
+    reply_marker = f"{REPLY_MARKER_PREFIX}{followup_id}-{secrets.token_hex(12)}"
     followup_row = {
         "id": followup_id,
         "repo": repo.name,
@@ -931,7 +946,7 @@ def _build_plan_rows(followup_id: str, repo: config.Repo, tk: tracker.Tracker,
         matched = find_matching_open_bug(repo, tk, tid, planned, open_checker=open_checker)
         dep_ids = [item_ids[d] for d in planned.depends_on if 0 <= d < seq]
         if matched is not None:
-            marker = f"{EVIDENCE_MARKER_PREFIX}{item_id}"
+            marker = f"{EVIDENCE_MARKER_PREFIX}{item_id}-{secrets.token_hex(12)}"
             item_rows.append({
                 "id": item_id,
                 "followup_id": followup_id,
@@ -961,7 +976,7 @@ def _build_plan_rows(followup_id: str, repo: config.Repo, tk: tracker.Tracker,
             })
         else:
             pub_key = f"fup-{ticket_feedback.digest([repo.name, tid, tk.name, cid, seq])[:32]}"
-            marker = f"{LOCAL_MARKER_PREFIX}{item_id}"
+            marker = f"{LOCAL_MARKER_PREFIX}{item_id}-{secrets.token_hex(12)}"
             body = _format_followup_body(repo, delivered, planned, comment_row, [])
             item_rows.append({
                 "id": item_id,

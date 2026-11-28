@@ -658,15 +658,25 @@ def init(*, fence: Fence | None = None) -> None:
                 switched = {}
             if isinstance(switched, dict):
                 for loop_name, enabled in sorted(switched.items()):
+                    if not isinstance(loop_name, str) or not loop_name.strip():
+                        continue
+                    try:
+                        clean_loop = _normalize_rel(loop_name)
+                    except ConfigRepoError:
+                        continue
                     enabled_bool = bool(enabled)
-                    if "/" in loop_name:
-                        repo_name, _, sub = loop_name.partition("/")
+                    if "/" in clean_loop:
+                        repo_name, _, sub = clean_loop.partition("/")
+                        if "/" in sub:
+                            continue
                         layer_loop = root / "layers" / repo_name / "loops" / sub / "loop.toml"
-                        if layer_loop.is_file():
+                        if layer_loop.resolve().is_relative_to(root) and layer_loop.is_file():
                             updated = _set_enabled_toml(layer_loop.read_text(), enabled_bool)
                             _write_atomic_bytes(layer_loop, updated.encode("utf-8"), 0o644)
                             continue
-                    target_toml = root / "loops" / loop_name / "loop.toml"
+                    target_toml = root / "loops" / clean_loop / "loop.toml"
+                    if not target_toml.resolve().is_relative_to(root):
+                        continue
                     if target_toml.is_file():
                         updated = _set_enabled_toml(target_toml.read_text(), enabled_bool)
                     else:

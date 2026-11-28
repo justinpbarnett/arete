@@ -5,6 +5,7 @@ import json
 import sqlite3
 
 from .. import paths, util
+from ._rows import json_dict
 from .db import NoDatabase, reader, tx
 
 TABLES = {
@@ -83,10 +84,7 @@ def _decode(row) -> dict:
     if "linked" in item:
         item["linked"] = bool(item["linked"])
     if "data" in item:
-        try:
-            item["data"] = json.loads(item["data"] or "{}")
-        except ValueError:
-            item["data"] = {}
+        item["data"] = json_dict(item["data"])
     return item
 
 
@@ -503,12 +501,7 @@ def complete_followup(followup_id: str, reply_url: str, reply_body: str, *,
             "SELECT data FROM ticket_comments WHERE repo = ? AND ticket = ? AND tracker = ? AND comment_id = ?",
             (row["repo"], row["ticket"], row["tracker"], row["comment_id"]),
         ).fetchone()
-        merged_data: dict = {}
-        if comment_row:
-            try:
-                merged_data = json.loads(comment_row["data"] or "{}")
-            except ValueError:
-                merged_data = {}
+        merged_data: dict = json_dict(comment_row["data"]) if comment_row else {}
         if comment_data:
             merged_data.update(comment_data)
         c.execute(
