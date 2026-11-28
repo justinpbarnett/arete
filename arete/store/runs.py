@@ -667,12 +667,21 @@ def running_runs(conn):
     return [dict(r) for r in conn.execute("SELECT * FROM runs WHERE status='running'")]
 
 
+def _sync_inbox_runs(c) -> None:
+    from .. import inbox
+
+    inbox.sync(c, "runs")
+    inbox.sync(c, "asks")
+
+
 def insert_run(run_id: str, row: dict) -> None:
     from . import factory
 
     with writes.atomic() as c:
         writes.insert("runs", row, run_id, "run.started")
         factory.registered_run(c, run_id, row)
+        if row.get("kind") == "pipeline":
+            _sync_inbox_runs(c)
 
 
 def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
@@ -732,7 +741,11 @@ def move(run_id: str, to: str, expect: tuple[str, ...], *, base_version=None, **
             writes.check_run(run_id, base_version)
         return False
     fields = {**fields, "status": to}
-    return writes.update("runs", run_id, fields, expect=expect, base_version=base_version) is not None
+    with writes.atomic() as c:
+        updated = writes.update("runs", run_id, fields, expect=expect, base_version=base_version)
+        if updated is not None and updated.get("kind") == "pipeline" and (to == "needs-info" or "needs-info" in expect):
+            _sync_inbox_runs(c)
+        return updated is not None
 
 
 def ask_stop(run_id: str, base_version=None) -> dict | None:
@@ -764,6 +777,8 @@ def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> 
             insights.release_interrupted_feedback(run_id)
         if end_line:
             insert_feed(run_id, "end", end_line)
+        if settled["kind"] == "pipeline" and settled["status"] == "needs-info":
+            _sync_inbox_runs(c)
         return settled
 
 

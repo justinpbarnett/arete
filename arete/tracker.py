@@ -37,6 +37,7 @@ MAX_IMAGE_BYTES = ticket_media.MAX_IMAGE_BYTES
 MAX_VIDEO_BYTES = ticket_media.MAX_VIDEO_BYTES
 ARETE_TAG = "[arete]"
 TASK_ID = re.compile(r"t-[0-9a-f]{4,}", re.IGNORECASE)
+DEPENDENCY_WAIT = "dependency_wait"
 
 
 class TaskError(LookupError):
@@ -86,6 +87,7 @@ class Ticket:
     updated: str = ""
     labels: list[str] = field(default_factory=list)
     blocker: str = ""
+    blocker_kind: str = ""
     images: list[Image] = field(default_factory=list)
     github_repo: str = ""
     github_blockers: list[int | str] = field(default_factory=list)
@@ -170,6 +172,14 @@ def batch_ids(t: Ticket) -> list[str]:
     return [own, *sorted(set(named) - {own}, key=int)]
 
 
+
+
+def blocker_of(source, tid: str) -> tuple[str, str]:
+    if "blocker" in getattr(source, "__dict__", {}):
+        return source.blocker(tid), ""
+    if hasattr(source, "blocker_info"):
+        return source.blocker_info(tid)
+    return source.blocker(tid), ""
 
 
 def for_repo(cfg: config.Config, repo: config.Repo) -> Tracker:
@@ -287,13 +297,22 @@ class GitHubTracker:
         return bool(login) and login.casefold() == gh.me().casefold()
 
     def blocker(self, tid: str) -> str:
+        return self.blocker_info(tid)[0]
+
+    def blocker_info(self, tid: str) -> tuple[str, str]:
         ticket = self._tickets.get(tid) or self.remember(tid, gh.issue(self.repo.github, int(tid)) or {})
-        return (ZTE_QUEUE if ZTE_LABEL in ticket.labels else "") or error_of(
-            lambda: batch_ids(ticket)) or self.ticket_wait_blocker(ticket)
+        if ZTE_LABEL in ticket.labels:
+            return ZTE_QUEUE, ""
+        if err := error_of(lambda: batch_ids(ticket)):
+            return err, ""
+        return self.ticket_wait_blocker_info(ticket)
 
     def ticket_wait_blocker(self, ticket: Ticket, *, include_environment: bool = True) -> str:
+        return self.ticket_wait_blocker_info(ticket, include_environment=include_environment)[0]
+
+    def ticket_wait_blocker_info(self, ticket: Ticket, *, include_environment: bool = True) -> tuple[str, str]:
         if ticket.blocker:
-            return ticket.blocker
+            return ticket.blocker, ticket.blocker_kind
         own = self.repo.github.casefold()
         waits = github_waits(ticket.body, own)
         if include_environment:
@@ -306,7 +325,7 @@ class GitHubTracker:
             satisfied |= cross_repo.satisfied_cross_repo_native(self.enrolled_repos, self.repo, ticket.id, native)
             native -= satisfied
             refs = [ref for ref in refs if ref not in satisfied]
-        return wait_blocker([*refs, *sorted(native, key=str)], lambda ref: ref in native or self.wait_is_open(ref))
+        return wait_blocker_info([*refs, *sorted(native, key=str)], lambda ref: ref in native or self.wait_is_open(ref))
 
     def wait_is_open(self, ref: int | str) -> bool | None:
         if isinstance(ref, int):
@@ -377,14 +396,17 @@ class GitHubTracker:
         publisher = "the configured GitHub user" if spec else self.owner
         blocker = (ZTE_QUEUE if ZTE_LABEL in labels else "") or (
             "" if self.by_publisher(i, spec) else f"it was opened by {author or 'someone else'}, not {publisher}") or (
-            "" if LABEL in labels else f"it has no `{LABEL}` label") or self.ticket_wait_blocker(ticket)
+            "" if LABEL in labels else f"it has no `{LABEL}` label")
+        blocker_kind = ""
+        if not blocker:
+            blocker, blocker_kind = self.ticket_wait_blocker_info(ticket)
         body = ticket.body or "(no description)"
         owner_comments = scope_comments(comments)
         images = _media_refs_to_images(ticket_media.extract_media_refs(body, owner_comments, origin="github"))
         ticket = replace(ticket, body=body, comments=comments_text(comments),
                          owner_comments=owner_comments, saved_scope_matches=same_comment_scope(comments, comments, saved_comments),
                          open=i.get("state") == "OPEN", kind="fix" if FIX_LABELS & set(labels) else "feat",
-                         updated=i.get("updatedAt") or "", blocker=blocker, images=images,
+                         updated=i.get("updatedAt") or "", blocker=blocker, blocker_kind=blocker_kind, images=images,
                          spec_identity=github_issue_identity(self.repo.github, i["number"]))
         if ZTE_LABEL not in labels:
             batch_ids(ticket)
@@ -492,10 +514,16 @@ class JiraTracker:
         return [search_ticket(self.client, i) for i in issues]
 
     def blocker(self, tid: str) -> str:
+        return self.blocker_info(tid)[0]
+
+    def blocker_info(self, tid: str) -> tuple[str, str]:
         issue = self.client.issue(tid, JIRA_FIELDS)
-        return (check_approval(self.client.me().get("accountId", ""), issue, self.client.changelog(tid), self.route)[0]
-                or wait_blocker(waits_on_jira((issue.get("fields") or {}).get("description") or ""), self.is_open)
-                or environment_blocker(self.repo.name, tid))
+        if approved := check_approval(self.client.me().get("accountId", ""), issue, self.client.changelog(tid), self.route)[0]:
+            return approved, ""
+        waited, kind = wait_blocker_info(waits_on_jira((issue.get("fields") or {}).get("description") or ""), self.is_open)
+        if waited:
+            return waited, kind
+        return environment_blocker_info(self.repo.name, tid)
 
     def is_open(self, key: str) -> bool | None:
         try:
@@ -545,9 +573,11 @@ class JiraTracker:
             if (f.get("issuetype") or {}).get("subtask"):
                 blocker = blocker or "a Jira subtask cannot be a bootstrap spec"
         body = f.get("description") or "(no description)"
-        blocker = blocker or wait_blocker(waits_on_jira(body), self.is_open)
+        blocker_kind = ""
+        if not blocker:
+            blocker, blocker_kind = wait_blocker_info(waits_on_jira(body), self.is_open)
         if include_environment and not blocker:
-            blocker = environment_blocker(self.repo.name, tid)
+            blocker, blocker_kind = environment_blocker_info(self.repo.name, tid)
         parent = f.get("parent") or {}
         if parent.get("key"):
             body = f"Part of {parent['key']}: {(parent.get('fields') or {}).get('summary', '')}\n\n{body}"
@@ -567,7 +597,7 @@ class JiraTracker:
                       saved_scope_matches=same_comment_scope(comments, directed, saved_comments), open=((status.get("statusCategory") or {}).get("key") != "done"),
                       kind="fix" if itype in FIX_TYPES or FIX_LABELS & set(labels) else "feat",
                       url=self.client.browse_url(tid), created=f.get("created", ""), updated=f.get("updated") or "",
-                      labels=labels, blocker=blocker, images=images, spec_identity=spec_identity)
+                      labels=labels, blocker=blocker, blocker_kind=blocker_kind, images=images, spec_identity=spec_identity)
 
     def save_images(self, t: Ticket, dest: Path, *, fetcher=None, keyframe_extractor=None) -> SavedImages:
         out = SavedImages()
@@ -701,9 +731,15 @@ class LocalTracker:
         return True
 
     def blocker(self, tid: str) -> str:
+        return self.blocker_info(tid)[0]
+
+    def blocker_info(self, tid: str) -> tuple[str, str]:
         if (row := tasks_store.task_get(tid)) is None:
-            return f"there is no task {tid}"
-        return task_wait_blocker(waits_on_tasks(row["body"]), task_state) or environment_blocker(self.repo.name, tid)
+            return f"there is no task {tid}", ""
+        waited, kind = task_wait_blocker_info(waits_on_tasks(row["body"]), task_state)
+        if waited:
+            return waited, kind
+        return environment_blocker_info(self.repo.name, tid)
 
     def replied(self) -> list[Ticket]:
         return [task_ticket(row) for row in tasks_store.tasks_replied(self.repo.name)]
@@ -727,11 +763,15 @@ class LocalTracker:
         history = tasks_store.task_comments(tid)
         comments = [("Arete" if c["author"] == "arete" else "Owner", c["ts"] or "", c["body"] or "") for c in history]
         directed = [text for c, text in zip(history, comments) if c["author"] != "arete" and principals.is_person(c["author"])]
-        blocker = (f"it is a task of {row['repo']}, not {self.repo.name}" if row["repo"] != self.repo.name
-                   else task_wait_blocker(waits_on_tasks(row["body"]), task_state))
+        blocker_kind = ""
+        if row["repo"] != self.repo.name:
+            blocker = f"it is a task of {row['repo']}, not {self.repo.name}"
+        else:
+            blocker, blocker_kind = task_wait_blocker_info(waits_on_tasks(row["body"]), task_state)
         if include_environment and not blocker:
-            blocker = environment_blocker(self.repo.name, tid)
-        return replace(task_ticket(row, comments_text(comments), blocker), owner_comments=scope_comments(directed))
+            blocker, blocker_kind = environment_blocker_info(self.repo.name, tid)
+        return replace(task_ticket(row, comments_text(comments), blocker), blocker_kind=blocker_kind,
+                       owner_comments=scope_comments(directed))
 
     def prepare(self) -> list[str]:
         return []
@@ -1156,7 +1196,7 @@ def _refs(references: Iterable[int | str]) -> str:
     return joined([ref if isinstance(ref, str) and "#" in ref else ref_for(ref) for ref in references])
 
 
-def task_wait_blocker(waits: list[str], state_of: Callable[[str], str | None]) -> str:
+def task_wait_blocker_info(waits: list[str], state_of: Callable[[str], str | None]) -> tuple[str, str]:
     seen = {tid: state_of(tid) for tid in waits}
     held = [f"{tid} ({s})" for tid, s in seen.items() if s is not None and s not in config.TASK_FINISHED]
     missing = [tid for tid, s in seen.items() if s is None]
@@ -1165,10 +1205,15 @@ def task_wait_blocker(waits: list[str], state_of: Callable[[str], str | None]) -
         parts.append(f"it waits on {joined(held)}, not yet done or closed")
     if missing:
         parts.append(f"it waits on {joined(missing)}, which {'matches' if len(missing) == 1 else 'match'} no task")
-    return "; ".join(parts)
+    reason = "; ".join(parts)
+    return reason, DEPENDENCY_WAIT if held and not missing else ""
 
 
-def wait_blocker[T: (int, str)](waits: list[T], is_open: Callable[[T], bool | None]) -> str:
+def task_wait_blocker(waits: list[str], state_of: Callable[[str], str | None]) -> str:
+    return task_wait_blocker_info(waits, state_of)[0]
+
+
+def wait_blocker_info[T: (int, str)](waits: list[T], is_open: Callable[[T], bool | None]) -> tuple[str, str]:
     seen = {n: is_open(n) for n in waits}
     still = [n for n, v in seen.items() if v is True]
     unread = [n for n, v in seen.items() if v is None]
@@ -1177,12 +1222,21 @@ def wait_blocker[T: (int, str)](waits: list[T], is_open: Callable[[T], bool | No
         parts.append(f"it waits on {_refs(still)}, which {'is' if len(still) == 1 else 'are'} still open")
     if unread:
         parts.append(f"it waits on {_refs(unread)}, which arete could not read")
-    return "; ".join(parts)
+    reason = "; ".join(parts)
+    return reason, DEPENDENCY_WAIT if still and not unread else ""
+
+
+def wait_blocker[T: (int, str)](waits: list[T], is_open: Callable[[T], bool | None]) -> str:
+    return wait_blocker_info(waits, is_open)[0]
+
+
+def environment_blocker_info(repo: str, tid: str) -> tuple[str, str]:
+    refs = {f"{remote}#{number}": (remote, number) for remote, number in run_store.environment_waits(repo, tid)}
+    return wait_blocker_info(list(refs), lambda ref: GitHubTracker.issue_open(*refs[ref]))
 
 
 def environment_blocker(repo: str, tid: str) -> str:
-    refs = {f"{remote}#{number}": (remote, number) for remote, number in run_store.environment_waits(repo, tid)}
-    return wait_blocker(list(refs), lambda ref: GitHubTracker.issue_open(*refs[ref]))
+    return environment_blocker_info(repo, tid)[0]
 
 
 def jira_unrouted(project: str, routes: set[str], client: jira.Client) -> list[Ticket]:

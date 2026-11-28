@@ -684,7 +684,7 @@ Health lists workspaces held because a legacy snapshot was unreadable, changed d
 - Retried by `arete serve` every ten minutes after release. The sweep also removes kept or held workspaces when the latest whole run is `merged`, `rejected` or `done` (or the ticket is a closed local task). It skips tickets in use and keeps workspaces with saved edits or files that block removal.
 - The sweep runs `git worktree remove --force` and `git worktree prune` under the repo lock and prunes registrations in each configured repo. The local `arete/<n>-...` branch stays.
 
-The sweep records cleanup results on the workspace rows. Dashboard Health lists held workspaces with their blocking files or last sweep error. The heartbeat check `workspaces:held` reports their count, size and age and warns about blocked workspaces. The sweep removes unowned folders after seven days when they contain no files or scratch roots, and records old unowned folders with files as held.
+The sweep records cleanup results on the workspace rows. Held workspaces appear in the owner inbox (with `keep` and `remove` actions), in Dashboard Health with their blocking files or last sweep error, and in the heartbeat check `workspaces:held` reporting their count, size and age and warning about blocked workspaces. The sweep removes unowned folders after seven days when they contain no files or scratch roots, and records old unowned folders with files as held.
 
 ## Records
 

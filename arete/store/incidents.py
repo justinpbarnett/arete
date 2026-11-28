@@ -83,6 +83,12 @@ def known_fingerprints() -> dict[str, dict]:
         return held
 
 
+def _sync_inbox(c, source: str) -> None:
+    from .. import inbox
+
+    inbox.sync(c, source)
+
+
 def update_incident(incident_id: int, note: str = "", **fields) -> None:
     validate_columns(fields, INCIDENT_UPDATABLE_FIELDS, "incidents")
     if fields.get("state", "open") != "open" and "closed" not in fields:
@@ -94,6 +100,8 @@ def update_incident(incident_id: int, note: str = "", **fields) -> None:
         if note:
             c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
                       (incident_id, util.iso(), note))
+        if "phase" in fields or "state" in fields:
+            _sync_inbox(c, "incidents")
 
 
 def woken_incidents() -> list[dict]:
@@ -167,17 +175,21 @@ def alert_get(key: str) -> dict | None:
 
 
 def alert_set(key: str, issue: int | None, repo: str = "") -> None:
-    prev = alert_get(key)
     with db() as c:
+        prev = c.execute("SELECT * FROM alerts WHERE key = ?", (key,)).fetchone()
+        opened = prev["opened"] if prev else util.iso()
+        repo_name = repo or (prev["repo"] if prev else "") or ""
         c.execute(
             "INSERT OR REPLACE INTO alerts (key, issue, opened, last_seen, repo) VALUES (?,?,?,?,?)",
-            (key, issue, (prev or {}).get("opened") or util.iso(), util.iso(), repo or (prev or {}).get("repo") or ""),
+            (key, issue, opened, util.iso(), repo_name),
         )
+        _sync_inbox(c, "alerts")
 
 
 def alert_clear(key: str) -> None:
     with db() as c:
         c.execute("DELETE FROM alerts WHERE key = ?", (key,))
+        _sync_inbox(c, "alerts")
 
 
 def alerts(connect=reader) -> list[dict]:

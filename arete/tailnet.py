@@ -245,6 +245,10 @@ class Server(ThreadingHTTPServer):
         self.address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
         self.node, self.logins, self.inside_serve, self.tls = node, logins, inside_serve, tls
         self.redirect = redirect
+        self.pending_secrets: dict[tuple[str, str], str] = {}
+        from . import inbox
+
+        inbox.on_server_start(self.pending_secrets)
         super().__init__((address, port), handler)
 
     def finish_request(self, request, client_address) -> None:
