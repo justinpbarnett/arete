@@ -23954,3 +23954,353 @@ class SettingsShellTests(unittest.TestCase):
             assert.equal(SECTIONS.length, 13);
         """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class RunSteerAndSessionsTests(unittest.TestCase):
+    def test_run_ui_assets_served_over_http_and_safe(self):
+        root = Path(__file__).resolve().parents[1]
+        web = root / "arete" / "web"
+        _, served = dashboard.web_snapshot()
+        expected = {
+            "ui-run-steer.js": ("/steer", "nothing to steer", "waits on"),
+            "ui-sessions.js": ("/api/v1/sessions", "/api/v1/runs?kind=session", "Start a session"),
+            "ui-run-sandbox.js": ("/sandbox", "/diff", "takeover", "No sandbox recorded"),
+        }
+        class QuietAssetHandler(dashboard.Handler):
+            def log_request(self, *_):
+                pass
+
+            def admit(self, method, path):
+                self.server.tls = object()
+                try:
+                    return super().admit(method, path)
+                finally:
+                    self.server.tls = None
+
+        address = "127.0.0.1"
+        node = tailnet.Node((address,), frozenset({address}), address)
+        logins = tailnet.Logins(mock.Mock())
+        with tempfile.TemporaryDirectory() as tmp, support.workspace_state(Path(tmp)):
+            db.migrate()
+            principals.seed_owner("owner@example.test")
+            with mock.patch.object(logins, "of", return_value="owner@example.test"), \
+                 mock.patch("socket.getfqdn", return_value=address):
+                server = tailnet.Server(address, 0, node, logins, False, QuietAssetHandler, dashboard.Redirect)
+                thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+                thread.start()
+                try:
+                    port = server.server_port
+                    for name, needles in expected.items():
+                        path = web / name
+                        text = path.read_text(encoding="utf-8")
+                        self.assertIn(f"/{name}", served)
+                        self.assertEqual(served[f"/{name}"][0], path.read_bytes())
+                        conn = HTTPConnection(address, port, timeout=5)
+                        try:
+                            conn.request("GET", f"/{name}")
+                            resp = conn.getresponse()
+                            body = resp.read().decode("utf-8")
+                        finally:
+                            conn.close()
+                        self.assertEqual(resp.status, 200)
+                        self.assertEqual(body, text)
+                        for needle in needles:
+                            self.assertIn(needle, body)
+                        for forbidden in ("style=", "innerHTML"):
+                            self.assertNotIn(forbidden, body)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
+
+    def test_run_steer_and_sessions_behavior(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import { RunSteer, canSteerRun, formatFinished, waitingTarget, pruneQueued, sendSteer } from "./arete/web/ui-run-steer.js";
+            import { sessionCommand, sessionBox, openSessionBox, closeSessionBox, validateSessionDraft, submitSession, fetchSessionRuns } from "./arete/web/ui-sessions.js";
+            import { notice } from "./arete/web/ui-notice.js";
+
+            function textOf(node) {
+              if (node == null || typeof node === "boolean") return "";
+              if (typeof node === "string" || typeof node === "number") return String(node);
+              if (Array.isArray(node)) return node.map(textOf).join("");
+              if (typeof node.type === "function" && !node.type.prototype?.render) return textOf(node.type(node.props));
+              return textOf(node.props?.children);
+            }
+            function* walk(node) {
+              if (Array.isArray(node)) { for (const c of node) yield* walk(c); }
+              else if (node && typeof node === "object") { yield node; yield* walk(node.props?.children); }
+            }
+
+            assert.equal(canSteerRun({ status: "running", kind: "session" }), true);
+            assert.equal(canSteerRun({ status: "queued", kind: "session" }), true);
+            assert.equal(canSteerRun({ status: "running", kind: "pipeline" }), false);
+            assert.equal(canSteerRun({ status: "done", kind: "session" }), false);
+            assert.equal(formatFinished("2026-11-28T15:55:12Z"), "15:55");
+
+            const baseCtx = { run: { retry: { name: "retry" } } };
+            const runningSession = new RunSteer({
+              view: { detail: { run: { id: "ses-1", kind: "session", status: "running" } }, turns: [] },
+              group: "Running", fault: "", elapsedText: "1m 0s", costText: "$0.10", context: baseCtx, snapshot: {}, statusWord: "▷ RUNNING",
+            });
+            const rsTree = runningSession.render(runningSession.props, runningSession.state);
+            const rsNodes = [...walk(rsTree)];
+            assert.ok(rsNodes.some((n) => n.type === "textarea" && n.props.placeholder === "tell the agent at its next turn"));
+            assert.ok(textOf(rsTree).includes("Send at next turn"));
+            assert.ok(textOf(rsTree).includes("Stop the run"));
+            assert.ok(!textOf(rsTree).includes("Hold the run"));
+
+            const runningPipe = new RunSteer({
+              view: { detail: { run: { id: "pip-1", kind: "pipeline", status: "running" } }, turns: [] },
+              group: "Running", fault: "", elapsedText: "2m 0s", costText: "$0.20", context: baseCtx, snapshot: {}, statusWord: "▷ RUNNING",
+            });
+            const rpText = textOf(runningPipe.render(runningPipe.props, runningPipe.state));
+            assert.ok(rpText.includes("takes no steer"));
+            assert.ok(rpText.includes("Stop the run"));
+
+            const doneRun = new RunSteer({
+              view: { detail: { run: { id: "pip-2", kind: "pipeline", status: "done", finished: "2026-11-28T15:55:00Z", paid: 0.48 } }, turns: [] },
+              group: "Done", fault: "", elapsedText: "5m 59s", costText: "$0.48", context: baseCtx, snapshot: {}, statusWord: "✓ DONE",
+            });
+            const doneText = textOf(doneRun.render(doneRun.props, doneRun.state));
+            assert.ok(doneText.includes("finished 15:55 · nothing to steer"));
+            assert.ok(doneText.includes("5m 59s · $0.48"));
+
+            const waitSnap = { questions: { data: { asks: [{ id: "ask-9", run: "pip-3", ticket: "T-201", questions: [{ header: "TR-201" }] }] } } };
+            const target = waitingTarget({ id: "pip-3", ticket: "T-201" }, waitSnap);
+            assert.equal(target.href, "#triage/ask/ask-9");
+            const waitRun = new RunSteer({
+              view: { detail: { run: { id: "pip-3", kind: "pipeline", status: "needs-info", ticket: "T-201" } }, turns: [] },
+              group: "Waiting on you", fault: "", elapsedText: "3m 0s", costText: "$0.16", context: baseCtx, snapshot: waitSnap, statusWord: "◆ WAITING",
+            });
+            const waitText = textOf(waitRun.render(waitRun.props, waitRun.state));
+            assert.ok(waitText.includes("◆ waits on TR-201"));
+            assert.ok(waitText.includes("Open TR-201"));
+
+            const faultRun = new RunSteer({
+              view: { detail: { run: { id: "pip-4", kind: "pipeline", status: "failed" } }, turns: [] },
+              group: "Fault", fault: "tests failed", elapsedText: "1m 0s", costText: "$0.05", context: baseCtx, snapshot: {}, statusWord: "× FAILED",
+            });
+            const faultText = textOf(faultRun.render(faultRun.props, faultRun.state));
+            assert.ok(faultText.includes("tests failed"));
+            assert.ok(faultText.includes("Retry"));
+
+            const requests = [];
+            const headerOf = (headers, name) => headers instanceof Headers ? headers.get(name) : headers?.[name];
+            globalThis.location = { hash: "#floor", protocol: "http:", host: "127.0.0.1" };
+            globalThis.fetch = async (url, init = {}) => {
+              requests.push({ url, method: init.method ?? "GET", headers: init.headers, body: init.body });
+              if (url === "/api/sessions") {
+                return Response.json({
+                  sessions: [],
+                  choices: { devices: ["local", "box"], models: ["sonnet"], runners: ["claude"], repos: ["arete"], tools: ["Read", "Bash"], default_tools: ["Read"], default_model: "sonnet", idle_hours: 4 },
+                });
+              }
+              if (url === "/api/v1/runs?kind=session") return Response.json({ seq: "0.1", runs: [{ id: "ses-1", kind: "session", status: "running" }] });
+              if (url === "/api/v1/runs/ses-1/steer") return Response.json({ seq: "0.2", id: "ses-1", queued: true });
+              if (url === "/api/v1/sessions") return Response.json({ seq: "0.3", run: { id: "ses-new", kind: "session", status: "queued" }, session: { id: "ses-new" } }, { status: 201 });
+              return Response.json({ error: "unexpected" }, { status: 404 });
+            };
+
+            const emptySteer = await sendSteer("ses-1", "   ");
+            assert.equal(emptySteer.ok, false);
+            assert.equal(requests.length, 0);
+
+            const sentSteer = await sendSteer("ses-1", "check edge cases");
+            assert.equal(sentSteer.ok, true);
+            assert.equal(requests.length, 1);
+            assert.equal(requests[0].url, "/api/v1/runs/ses-1/steer");
+            assert.equal(headerOf(requests[0].headers, "X-Arete"), "1");
+            assert.ok(headerOf(requests[0].headers, "Idempotency-Key").length >= 16);
+            assert.deepEqual(JSON.parse(requests[0].body), { text: "check edge cases" });
+
+            const queued = [{ id: "q1", text: "check edge cases", seenTurns: 1 }];
+            assert.equal(pruneQueued(queued, [{ kind: "reply", text: "first" }]).length, 1);
+            assert.equal(pruneQueued(queued, [{ kind: "reply", text: "first" }, { kind: "you", text: "check edge cases" }]).length, 0);
+
+            assert.equal(sessionCommand.title, "Start a session");
+            assert.equal(validateSessionDraft({ prompt: "  " }).error, "Write a prompt first.");
+            assert.ok(validateSessionDraft({ prompt: "hi", budget: "-1" }).error);
+
+            openSessionBox();
+            await new Promise((r) => setTimeout(r, 20));
+            const beforeEmpty = requests.length;
+            assert.equal(await submitSession(), false);
+            assert.equal(requests.length, beforeEmpty);
+            assert.equal(sessionBox.value.error, "Write a prompt first.");
+
+            sessionBox.value = { ...sessionBox.value, prompt: "Inspect build", device: "box", model: "sonnet", runner: "claude", repo: "arete", tools: ["Read", "Bash"], budget: "1.50" };
+            assert.equal(await submitSession(), true);
+            assert.equal(sessionBox.value, null);
+            assert.equal(globalThis.location.hash, "#run/ses-new");
+            assert.ok(notice.value.includes("ses-new"));
+            const startReq = requests.find((r) => r.url === "/api/v1/sessions");
+            assert.ok(startReq && headerOf(startReq.headers, "Idempotency-Key").length >= 16);
+            assert.deepEqual(JSON.parse(startReq.body), {
+              prompt: "Inspect build", device: "box", model: "sonnet", runner: "claude", repo: "arete", tools: ["Read", "Bash"], budget_usd: 1.5,
+            });
+            const listed = await fetchSessionRuns();
+            assert.equal(listed[0].id, "ses-1");
+            closeSessionBox();
+        """], capture_output=True, text=True, timeout=10, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class RunSandboxApiAndUiTests(unittest.TestCase):
+    def test_run_sandbox_takeover_workspace_egress_and_tail(self):
+        import shlex
+        from arete import board, devices, leases, ssh
+        from arete.store import devices as device_store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with support.workspace_state(root):
+                db.migrate()
+                dev_dir = devices.devices_dir()
+                dev_dir.mkdir(parents=True, exist_ok=True)
+                (dev_dir / "box.toml").write_text(
+                    'kind = "ssh"\nhost = "alice@box.example"\nport = 2222\n'
+                    'identity = "~/.ssh/id_box_test"\ndir = "/srv/work"\negress = "integrations"\n',
+                    encoding="utf-8",
+                )
+                (dev_dir / "exebox.toml").write_text(
+                    'kind = "exe"\ndir = "/home/agent/work"\negress = "all"\n',
+                    encoding="utf-8",
+                )
+                with db.tx(fenced=False) as c:
+                    device_store.insert_device_probe(
+                        c, device="box", device_version=devices.version_of("box"),
+                        at="2026-11-28T15:38:02Z", ok=True, seconds=0.4,
+                        system="Linux x86_64", home="/home/alice",
+                        tools=["claude"], gpus=[], detail="",
+                        facts={"ok": True, "at": "2026-11-28T15:38:02Z", "system": "Linux x86_64", "cwd": "/srv/work"},
+                    )
+
+                r_ssh = support.start_pipeline(repo="demo", issue=7, device="box", branch="feat/sandbox")
+                record.mark(r_ssh, "clone", repo="o/demo", base="main", branch="feat/sandbox", path="/srv/work")
+                log_path = paths.RUNS_DIR / r_ssh / "run.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                lines = [f"line-{i}" for i in range(1, 20)] + ["X" * 480]
+                log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+                active_ssh = leases.claim("box", devices.version_of("box"), run_id=r_ssh, start_renewer=False)
+                sbx = api.execute("run.sandbox", {"run": r_ssh})
+                contract.validate(sbx, contract.BY_NAME["run.sandbox"]["result"], "run.sandbox")
+                box_dev = devices.get("box")
+                argv = ssh.ssh_argv(box_dev)
+                expected_cmd = shlex.join([*argv[:-1], "-t", argv[-1], "cd /srv/work && exec $SHELL"])
+                self.assertEqual(sbx["takeover"], expected_cmd)
+                self.assertIn("alice@box.example", sbx["takeover"])
+                self.assertIn("-p 2222", sbx["takeover"])
+                self.assertIn("id_box_test", sbx["takeover"])
+                self.assertEqual(sbx["branch"], "feat/sandbox")
+                self.assertEqual(sbx["base"], "main")
+                self.assertEqual(sbx["egress"], "integrations")
+                self.assertEqual(len(sbx["tail"]), 14)
+                self.assertEqual(sbx["tail"][0], "line-7")
+                self.assertEqual(len(sbx["tail"][-1]), 400)
+                self.assertEqual(sbx["tail"], [line[:400] for line in board.log_lines({"id": r_ssh})[-14:]])
+
+                active_ssh.close("deleted", fenced=False)
+                sbx_ended = api.execute("run.sandbox", {"run": r_ssh})
+                contract.validate(sbx_ended, contract.BY_NAME["run.sandbox"]["result"], "run.sandbox")
+                self.assertIsNone(sbx_ended["takeover"])
+                self.assertEqual(sbx_ended["device"], "box")
+                self.assertIsInstance(sbx_ended["facts"], dict)
+
+                r_exe = record.start("loop", loop="sbx", device="exebox")
+                active_exe = leases.claim("exebox", devices.version_of("exebox"), run_id=r_exe, start_renewer=False)
+                active_exe.update(vm_name="arete-exe", ready=util.iso(), address="arete-exe.exe.xyz")
+                sbx_exe = api.execute("run.sandbox", {"run": r_exe})
+                self.assertIn("-t arete-exe.exe.xyz", sbx_exe["takeover"])
+                self.assertIn("cd /home/agent/work && exec $SHELL", sbx_exe["takeover"])
+                self.assertEqual(sbx_exe["egress"], "all")
+                active_exe.close("deleted", fenced=False)
+
+                r_local = record.start("loop", loop="loc", device="local")
+                active_local = leases.claim("local", devices.version_of("local"), run_id=r_local, start_renewer=False)
+                sbx_local = api.execute("run.sandbox", {"run": r_local})
+                self.assertIsNone(sbx_local["takeover"])
+                self.assertIsNone(sbx_local["branch"])
+                self.assertIsNone(sbx_local["base"])
+                self.assertEqual(sbx_local["egress"], "")
+                active_local.close("", fenced=False)
+
+                r_none = record.start("loop", loop="plain")
+                sbx_none = api.execute("run.sandbox", {"run": r_none})
+                self.assertIsNone(sbx_none["takeover"])
+                self.assertIsNone(sbx_none["lease"])
+                self.assertIsNone(sbx_none["branch"])
+                self.assertIsNone(sbx_none["base"])
+                self.assertEqual(sbx_none["tail"], [])
+
+    def test_run_sandbox_ui_behavior(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import { RunSandbox, parseUnifiedDiff, hasSandboxData, extractCwd, copyTakeover } from "./arete/web/ui-run-sandbox.js";
+            import { notice } from "./arete/web/ui-notice.js";
+
+            function textOf(node) {
+              if (node == null || typeof node === "boolean") return "";
+              if (typeof node === "string" || typeof node === "number") return String(node);
+              if (Array.isArray(node)) return node.map(textOf).join("");
+              if (typeof node.type === "function" && !node.type.prototype?.render) return textOf(node.type(node.props));
+              return textOf(node.props?.children);
+            }
+
+            const sampleDiff = [
+              "diff --git a/arete/api.py b/arete/api.py",
+              "--- a/arete/api.py",
+              "+++ b/arete/api.py",
+              "@@ -1,2 +1,3 @@",
+              " keep",
+              "-old",
+              "+new1",
+              "+new2",
+              "diff --git a/tests/new_test.py b/tests/new_test.py",
+              "new file mode 100644",
+              "--- /dev/null",
+              "+++ b/tests/new_test.py",
+              "@@ -0,0 +1,2 @@",
+              "+line1",
+              "+line2",
+            ].join("\\n");
+            const files = parseUnifiedDiff(sampleDiff);
+            assert.deepEqual(files, [
+              { path: "arete/api.py", added: 2, removed: 1, status: "modified" },
+              { path: "tests/new_test.py", added: 2, removed: 0, status: "added" },
+            ]);
+
+            const sandbox = {
+              device: "exebox",
+              lease: "L-9",
+              address: "arete-t142.exe.xyz",
+              facts: { ok: true, at: "2026-11-28T15:38:02Z" },
+              takeover: "ssh -t arete-t142.exe.xyz 'cd /home/agent/work && exec $SHELL'",
+              branch: "arete/T-142",
+              base: "main",
+              egress: "integrations",
+              tail: ["booted", "running checks"],
+            };
+            assert.equal(extractCwd(sandbox), "/home/agent/work");
+            assert.equal(hasSandboxData(sandbox, sampleDiff), true);
+            const fullText = textOf(RunSandbox({ state: { loading: false, error: null, sandbox, diff: sampleDiff, files }, retry: () => {} }));
+            for (const part of ["arete-t142.exe.xyz", "UP", "integrations", "arete/T-142", "main", "/home/agent/work", "15:38:02", "Copy take over command", "Files changed · 2", "arete/api.py", "+2", "-1", "modified", "tests/new_test.py", "added", "booted", "running checks"]) {
+              assert.ok(fullText.includes(part), `missing ${part}`);
+            }
+
+            const noTakeoverText = textOf(RunSandbox({ state: { loading: false, error: null, sandbox: { ...sandbox, takeover: null }, diff: "", files: [] }, retry: () => {} }));
+            assert.ok(!noTakeoverText.includes("Copy take over command"));
+
+            const emptySandbox = { device: "local", lease: null, address: "", facts: null, takeover: null, branch: null, base: null, egress: "", tail: [] };
+            assert.equal(hasSandboxData(emptySandbox, ""), false);
+            const emptyText = textOf(RunSandbox({ state: { loading: false, error: null, sandbox: emptySandbox, diff: "", files: [] }, retry: () => {} }));
+            assert.ok(emptyText.includes("No sandbox recorded"));
+
+            let copied = "";
+            Object.defineProperty(globalThis, "navigator", { value: { clipboard: { writeText: async (text) => { copied = text; } } }, configurable: true });
+            assert.equal(await copyTakeover(sandbox.takeover), true);
+            assert.equal(copied, sandbox.takeover);
+            assert.equal(notice.value, "Copied take over command");
+        """], capture_output=True, text=True, timeout=10, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

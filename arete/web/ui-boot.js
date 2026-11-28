@@ -11,6 +11,7 @@ import { actions, dispatch } from "./ui-actions.js";
 import { dismissMenu } from "./ui-menu.js";
 import { startHooks } from "./ui-hooks.js";
 import { feedbackCommand, startFeedback } from "./ui-feedback.js";
+import { sessionCommand } from "./ui-sessions.js";
 import { normalizePrimary } from "./ui-list.js";
 import { pairedBrowser } from "./browser-auth.js";
 import { browserPaired } from "./ui-notice.js";
@@ -104,5 +105,5 @@ configurePalette(screenKeys.map(([key, id, title, href], index) => ({ key, id, t
 }, () => { mode.value = "NORMAL"; }, [feedbackCommand]);
 startFeedback();
 startKeys();
-globalCommands([{ id: "run-checks", title: "Run checks now", run: () => dispatch(actions.checks) }]);
+globalCommands([{ id: "run-checks", title: "Run checks now", run: () => dispatch(actions.checks) }, sessionCommand]);
 startHooks();

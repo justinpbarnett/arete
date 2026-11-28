@@ -13,6 +13,10 @@
   --accent: #FFD60A;
   --on-accent: #0B0C0E;
   --fault: #F5646A;
+  --diff-add: #16301F;
+  --diff-del: #3A1719;
+  --diff-add-mark: #4CC38A;
+  --diff-del-mark: var(--fault);
   --row: 28px;
   --text-micro: 11px;
   --text-s: 12px;

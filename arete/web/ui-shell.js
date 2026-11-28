@@ -10,6 +10,7 @@ import { FloorFocus, FloorQueue, TaskFocus, TaskQueue } from "./ui-work.js";
 import { SettingsFocus, SettingsQueue } from "./ui-settings.js";
 import { Palette, openPalette } from "./ui-palette.js";
 import { ReasonBox, fixture, fixtureRevision, replayLast } from "./ui-actions.js";
+import { SessionBox } from "./ui-sessions.js";
 import { RunFocus, RunQueue, RunSubtitle } from "./ui-run.js";
 import { browserPaired, clientNotice, staleWrite } from "./ui-notice.js";
 
@@ -134,6 +135,7 @@ export function Shell({ route, snapshot, resources, now, retry, runs }) {
       <${KeyBar} />
       ${actionList ? html`<button class="fixture-replay" type="button" onClick=${replayLast}>Replay last request</button>` : null}
       <${ReasonBox} />
+      <${SessionBox} />
     </main>
     <${KeySheet} />
     <${Palette} />

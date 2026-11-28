@@ -49,7 +49,7 @@ export function KeySheet() {
       </header>
       ${sheetGroups.map(([title, entries]) => html`<section class="sheet-group" key=${title}>
         <h3>${title}</h3>
-        <div class="sheet-grid">${entries.map(([keys, label]) => html`<div class="sheet-entry" key=${keys.join(" ")}>
+        <div class="sheet-grid">${entries.map(([keys, label]) => html`<div class="sheet-entry" key=${`${keys.join(" ")}-${label}`}>
           <span class="sheet-caps">${caps(keys)}</span><span>${label}</span></div>`)}</div>
       </section>`)}
       <section class="sheet-group">

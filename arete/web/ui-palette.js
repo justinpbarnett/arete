@@ -7,6 +7,8 @@ export const pickerModes = {
   steps: ["Add a step…", "add"], triggers: ["Add a trigger…", "add"],
   prompts: ["Choose a prompt…", "choose"], roles: ["Choose a role…", "choose"],
   drop: ["Add a compatible step…", "add + wire"], wires: ["Wire to…", "wire"], create: ["Create…", "create"],
+  device: ["Choose a device…", "choose"], model: ["Choose a model…", "choose"],
+  runner: ["Choose a runner…", "choose"], repo: ["Choose a repository…", "choose"],
 };
 export const palette = signal(null);
 const snapshots = new Map();

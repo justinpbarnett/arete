@@ -4,6 +4,7 @@ import { dismissMenu } from "./ui-menu.js";
 import { paletteKey, paletteRouteChanged } from "./ui-palette.js";
 import { notice } from "./ui-notice.js";
 import { actions, perform, repeat, reasonBox, cancelReason, confirmReason } from "./ui-actions.js";
+import { sessionBox, closeSessionBox, submitSession } from "./ui-sessions.js";
 import { undo } from "./ui-undo.js";
 export { notice };
 
@@ -43,7 +44,10 @@ export const sheetGroups = [
     [[":", "Cmd K"], "command palette"], [["?"], "this sheet"],
     [["Esc"], "leave insert, close; never changes screens"],
   ]],
-  ["Palette only", [[[":"], "snooze 1 hour or to Monday, redirect, batch send, revert a prompt, merge, reply, show done, display"]]],
+  ["Palette only", [
+    [[":"], "Start a session"],
+    [[":"], "snooze 1 hour or to Monday, redirect, batch send, revert a prompt, merge, reply, show done, display"],
+  ]],
 ];
 
 const panes = ["sidebar", "queue", "focus"];
@@ -240,7 +244,8 @@ function insert() {
   const list = focusedList();
   const scope = list && cursorRow(list);
   const fields = [...(scope?.querySelectorAll("textarea, input, [contenteditable]") ?? []),
-    ...paneElements(pane.value).flatMap((el) => [...el.querySelectorAll(".ops-form textarea, .ops-form input")])];
+    ...paneElements(pane.value).flatMap((el) => [...el.querySelectorAll(".ops-form textarea, .ops-form input")]),
+    ...paneElements("focus").flatMap((el) => [...el.querySelectorAll(".ops-form textarea, .ops-form input")])];
   const box = fields.find((el) => writable(el) && usable(el));
   box?.focus();
 }
@@ -350,6 +355,14 @@ function onKey(event) {
     }
     return;
   }
+  if (sessionBox.peek()) {
+    if (event.key === "Escape") { closeSessionBox(); event.target.blur?.(); mode.value = "NORMAL"; event.preventDefault(); }
+    else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      submitSession().then((ok) => { if (ok) mode.value = "NORMAL"; });
+      event.preventDefault();
+    }
+    return;
+  }
   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
     const form = event.target.closest?.(".ops-form");
     const submit = form?.querySelector('button[type="submit"]');
@@ -410,7 +423,10 @@ export function hints() {
   const list = focusedList();
   const row = list && cursorRow(list);
   const found = [[["j", "k"], "move"], [["gg", "G"], "first, last"], [["h", "l"], "pane"], [["Enter"], "open"]];
-  if (row && [...row.querySelectorAll("textarea, input, [contenteditable]")].some(writable)) found.push([["i"], "type"]);
+  const hasBox = (row && [...row.querySelectorAll("textarea, input, [contenteditable]")].some(writable))
+    || [...paneElements(pane.value), ...paneElements("focus")]
+      .some((el) => [...el.querySelectorAll(".ops-form textarea, .ops-form input")].some((field) => writable(field) && usable(field)));
+  if (hasBox) found.push([["i"], "type"]);
   if (document.querySelector("[data-search]")) found.push([["/"], "search"]);
   if (document.querySelector(tabSelector)) found.push([["gt", "gT"], "tab"]);
   const run = list?.uiContext ? actionContext()?.run : null;

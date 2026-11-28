@@ -13,6 +13,9 @@ import { runHash as hashOf, taskHash } from "./ui-data.js";
 import { runView, snapshot } from "./ui-live.js";
 import { TicketProgress } from "./ui-work.js";
 import { safeLink } from "./ui-operations.js";
+import { RunSteer, waitingTarget } from "./ui-run-steer.js";
+import { RunSandbox, loadSandbox } from "./ui-run-sandbox.js";
+import { sessionIdleHours, fetchSessionChoices } from "./ui-sessions.js";
 
 const html = htm.bind(h);
 export const GROUPS = ["Running", "Recovering", "Waiting on you", "Fault", "Done"];
@@ -22,7 +25,7 @@ const STEP_STATES = { running: "▷ RUNNING", pass: "✓ PASS", fail: "× FAIL",
 const taskOf = (run) => run?.issue && taskHash(run.issue, run.repo);
 const pullUrls = (urls) => String(urls ?? "").split(/\s+/).map(safeLink).filter(Boolean);
 
-export const groupOf = (status) => status === "running" ? "Running" : status === "needs-info" ? "Waiting on you"
+export const groupOf = (status) => (status === "running" || status === "queued") ? "Running" : status === "needs-info" ? "Waiting on you"
   : FAULTS.includes(status) ? "Fault" : "Done";
 export const wordOf = (status) => status === "stopped" ? "■ STOPPED" : `${GLYPHS[groupOf(status)]} ${status === "needs-info" ? "WAITING" : String(status).toUpperCase()}`;
 const runGroup = (run) => run.ask_route === "unblock" ? "Recovering"
@@ -49,7 +52,7 @@ function elapsed(run, now) {
 
 function rowOf(run) {
   const seconds = Number.isFinite(run.seconds) ? run.seconds : elapsed(run, Date.now());
-  return { id: run.id, title: [run.ticket || run.id, run.summary].filter(Boolean).join(" · "), state: runWord(run), status: run.status,
+  return { id: run.id, kind: run.kind ?? "", title: [run.ticket || run.id, run.summary].filter(Boolean).join(" · "), state: runWord(run), status: run.status,
     group: runGroup(run), repo: run.repo ?? "", priority: "", number: duration(seconds), url: pullUrls(run.pr_url)[0] ?? "" };
 }
 
@@ -113,6 +116,7 @@ export class RunQueue extends Watching {
                   && globalThis.matchMedia?.("(width < 900px)").matches) activatePane("focus");
               } },
             h("span", { class: `run-state ${name === "Fault" ? "fault" : ""}` }, row.state),
+            row.kind === "session" ? h("span", { class: "run-kind mono" }, "session") : null,
             h("span", { class: "run-title", title: row.title }, row.title),
             h("span", { class: "run-time" }, row.number)))) : null;
         }) : h(Empty, { what: queue.state.rows.length ? "No matching runs. Clear search or remove a filter." : "No runs yet" }),
@@ -194,16 +198,19 @@ function Head({ view, now }) {
   if (current && !(Date.parse(progress.timing?.as_of) > Date.parse(current.timing?.as_of))) {
     progress = { ...current, timing: current.timing?.run_ids?.includes(run.id) ? current.timing : progress.timing };
   }
+  const idleHours = run.kind === "session" ? sessionIdleHours.value : null;
   return html`<header class="run-head">
     <div class="run-head-line"><span class=${`run-state ${group === "Fault" ? "fault" : ""}`} data-state-word>${runWord(run)}</span>
+      ${run.kind === "session" ? html`<span class="run-kind mono">session</span>` : null}
       <span class="run-id mono">${run.id}</span>
       ${taskOf(run) ? html`<a class="run-task" href=${taskOf(run)}>${run.ticket || run.issue}</a>` : null}
-      ${run.status === "running" ? html`<span class="run-live" aria-label="Live">● LIVE</span>` : null}</div>
+      ${run.status === "running" || run.status === "queued" ? html`<span class="run-live" aria-label="Live">● LIVE</span>` : null}</div>
     <h2 class="run-summary">${run.summary || run.id}</h2>
     ${view.detail.recovery ? html`<p class="run-meta">Automatic recovery: ${view.detail.recovery.phase.replaceAll("_", " ")}
       ${view.detail.recovery.detail ? ` · ${view.detail.recovery.detail}` : ""}</p>` : null}
     <p class="run-meta mono"><span>step ${steps} of ${steps}</span><span>${duration(elapsed(run, now))}</span><span>${money(run.paid)}</span>
       <span>${models.length ? `${count(tokensIn)} in · ${count(tokensOut)} out` : "no tokens recorded"}</span><span>${recordedTurns(view)} turns</span>
+      ${idleHours != null ? html`<span>closes after ${idleHours}h idle</span>` : null}
       ${prs.map((url, i) => html`<a key=${url} href=${url} target="_blank" rel="noopener noreferrer">${prs.length === 1 ? "PR" : `PR ${i + 1}`}</a>`)}</p>
     ${progress ? html`<section class="ops-section"><h3>Ticket progress</h3><${TicketProgress} progress=${progress} /></section>` : null}
   </header>`;
@@ -256,20 +263,29 @@ function Orchestration({ view, retry }) {
 function turnTime(turn) { return turn.at ? String(turn.at).slice(11, 19) : ""; }
 
 export class RunFocus extends Component {
-  state = { tab: "steps", open: new Set() };
+  state = { tab: "steps", open: new Set(), sandbox: { loading: false, error: null, sandbox: null, diff: "", files: [] } };
   go = (id) => { location.hash = hashOf(id); };
   link = () => {
     const run = this.props.view.detail?.run;
+    if (run && runGroup(run) === "Waiting on you") {
+      location.hash = waitingTarget(run, snapshot.value).href;
+      return;
+    }
     const [url] = pullUrls(run?.pr_url);
     if (url) window.open(url, "_blank", "noopener,noreferrer");
     else if (taskOf(run)) location.hash = taskOf(run);
     else notice.value = "Nothing to open for this run";
   };
   openTask = () => { const href = taskOf(this.props.view.detail?.run); if (href) location.hash = href; };
+  retryAll = () => {
+    this.props.retry();
+    const id = this.props.view.detail?.run?.id;
+    if (id) this.loadSandboxFor(id);
+  };
   actionOf = () => {
     const run = this.props.view.detail?.run;
     if (!run) return null;
-    return runPageContext(run, { refresh: () => this.props.retry(), go: this.go, openLink: this.link });
+    return runPageContext(run, { refresh: this.retryAll, go: this.go, openLink: this.link });
   };
   repair = () => { const context = this.actionOf(); if (context) return dispatch(repairThisRun, context); };
   fold = () => {
@@ -282,6 +298,24 @@ export class RunFocus extends Component {
     if (!open.delete(key)) open.add(key);
     this.setState({ open });
   };
+  loadSandboxFor(id) {
+    this.sandboxController?.abort();
+    if (!id) {
+      this.sandboxRun = "";
+      return;
+    }
+    const controller = new AbortController();
+    this.sandboxController = controller;
+    const same = this.sandboxRun === id;
+    this.sandboxRun = id;
+    this.setState((prev) => ({
+      sandbox: same ? { ...prev.sandbox, loading: true } : { loading: true, error: null, sandbox: null, diff: "", files: [] },
+    }));
+    loadSandbox(id, controller.signal).then((loaded) => {
+      if (!loaded || controller.signal.aborted || this.sandboxRun !== id) return;
+      this.setState({ sandbox: { loading: false, ...loaded } });
+    });
+  }
   componentDidMount() {
     focus = this;
     this.sync();
@@ -303,15 +337,22 @@ export class RunFocus extends Component {
   componentDidUpdate() { focus = this; this.sync(); }
   componentWillUnmount() {
     if (focus === this) focus = null;
+    this.sandboxController?.abort();
     this.unwatchProgress();
     this.unregister?.();
   }
   sync() {
-    const id = this.props.view.detail?.run.id ?? "";
+    const run = this.props.view.detail?.run;
+    const id = run?.id ?? "";
     if (this.registered !== id) {
       this.unregister?.();
       this.registered = id;
       this.unregister = id ? register("run", [], [{ id: "repair-run", title: "Repair run", description: "post repair for the open run", glyph: "◇", run: this.repair }]) : null;
+      this.loadSandboxFor(id);
+    }
+    if (run?.kind === "session" && sessionIdleHours.peek() == null && !this.askedSessionChoices) {
+      this.askedSessionChoices = true;
+      fetchSessionChoices().catch(() => {});
     }
   }
   render({ view, now, retry }) {
@@ -321,33 +362,27 @@ export class RunFocus extends Component {
     }
     const run = view.detail.run;
     const group = runGroup(run);
-    const { tab, open } = this.state;
+    const { tab, open, sandbox } = this.state;
     const context = this.actionOf();
     const turns = view.turns;
     const recorded = Math.max(turns.length, recordedTurns(view));
+    const sandboxCount = sandbox.files?.length ?? 0;
     const tabs = [["steps", "Steps"], ...(view.detail.orchestration ? [["actions", `Actions (${view.detail.orchestration.actions.length})`]] : []),
-      ["turns", `Turns (${turns.length} of ${recorded})`], ["sandbox", "Sandbox (0)"]];
+      ["turns", `Turns (${turns.length} of ${recorded})`], ["sandbox", sandboxCount > 0 ? `Sandbox ${sandboxCount}` : "Sandbox"]];
     const fault = failure(view);
     const key = (turn) => `${run.id}|${turn.id}`;
+    const elapsedText = duration(elapsed(run, now));
+    const costText = money(run.paid);
     return html`<div class="run-page" data-run=${run.id}>
       ${view.detailError ? html`<${Fault} what="Run" fault=${view.detailError} retry=${retry} />` : null}
       <${Head} view=${view} now=${now} />
       <div class="run-tabs" role="tablist" aria-label="Run">${tabs.map(([name, label]) => html`<button key=${name} type="button" role="tab" id=${`run-tab-${name}`}
         aria-selected=${tab === name} aria-controls="run-panel" tabindex=${tab === name ? 0 : -1} onClick=${() => this.setState({ tab: name })}>${label}</button>`)}</div>
-      <div class=${`run-strip ${group === "Fault" ? "fault" : ""}`} data-group=${group}>
-        ${group === "Fault" ? html`<span class="strip-text">× ${fault || wordOf(run.status)}</span>` : null}
-        ${group === "Waiting on you" ? html`<span class="strip-text">◆ waits on ${run.ticket || run.id}</span>` : null}
-        <span class="strip-actions">
-          ${group === "Waiting on you" && taskOf(run) ? html`<button type="button" data-act="open-task" onClick=${this.openTask}><kbd class="cap">gx</kbd> Open task</button>` : null}
-          ${context?.run.retry ? html`<button type="button" data-act="retry-run" onClick=${() => dispatch(context.run.retry, context)}><kbd class="cap">⇧r</kbd> Retry</button>` : null}
-          ${run.status === "running" ? html`<button type="button" data-act="stop-run" disabled=${Boolean(run.stop_asked)} onClick=${() => dispatch(actions.stop, context)}><kbd class="cap">dd</kbd> ${run.stop_asked ? "Stopping" : "Stop the run"}</button>` : null}
-        </span>
-      </div>
       <div class="run-panel" id="run-panel" role="tabpanel" aria-labelledby=${`run-tab-${tab}`}
         data-list=${tab === "turns" && turns.length ? undefined : "run-panel"} ref=${(el) => { if (el) el.uiContext = this.actionOf; }}>
         ${tab === "steps" ? html`${view.eventsError ? html`<${Fault} what="Steps" fault=${view.eventsError} retry=${retry} />` : null}<${Steps} view=${view} />`
     : tab === "actions" ? html`<${Orchestration} view=${view} retry=${retry} />`
-    : tab === "sandbox" ? html`<${Empty} what="No sandbox recorded" />`
+    : tab === "sandbox" ? html`<${RunSandbox} state=${sandbox} retry=${this.retryAll} />`
     : html`${view.turnsError ? html`<${Fault} what="Turns" fault=${view.turnsError} retry=${retry} />` : null}
         ${turns.length ? html`<div class="run-turns" data-list="run-turns" ref=${(el) => { if (el) { el.uiContext = this.actionOf; el.uiDismiss = this.fold; } }}>
           ${turns.map((turn) => html`<div key=${turn.id} class=${`run-turn${open.has(key(turn)) ? " open" : ""}`} data-row="" data-item=${turn.id}
@@ -356,6 +391,8 @@ export class RunFocus extends Component {
             <span class="turn-text">${open.has(key(turn)) ? turn.text : turn.text.split("\n")[0]}</span></div>`)}</div>`
         : view.turnsError ? null : html`<${Empty} what="No turns recorded for this run" />`}`}
       </div>
+      <${RunSteer} view=${view} group=${group} fault=${fault} elapsedText=${elapsedText} costText=${costText}
+        context=${context} retry=${this.retryAll} snapshot=${snapshot.value} statusWord=${wordOf(run.status)} />
     </div>`;
   }
 }
