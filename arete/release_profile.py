@@ -9,7 +9,8 @@ from pathlib import Path
 from . import paths, release_proof as proof, serve_guard, util, zte
 
 FIELDS = {"destination", "staging", "production", "production_branch", "identity_path", "immutable_host_suffix",
-          "checks", "qa", "qa_require_revision", "promotion_mode"}
+          "checks", "qa", "qa_require_revision", "promotion_mode",
+          "qa_authority", "release_owners", "require_release_owner", "release_workflow"}
 TARGET_FIELDS = ("github", "tracker", "jira_site", "jira_project", "jira_label", "target_branch", "landing", "unattended_environment")
 
 
@@ -83,10 +84,11 @@ def apply(profile, promise):
     settings = profile["settings"]
     proof.need(isinstance(promise, dict), "a ticket promise must be a JSON object")
     for key in FIELDS.intersection(promise):
-        if key == "qa":
+        if key in ("qa", "release_owners"):
             people = promise[key]
-            proof.need(isinstance(people, list) and people and all(isinstance(who, str) and who in settings["qa"] for who in people),
-                       "ticket QA authority exceeds the enrolled repository profile")
+            allowed = settings.get(key) or []
+            proof.need(isinstance(people, list) and people and all(isinstance(who, str) and who in allowed for who in people),
+                       f"ticket {key} authority exceeds the enrolled repository profile")
         else:
             proof.need(key in settings and settings[key] == promise[key], "ticket " + key + " differs from the enrolled staging profile")
     return {**settings, **promise}
