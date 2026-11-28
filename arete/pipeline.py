@@ -70,7 +70,6 @@ from . import (
     util,
     vault,
     verify,
-    webpush,
     workspace,
 )
 from .agent import NO_SESSION, READ_ONLY_TOOLS, Result, Session
@@ -3408,20 +3407,21 @@ def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, 
     for ask in asked or [{}]:
         run_lines.write(run.id, "question", question=comment, summary=summary[:300], recovery=recover, **ask)
     if asked and session is not None and not run.dry_run:
+        from .store import db as foundation
+
         notify_owner = not shared_runner
-        for ask in asked:
-            first = asks_store.ask_add(ask["ask_id"], run.id, run.repo.name, run.tid, ask["step"], ask["call"],
-                          ask.get("why", ""), ask.get("tried", ""), ask["questions"], session,
-                          recovery_route="unblock" if recover else "owner")
-            notify_owner = notify_owner or first
+        with foundation.tx():
+            for ask in asked:
+                first = asks_store.ask_add(ask["ask_id"], run.id, run.repo.name, run.tid, ask["step"], ask["call"],
+                              ask.get("why", ""), ask.get("tried", ""), ask["questions"], session,
+                              recovery_route="unblock" if recover else "owner")
+                notify_owner = notify_owner or first
         if not recover and notify_owner:
             run.say(outbound.screen(comment))
         run.enter("needs-info")
         devices.release(run.id, run.log)
         if not recover and notify_owner:
             alerts.ask_notice(run.where, summary)
-            for note in webpush.ask_opened(run.config, [a["ask_id"] for a in asked]):
-                run.log(note)
         run.log("needs-info: kept the work folder and the step's session for the answer")
         return "needs-info", summary[:300], ""
     run.say(comment)
@@ -6634,11 +6634,12 @@ class SkipLog:
         self.before = before
         self.current: dict[str, dict] = {}
 
-    def note(self, name: str, t: tracker.Ticket, blocker: str, repo: str = "") -> None:
+    def note(self, name: str, t: tracker.Ticket, blocker: str, repo: str = "", *, blocker_kind: str = "") -> None:
         old = self.before.get(name) or {}
         same = old.get("why") == blocker
-        self.current[name] = {"why": blocker, "title": t.title, "url": t.url, "repo": repo, "id": str(t.id),
-                              "since": old.get("since") if same else util.iso()}
+        entry = {"why": blocker, "title": t.title, "url": t.url, "repo": repo, "id": str(t.id),
+                 "since": old.get("since") if same else util.iso(), "blocker_kind": blocker_kind}
+        self.current[name] = entry
         if not same:
             print(f"{util.iso()} {name}: not run, {blocker}")
 
