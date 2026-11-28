@@ -7,7 +7,6 @@ from .. import util
 from .db import db, reader
 
 TABLES = {
-    "seen": "until source forgets",
     "cursors": "kept",
     "source_owners": "kept",
     "source_polls": "until retention prunes",
@@ -81,29 +80,6 @@ def _rate_values(rate: object) -> tuple[int | None, int | None]:
     return _int_or_none(getattr(rate, "remaining", None)), _int_or_none(getattr(rate, "retry_after", None))
 
 
-def source_seen(source: str, connect=reader) -> set[str]:
-    with connect() as c:
-        return {r[0] for r in c.execute("SELECT key FROM seen WHERE source = ?", (source,))}
-
-
-def claim_seen(source: str, keys: list[str], connect=db) -> list[str]:
-    with connect() as c:
-        now = util.iso()
-        return [
-            str(k)
-            for k in keys
-            if c.execute(
-                "INSERT OR IGNORE INTO seen (source, key, ts) VALUES (?,?,?)",
-                (source, str(k), now),
-            ).rowcount == 1
-        ]
-
-
-def forget_seen(source: str, key: str, before, connect=db) -> None:
-    with connect() as c:
-        c.execute("DELETE FROM seen WHERE source = ? AND key = ? AND ts < ?", (source, key, util.iso(before)))
-
-
 def cursor(source: str, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM cursors WHERE source = ?", (source,)).fetchone()
@@ -142,6 +118,101 @@ def set_cursor(source: str, value: str | None, ok: bool, detail: str = "", conne
 def cursors(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM cursors ORDER BY source")]
+
+
+def begin_poll_row(c, sid: str, started: str) -> int:
+    cur = c.execute(
+        "INSERT INTO source_polls ("
+        "source, started, ended, ok, read, new, refused, error, rate_remaining, retry_after, backoff_s"
+        ") VALUES (?, ?, ?, 1, 0, 0, 0, NULL, NULL, NULL, NULL)",
+        (sid, started, started),
+    )
+    return int(cur.lastrowid)
+
+
+def finish_poll_row(
+    c,
+    poll_id: int,
+    *,
+    ended: str,
+    ok: bool,
+    read: int,
+    new: int,
+    refused: int | None,
+    error: str | None = None,
+    rate: object = None,
+    backoff_s: int | float | None = None,
+) -> None:
+    rate_remaining, retry_after = _rate_values(rate)
+    backoff_int = _int_or_none(backoff_s)
+    err_text = (error or "")[:500] if error is not None else None
+    c.execute(
+        "UPDATE source_polls SET ended = ?, ok = ?, read = ?, new = ?, refused = ?, "
+        "error = ?, rate_remaining = ?, retry_after = ?, backoff_s = ? WHERE id = ?",
+        (ended, int(ok), int(read), int(new), refused, err_text, rate_remaining, retry_after, backoff_int, poll_id),
+    )
+
+
+def record_poll_error(
+    c,
+    sid: str,
+    started: str,
+    error: str,
+    *,
+    rate: object = None,
+    ended: str | None = None,
+) -> int:
+    """Insert a failed source_polls row without mutating cursors or cursor version."""
+    ended_ts = ended or util.iso()
+    rate_remaining, retry_after = _rate_values(rate)
+    err_text = (error or "poll failed")[:500]
+    cur = c.execute(
+        "INSERT INTO source_polls ("
+        "source, started, ended, ok, read, new, refused, error, rate_remaining, retry_after, backoff_s"
+        ") VALUES (?, ?, ?, 0, 0, 0, NULL, ?, ?, ?, NULL)",
+        (sid, started, ended_ts, err_text, rate_remaining, retry_after),
+    )
+    return int(cur.lastrowid)
+
+
+def upsert_cursor_ok(
+    c,
+    src,
+    started: str,
+    *,
+    value: object = _UNSET,
+    advanced: bool = False,
+    detail: str = "",
+    ended: str | None = None,
+) -> dict:
+    sid = src.id if hasattr(src, "id") else str(src)
+    src_version = getattr(src, "version", None)
+    scope_sha = getattr(src, "scope_sha", None)
+    ended_ts = ended or util.iso()
+    keep_val = 1 if value is _UNSET else 0
+    val_arg = None if value is _UNSET else value
+    adv_ts = started if advanced else None
+    detail_text = (detail or "ok")[:500]
+    c.execute(
+        "INSERT INTO cursors ("
+        "source, value, polled, ok, detail, last_ok, "
+        "source_version, scope_sha, advanced, error_streak, backoff_until, version"
+        ") VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, NULL, 1) "
+        "ON CONFLICT(source) DO UPDATE SET "
+        "value = CASE WHEN ? THEN cursors.value ELSE excluded.value END, "
+        "polled = excluded.polled, "
+        "ok = 1, "
+        "detail = excluded.detail, "
+        "last_ok = excluded.last_ok, "
+        "source_version = excluded.source_version, "
+        "scope_sha = excluded.scope_sha, "
+        "advanced = COALESCE(excluded.advanced, cursors.advanced), "
+        "error_streak = 0, "
+        "backoff_until = NULL, "
+        "version = COALESCE(cursors.version, 1) + 1",
+        (sid, val_arg, ended_ts, detail_text, started, src_version, scope_sha, adv_ts, keep_val),
+    )
+    return dict(c.execute("SELECT * FROM cursors WHERE source = ?", (sid,)).fetchone())
 
 
 def source_poll(
@@ -305,8 +376,10 @@ def prune(c, *, polls_days: float, unused_days: float, active_ids: set[str] | No
         sid = str(row["source"])
         if sid.startswith("oncall:") or sid in active_ids:
             continue
+        from . import intake as intake_store
+
         removed += c.execute("DELETE FROM source_polls WHERE source = ?", (sid,)).rowcount
-        removed += c.execute("DELETE FROM seen WHERE source = ?", (sid,)).rowcount
+        removed += intake_store.prune_unused_source(c, sid)
         removed += c.execute("DELETE FROM source_owners WHERE source = ?", (sid,)).rowcount
         removed += c.execute("DELETE FROM cursors WHERE source = ?", (sid,)).rowcount
     return removed

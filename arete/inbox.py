@@ -77,6 +77,7 @@ RESERVED_MANUAL_PREFIXES = (
     "line:",
     "view:",
     "source:",
+    "intake:",
 )
 
 
@@ -2235,12 +2236,16 @@ def raise_rescope(c, src, held_events: builtins.list[dict]) -> dict | None:
         return item
     existing_detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
     existing_held = builtins.list(existing_detail.get("held") or ())
-    seen_keys = {str(e.get("key", "")) for e in existing_held if isinstance(e, dict)}
+    held_ids = {
+        (str(e.get("external_key") or e.get("key") or ""), str(e.get("external_rev") or ""))
+        for e in existing_held
+        if isinstance(e, dict)
+    }
     merged = builtins.list(existing_held)
     for ev in held_events:
-        k = str(ev.get("key", ""))
-        if k not in seen_keys:
-            seen_keys.add(k)
+        k = (str(ev.get("external_key") or ev.get("key") or ""), str(ev.get("external_rev") or ""))
+        if k not in held_ids:
+            held_ids.add(k)
             merged.append(ev)
     numeric = inbox_store.parse_id(item["id"])
     if numeric is None:
@@ -2274,14 +2279,22 @@ def _resolve_rescope(
     base_version: int,
     verb: str,
 ) -> dict:
+    from . import events as events_mod
     from . import loops as loops_mod
     from . import sources as sources_mod
+    from .store import factory as factory_store
+    from .store import intake as intake_store
 
     sid = item["subject"].removeprefix("source:")
     actor = principals.current()
     now = util.iso()
+    held = builtins.list((item.get("detail") or {}).get("held") or ())
+    held_intake_nums = [
+        num
+        for ev in held
+        if isinstance(ev, dict) and (num := intake_store.parse_id(ev.get("intake_item"))) is not None
+    ]
     if verb == "fire":
-        held = builtins.list((item.get("detail") or {}).get("held") or ())
         cfg = config.load_or_problem()[0]
         all_loops = loops_mod.load_all(cfg)
         live_by_name = {loop.name: loop for loop in all_loops if loop.enabled and not loop.error}
@@ -2289,6 +2302,7 @@ def _resolve_rescope(
         target_loops = [live_by_name[name] for name in src.loops if name in live_by_name] if src else []
         queued: builtins.list[int] = []
         with foundation.tx() as c:
+            factory_store.admit(c)
             updated, _, ok = inbox_store.resolve_item(
                 c,
                 numeric_id,
@@ -2300,9 +2314,66 @@ def _resolve_rescope(
             )
             if not ok:
                 raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=updated)
-            for loop_obj in target_loops:
-                if held:
-                    queued.extend(sources_mod.fire(loop_obj, "event", held))
+            if held:
+                accepted_ids: set[int] = set()
+                refused_reasons: dict[int, str] = {}
+                for loop_obj in target_loops:
+                    batches: dict[str, builtins.list[dict]] = {}
+                    for ev in held:
+                        num = intake_store.parse_id(ev.get("intake_item")) if isinstance(ev, dict) else None
+                        try:
+                            reason = loop_obj.trigger.refusal(ev)
+                            if reason:
+                                if num is not None and num not in accepted_ids:
+                                    refused_reasons.setdefault(num, reason)
+                                continue
+                            grp = loop_obj.trigger.group_of(ev)
+                        except Exception as err:
+                            if num is not None and num not in accepted_ids:
+                                refused_reasons.setdefault(num, f"{type(err).__name__}: {err}")
+                            continue
+                        if num is not None:
+                            accepted_ids.add(num)
+                            refused_reasons.pop(num, None)
+                        loop_store.add_event(loop_obj.name, ev, connect=lambda: nullcontext(c))
+                        batches.setdefault(grp, []).append(ev)
+                    for grp, batch in batches.items():
+                        qid = loop_store.enqueue(loop_obj.name, loop_obj.queue_name, grp, "event", batch, c=c)
+                        if qid:
+                            queued.append(qid)
+                if intake_store.available(c):
+                    nums = held_intake_nums
+                    if not nums:
+                        nums = [
+                            int(r["id"])
+                            for r in c.execute(
+                                "SELECT id FROM intake_items WHERE source = ? AND status = 'held' ORDER BY id",
+                                (sid,),
+                            ).fetchall()
+                        ]
+                    for num in nums:
+                        if num in refused_reasons:
+                            c.execute(
+                                "UPDATE intake_items SET status = 'refused', refuse_reason = ?, "
+                                "version = version + 1 WHERE id = ? AND status = 'held'",
+                                (refused_reasons[num], num),
+                            )
+                        else:
+                            c.execute(
+                                "UPDATE intake_items SET status = 'new', version = version + 1 "
+                                "WHERE id = ? AND status = 'held'",
+                                (num,),
+                            )
+                        row = intake_store.get_item_conn(c, num)
+                        if row is not None:
+                            events_mod.emit(
+                                "intake.changed",
+                                f"intake:{row['id']}",
+                                cls="durable",
+                                ver=row["version"],
+                                data={"item": row["id"], "status": row["status"], "reason": "rescope_fired"},
+                                connection=c,
+                            )
         return {"item": updated, "result": {"source": sid, "fired": len(held), "items": queued}}
     if verb == "dismiss":
         with foundation.tx() as c:
@@ -2317,6 +2388,32 @@ def _resolve_rescope(
             )
             if not ok:
                 raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=updated)
+            if intake_store.available(c):
+                nums = held_intake_nums
+                if not nums:
+                    nums = [
+                        int(r["id"])
+                        for r in c.execute(
+                            "SELECT id FROM intake_items WHERE source = ? AND status = 'held' ORDER BY id",
+                            (sid,),
+                        ).fetchall()
+                    ]
+                for num in nums:
+                    c.execute(
+                        "UPDATE intake_items SET status = 'dismissed', version = version + 1 "
+                        "WHERE id = ? AND status = 'held'",
+                        (num,),
+                    )
+                    row = intake_store.get_item_conn(c, num)
+                    if row is not None:
+                        events_mod.emit(
+                            "intake.changed",
+                            f"intake:{row['id']}",
+                            cls="durable",
+                            ver=row["version"],
+                            data={"item": row["id"], "status": "dismissed", "reason": "rescope_dismissed"},
+                            connection=c,
+                        )
         return {"item": updated, "result": {"source": sid, "dismissed": True}}
     raise contract.Problem("validation", f"Verb {verb!r} is not allowed on {item['id']}.")
 

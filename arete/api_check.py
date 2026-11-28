@@ -579,7 +579,39 @@ class Check:
                         closes="2099-01-01T00:00:00Z", hours=24)
         from . import configrepo as configrepo_mod
         from . import drafts as drafts_mod
+        from . import intake_service as intake_svc
         from . import lines as lines_mod
+
+        fixture_intake_main = intake_svc.add_item(
+            {"text": "Action item: fix login timeout on mobile.", "kind": "transcript", "title": "Fixture transcript"},
+            principals.owner() or "hand",
+        )
+        fixture_intake_dismiss = intake_svc.add_item(
+            {"text": "FYI: no action needed.", "kind": "paste", "title": "Fixture dismiss"},
+            principals.owner() or "hand",
+        )
+        replay_dir = replay.folder(config.load())
+        if replay_dir is not None:
+            replay_dir.mkdir(parents=True, exist_ok=True)
+            intake_num = fixture_intake_main["id"].removeprefix("IN-")
+            (replay_dir / f"intake-{intake_num}-extract.json").write_text(
+                json.dumps({
+                    **replay.SAMPLE_USAGE,
+                    "structured": {
+                        "candidates": [{
+                            "kind": "fix",
+                            "action": "create",
+                            "title": "Fix login timeout on mobile",
+                            "quote_start": 13,
+                            "quote_end": 41,
+                            "fields": {"summary": "Fix mobile login timeout", "repo": replay.SAMPLE_REPO},
+                            "match_task": None,
+                            "match_confidence": 0.9,
+                        }],
+                    },
+                }),
+                encoding="utf-8",
+            )
 
         lines_mod.ensure(config.load())
         with principals.acting(principals.owner() or "hand"):
@@ -625,7 +657,12 @@ class Check:
                       "chat": (str(chat_for_file) if name == "chat.file"
                                else str(chat_for_send) if name in ("chat.send", "chat.session_start")
                                else identities["chat"]),
-                      "item": ob_item if resource == "outbox" else identities["item"],
+                      "item": (
+                          ob_item if resource == "outbox"
+                          else (fixture_intake_dismiss["id"] if name == "intake.dismiss" else fixture_intake_main["id"])
+                          if resource == "intake"
+                          else identities["item"]
+                      ),
                       "task": (run_task if name == "task.run"
                                else sync_task if name == "task.sync"
                                else identities["task"]),
@@ -666,6 +703,15 @@ class Check:
                     values["base_rev"] = cur_ob["rev"]
                 elif name == "outbox.approve":
                     values["rev"] = cur_ob["rev"]
+            if name == "intake.accept":
+                cur_in = self.read(f"/api/v1/intake/{fixture_intake_main['id']}")["item"]
+                values["base_version"] = cur_in["version"]
+                values["candidates"] = [{"n": 1, "action": "create", "repo": replay.SAMPLE_REPO}]
+            if name == "intake.dismiss":
+                cur_in = self.read(f"/api/v1/intake/{fixture_intake_dismiss['id']}")["item"]
+                values["base_version"] = cur_in["version"]
+            if name == "task_screen.get":
+                values["task"] = self.task
             if name == "config.diff":
                 values["from"], values["to"] = "1", "2"
             if name in ("config.draft", "config.check"):

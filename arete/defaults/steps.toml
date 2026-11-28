@@ -20,6 +20,7 @@ verify = "verify"
 grade = "grade"
 learn = "learn"
 uat = "uat"
+intake_extract = "intake_extract"
 
 [defaults.schema]
 plan = "plan"
@@ -31,6 +32,7 @@ verify = "verify"
 grade = "verify"
 learn = "learn"
 uat = "uat"
+intake_extract = "intake_extract"
 
 [steps.verify]
 directory_cleanup = true
@@ -86,6 +88,15 @@ budget_usd = 0.25
 
 [steps.config_ask]
 timeout_minutes = 10
+tries = 1
+tools = []
+mcp = []
+instructions = []
+session = "fresh"
+structured_output = true
+
+[steps.intake_extract]
+timeout_minutes = 5
 tries = 1
 tools = []
 mcp = []

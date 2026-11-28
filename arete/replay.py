@@ -76,6 +76,16 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
     answer_file, patch_file = where / f"{name}.json", where / f"{name}.patch"
     if trace[1].startswith("worker-") and not answer_file.exists():
         answer_file, patch_file = where / "worker.json", where / "worker.patch"
+    if trace[1].startswith("intake-") and trace[1].endswith("-extract") and not answer_file.exists():
+        middle = trace[1].removeprefix("intake-").removesuffix("-extract")
+        alt = (
+            f"intake-{middle.removeprefix('IN-')}-extract"
+            if middle.startswith("IN-")
+            else f"intake-IN-{middle}-extract"
+        )
+        alt_file = where / f"{alt}.json"
+        if alt_file.exists():
+            answer_file, patch_file = alt_file, where / f"{alt}.patch"
     patched = patch_file.exists()
     on_line(json.dumps({"type": "replay", "answer": str(answer_file), "patch": str(patch_file) if patched else ""}))
     try:
@@ -101,6 +111,8 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
             return failed(f"replay: invalid controller observation: {error}")
     if trace[1].startswith("config_ask") and "structured" not in answer and "body" in answer and "why" in answer:
         answer = {**answer, "structured": {"body": answer["body"], "why": answer["why"]}}
+    if trace[1].startswith("intake-") and trace[1].endswith("-extract") and "structured" not in answer and "candidates" in answer:
+        answer = {**answer, "structured": {"candidates": answer["candidates"]}}
     try:
         res = Result(ok=bool(answer.get("ok", True)), text=str(answer.get("text") or ""),
                      structured=answer.get("structured"), error=str(answer.get("error") or ""),

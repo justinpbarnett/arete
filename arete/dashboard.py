@@ -13,7 +13,7 @@ from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import NoReturn
@@ -305,12 +305,18 @@ class Handler(BaseHTTPRequestHandler):
     restarting = False
     verify_controls: verify_faults.Controls | None = None
 
+    def _hook_port_active(self) -> bool:
+        explicit = getattr(self.server, "hook_port", None)
+        if explicit is not None:
+            return int(explicit) > 0
+        return config.load_or_problem()[0].dashboard_hook_port > 0
+
     def parse_request(self) -> bool:
         self.started = time.monotonic()
         words = self.raw_requestline.decode("iso-8859-1").split(None, 2)
         raw_path = request_path(words[1]) if len(words) > 1 else ""
         self.api_path = raw_path if raw_path == "/api" or raw_path.startswith("/api/") else ""
-        self.hook = raw_path.startswith(webhooks.HOOK_PATH)
+        self.hook = raw_path.startswith(webhooks.HOOK_PATH) and not self._hook_port_active()
         if self.hook:
             return super().parse_request()
         stream, self.rfile = self.rfile, BytesIO(b"\r\n")
@@ -422,7 +428,7 @@ class Handler(BaseHTTPRequestHandler):
             if canonical_path(path) and not self.operation and method not in (allowed := canonical_methods(path)) and allowed:
                 self.allowed_methods = allowed
                 raise contract.Problem("method_not_allowed", "The route does not accept this method.")
-            if path.startswith(webhooks.HOOK_PATH):
+            if path.startswith(webhooks.HOOK_PATH) and not self._hook_port_active():
                 if self.restarting:
                     raise contract.Problem("draining", RESTARTING)
                 got = webhooks.receive(unquote(path[len(webhooks.HOOK_PATH):]), self.headers, self.hook_body())
@@ -720,6 +726,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.origin is None or self.origin[1] not in node.names:
             raise Refusal(421, "This server answers only to its tailnet name or address.")
         if path.startswith(webhooks.HOOK_PATH):
+            if self._hook_port_active():
+                raise Refusal(404, "No such route.")
             if method != "POST":
                 raise Refusal(405, "A webhook takes POST.")
             return
@@ -1675,6 +1683,105 @@ def handlers() -> tailnet.Handlers:
     return tailnet.Handlers(ScratchHandler, Redirect)
 
 
+V1_HOOK_PATH = "/api/v1/hooks/"
+
+
+class HookHandler(BaseHTTPRequestHandler):
+    server_version = "http"
+    sys_version = ""
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+    def _send_empty(self, status: int) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _send_alias_json(self, status: int, data: dict) -> None:
+        raw = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _route_kind(self, path: str) -> tuple[str, str] | None:
+        if path.startswith(V1_HOOK_PATH) and len(path) > len(V1_HOOK_PATH):
+            return "v1", unquote(path[len(V1_HOOK_PATH):])
+        if path.startswith(webhooks.HOOK_PATH) and len(path) > len(webhooks.HOOK_PATH):
+            return "alias", unquote(path[len(webhooks.HOOK_PATH):])
+        return None
+
+    def _reject_non_post(self) -> None:
+        path = request_path(self.path)
+        self._send_empty(405 if self._route_kind(path) is not None else 404)
+
+    def do_GET(self) -> None:
+        self._reject_non_post()
+
+    def do_HEAD(self) -> None:
+        self._reject_non_post()
+
+    def do_PUT(self) -> None:
+        self._reject_non_post()
+
+    def do_PATCH(self) -> None:
+        self._reject_non_post()
+
+    def do_DELETE(self) -> None:
+        self._reject_non_post()
+
+    def do_OPTIONS(self) -> None:
+        self._reject_non_post()
+
+    def do_POST(self) -> None:
+        entered = POSTS_IN_FLIGHT.enter()
+        try:
+            path = request_path(self.path)
+            routed = self._route_kind(path)
+            if routed is None:
+                self._send_empty(404)
+                return
+            mode, target = routed
+            if not entered:
+                if mode == "v1":
+                    self._send_empty(503)
+                else:
+                    self._send_alias_json(503, {"error": RESTARTING})
+                return
+            try:
+                size = api_http.content_length(self.headers, required=False)
+                body = api_http.read_body(self.rfile, size, webhooks.MAX_HOOK_BODY)
+                with principals.acting("hand"), event_store.request_scope(f"POST {path}"):
+                    got = webhooks.receive(target, self.headers, body)
+            except Exception as err:
+                status = refusal_status(err) or 500
+                if mode == "v1":
+                    self._send_empty(status)
+                else:
+                    self._send_alias_json(status, refusal_answer(err))
+                return
+            if mode == "v1":
+                self._send_empty(202)
+            else:
+                self._send_alias_json(202 if got.get("queued") else 200, got)
+        finally:
+            if entered:
+                POSTS_IN_FLIGHT.add(-1)
+
+
+class HookServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def open_hook_server(port: int) -> HookServer:
+    return HookServer(("127.0.0.1", int(port)), HookHandler)
+
+
 def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None) -> NoReturn:
     cfg = config.load_or_problem()[0]
     port = port or cfg.dashboard_port
@@ -1705,8 +1812,17 @@ def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tai
         with util.lock(serve.SERVE_LOCK) as free:
             if free and (not installed or factory.view()["phase"] == "on"):
                 capture.recover()
-    with util.repeating(60, maintain_credentials, "credential-maintenance"):
-        tailnet.serve(handlers(), cfg, port, inside_serve, host)
+    hook_server: HookServer | None = None
+    if cfg.dashboard_hook_port > 0:
+        hook_server = open_hook_server(cfg.dashboard_hook_port)
+        threading.Thread(target=hook_server.serve_forever, name="arete-hook-listener", daemon=True).start()
+    try:
+        with util.repeating(60, maintain_credentials, "credential-maintenance"):
+            tailnet.serve(handlers(), cfg, port, inside_serve, host)
+    finally:
+        if hook_server is not None:
+            hook_server.shutdown()
+            hook_server.server_close()
 
 
 def maintain_credentials():

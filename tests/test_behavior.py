@@ -9733,8 +9733,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 176)
-        self.assertEqual(len({op["name"] for op in operations}), 176)
+        self.assertEqual(len(operations), 184)
+        self.assertEqual(len({op["name"] for op in operations}), 184)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -23991,7 +23991,7 @@ class SourceConfigTests(unittest.TestCase):
                 "    paths, poll as poll_mod, principals, record, retention, serve, sources, tailnet, util,\n"
                 ")\n"
                 "from arete.store import (\n"
-                "    db, inbox as inbox_store, loops as loop_store, retention as retention_store,\n"
+                "    db, inbox as inbox_store, intake as intake_store, loops as loop_store, retention as retention_store,\n"
                 "    runs as run_store, sources as source_store, tokens as token_store,\n"
                 ")\n"
                 "def _forbid(*a, **kw):\n"
@@ -24228,8 +24228,8 @@ a_events, _ = sources.poll(by_id["a"], srv.cfg)
 b_events, _ = sources.poll(by_id["b"], srv.cfg)
 assert [e["key"] for e in a_events] == ["a5"]
 assert [e["key"] for e in b_events] == ["b2"]
-assert source_store.source_seen("a") == {"a1", "a5"}
-assert source_store.source_seen("b") == {"b1", "b2"}
+assert {"a1", "a5"} <= intake_store.seen_driver_keys("a")
+assert {"b1", "b2"} <= intake_store.seen_driver_keys("b")
 
 # Unused id stays, restoring it catches up without baseline; new id baselines
 write_loop("demo", f'''
@@ -24497,7 +24497,11 @@ old_hash = hashlib.sha256(json.dumps(old_settings, sort_keys=True, default=str).
 old_polled = "2026-11-20T12:00:00Z"
 with db.tx() as c:
     c.execute("INSERT INTO cursors (source, value, polled, ok, detail, last_ok) VALUES ('demo#0', NULL, ?, 1, 'old', NULL)", (old_polled,))
-    c.execute("INSERT INTO seen (source, key, ts) VALUES ('demo#0', 'k1', ?), ('demo#0', 'k2', ?)", (old_polled, old_polled))
+    k1_ext = sources.canonical_external_key("command:cat", "command", "k1")
+    k2_ext = sources.canonical_external_key("command:cat", "command", "k2")
+    empty_sha = hashlib.sha256(b"{}").hexdigest()
+    intake_store.insert_item(c, source="demo#0", external_key=k1_ext, kind="command", raw="{}", raw_sha256=empty_sha, status="dismissed", received=old_polled)
+    intake_store.insert_item(c, source="demo#0", external_key=k2_ext, kind="command", raw="{}", raw_sha256=empty_sha, status="dismissed", received=old_polled)
     c.execute("INSERT INTO source_owners (source, fingerprint) VALUES ('demo#0', ?)", (old_hash,))
     c.execute("INSERT INTO cursors (source, value, polled, ok, detail, last_ok) VALUES ('demo#1', NULL, ?, 1, 'stale', ?)", (old_polled, old_polled))
     c.execute("INSERT INTO source_owners (source, fingerprint) VALUES ('demo#1', 'unmatched-owner')")
@@ -24509,7 +24513,7 @@ with db.reader() as c:
     assert c.execute("SELECT 1 FROM cursors WHERE source = 'demo#0'").fetchone() is None
     cur_a = dict(c.execute("SELECT * FROM cursors WHERE source = 'a'").fetchone())
     assert cur_a["scope_sha"] and cur_a["source_version"].startswith("source/a@") and cur_a["last_ok"] == old_polled
-    assert {r[0] for r in c.execute("SELECT key FROM seen WHERE source = 'a'")} == {"k1", "k2"}
+    assert {r[0] for r in c.execute("SELECT external_key FROM intake_items WHERE source = 'a'")} == {k1_ext, k2_ext}
     assert c.execute("SELECT fingerprint FROM source_owners WHERE source = 'a'").fetchone()[0] == old_hash
     assert c.execute("SELECT 1 FROM cursors WHERE source = 'oncall:scan'").fetchone() is not None
 
@@ -24571,7 +24575,7 @@ with db.tx() as c:
     c.execute("INSERT INTO source_polls (source, started, ended, ok, read, new) VALUES ('a', ?, ?, 1, 1, 0)", (old_91, old_91))
     c.execute("INSERT INTO source_polls (source, started, ended, ok, read, new) VALUES ('a', ?, ?, 1, 1, 0)", (keep_89, keep_89))
     c.execute("INSERT INTO cursors (source, value, polled, ok, detail, last_ok, version) VALUES ('stale-unused', NULL, ?, 1, 'old', ?, 1)", (old_91, old_91))
-    c.execute("INSERT INTO seen (source, key, ts) VALUES ('stale-unused', 'u1', ?)", (old_91,))
+    intake_store.insert_item(c, source="stale-unused", external_key="u1", kind="command", raw="{}", raw_sha256=empty_sha, status="dismissed", received=old_91)
     c.execute("INSERT INTO source_polls (source, started, ended, ok, read, new) VALUES ('stale-unused', ?, ?, 1, 0, 0)", (old_91, old_91))
 policy = retention.parse_bytes(b"[source_polls]\ndays = 90\n[sources]\nunused_days = 90\n")
 retention_store.prune_rows(policy, retention_store.measure())
@@ -24579,7 +24583,7 @@ with db.reader() as c:
     starts_a = {r[0] for r in c.execute("SELECT started FROM source_polls WHERE source = 'a'")}
     assert old_91 not in starts_a and keep_89 in starts_a
     assert c.execute("SELECT 1 FROM cursors WHERE source = 'stale-unused'").fetchone() is None
-    assert c.execute("SELECT 1 FROM seen WHERE source = 'stale-unused'").fetchone() is None
+    assert c.execute("SELECT 1 FROM intake_items WHERE source = 'stale-unused'").fetchone() is None
     assert c.execute("SELECT 1 FROM source_polls WHERE source = 'stale-unused'").fetchone() is None
     assert c.execute("SELECT 1 FROM cursors WHERE source = 'oncall:scan'").fetchone() is not None
 
@@ -24659,7 +24663,7 @@ def fake_launch(name, **kw):
     return {"id": f"poll-run-{len(launch_calls)}", "status": "done", "picks": ["picked APP-1"]}
 
 with live_dashboard() as (_, port):
-    before_seen = source_store.source_seen("a")
+    before_seen = intake_store.item_identities("a")
     before_cur = source_store.cursor("a")
     with db.reader() as c:
         before_polls = c.execute("SELECT COUNT(*) FROM source_polls WHERE source = 'a'").fetchone()[0]
@@ -24670,7 +24674,7 @@ with live_dashboard() as (_, port):
     assert st_dr == 200 and body_dr["ok"] is True and body_dr["dry_run"] is True
     flags = {it["key"]: it["seen"] for it in body_dr["items"]}
     assert flags == {"a1": True, "a2": False}, flags
-    assert source_store.source_seen("a") == before_seen
+    assert intake_store.item_identities("a") == before_seen
     assert source_store.cursor("a") == before_cur
     with db.reader() as c:
         assert c.execute("SELECT COUNT(*) FROM source_polls WHERE source = 'a'").fetchone()[0] == before_polls

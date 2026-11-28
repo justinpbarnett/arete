@@ -16,9 +16,9 @@ from urllib.parse import quote, unquote
 
 from . import (
     IMPORTED_NS, __version__, api_http, attention, bands, board, codebase, config, configcheck, configitems,
-    configkinds, configrepo, contract, control, credential_http, devices, drafts, events, floor, inbox, leases,
-    loop_run, loops, outbox, paths, pi, record, refusals, secretstore, settings, sources, stats, tasks, ticket_media,
-    tool_events, triage, util, webhooks, webpush,
+    configkinds, configrepo, contract, control, credential_http, devices, drafts, events, floor, inbox,
+    intake_service, leases, loop_run, loops, outbox, paths, pi, record, refusals, secretstore, settings, sources,
+    stats, tasks, ticket_media, tool_events, triage, util, webhooks, webpush,
 )
 from . import principals as actor_principals
 from .store import blobs, chats, credentials, insights, principals, runs
@@ -462,6 +462,43 @@ def read(name, values, handler, *, conn=None):
             project=values.get("project"),
             include_archived=bool(values.get("include_archived", False)),
         )
+    if name == "task_screen.get":
+        tid = values["task"].strip()
+        read_conn = (lambda: nullcontext(conn)) if conn is not None else foundation.reader
+        task_row = needed(task_store.task_get(tid, connect=read_conn), tid)
+        view_data = tasks.view(task_row["id"])
+        sources_rows = [serialize(r, contract.TASK_REF) for r in (view_data.get("sources") or ())]
+        comments_rows = [serialize(row, contract.TASK_COMMENT) for row in task_store.versioned_comments(task_row["id"])]
+        return {
+            "task": serialize(task_row, contract.TASK),
+            "sources": sources_rows,
+            "runs": list(view_data.get("runs") or ()),
+            "children": list(view_data.get("children") or ()),
+            "comments": comments_rows,
+        }
+    if name == "intake.list":
+        read_conn = (lambda: nullcontext(conn)) if conn is not None else foundation.reader
+        raw_limit = values.get("limit")
+        limit = 100
+        if raw_limit is not None:
+            if not str(raw_limit).isascii() or not str(raw_limit).isdecimal():
+                raise contract.Problem("invalid_input", "limit must be a positive integer")
+            limit = int(raw_limit)
+        return {
+            "items": intake_service.list_items(
+                source=values.get("source"),
+                status=values.get("status"),
+                kind=values.get("kind"),
+                limit=limit,
+                connect=read_conn,
+            )
+        }
+    if name == "intake.get":
+        read_conn = (lambda: nullcontext(conn)) if conn is not None else foundation.reader
+        return intake_service.get_item(values["item"], connect=read_conn)
+    if name == "intake.history":
+        read_conn = (lambda: nullcontext(conn)) if conn is not None else foundation.reader
+        return {"events": intake_service.history(values["item"], connect=read_conn)}
     if name == "push.list":
         return {"subscriptions": webpush.list_v1()}
     if name == "device.list":
@@ -789,7 +826,8 @@ def read(name, values, handler, *, conn=None):
         return {"run": run_view, "steps": steps, "eta": eta, "eta_partial": eta_partial}
     if action == "get" and resource == "task":
         task = needed(task_store.task_get(identity), identity)
-        return {"task": serialize(task, contract.TASK)}
+        sources_rows = [serialize(r, contract.TASK_REF) for r in (task.get("refs") or ())]
+        return {"task": serialize(task, contract.TASK), "sources": sources_rows}
     if action == "get" and resource == "project":
         from . import lines as lines_mod
 
@@ -1113,6 +1151,7 @@ _NON_ATOMIC_COMMANDS = frozenset((
     "line.create", "line.update", "line.restore", "line.delete",
     "view.create", "view.update", "view.restore",
     "derived.recompute",
+    "intake.extract",
 ))
 
 
@@ -1121,11 +1160,13 @@ def command(handler, op, values, path_values, *, claim=None):
     read_only = op["method"] == "GET" or name == "batch.run"
     action = (lambda: mutation(name, values, handler)) if contract.keyed_write(op) else (
         lambda: execute(name, values, handler))
-    return handler.keyed_action(op["method"], op["path"], path_values, action,
-                                atomic=not read_only and name not in _NON_ATOMIC_COMMANDS,
-                                status=op["success_status"],
-                                redact=name in ("token.issue", "token.rotate", "webhook.rotate"),
-                                claim=claim, read_only=read_only)
+    fence_ctx = configrepo.maybe_instance_fence() if name == "intake.accept" else nullcontext()
+    with fence_ctx:
+        return handler.keyed_action(op["method"], op["path"], path_values, action,
+                                    atomic=not read_only and name not in _NON_ATOMIC_COMMANDS,
+                                    status=op["success_status"],
+                                    redact=name in ("token.issue", "token.rotate", "webhook.rotate"),
+                                    claim=claim, read_only=read_only)
 
 
 def _set_run_location(handler, run_id: str, *, created: bool) -> None:
@@ -1852,6 +1893,40 @@ def mutation(name, values, handler):
         result = {"item": outbox.retry(values["item"], base_version=values["base_version"])}
     elif name == "outbox.discard":
         result = {"item": outbox.discard(values["item"], base_version=values["base_version"])}
+    elif name == "intake.add":
+        result = {"item": intake_service.add_item(values, actor_principals.current())}
+    elif name == "intake.extract":
+        item_id = values["item"]
+        actor = actor_principals.current()
+        key = (handler.headers.get("Idempotency-Key") if handler else None) or secrets.token_hex(12)
+        wait_seconds = prefer_wait(handler, default=2.0, maximum=10.0)
+
+        def _do_extract(target_item=item_id, target_actor=actor) -> dict:
+            with actor_principals.acting(target_actor):
+                return intake_service.extract_item(target_item, target_actor)
+
+        future = intake_service.submit_extract(_do_extract)
+        try:
+            result = future.result(timeout=wait_seconds)
+        except concurrent.futures.TimeoutError:
+            if handler is not None:
+                handler.success_status = 202
+            result = {
+                "accepted": True,
+                "watch": f"/api/v1/events?idem={quote(key, safe='')}",
+                "item": item_id,
+            }
+    elif name == "intake.accept":
+        accepted = intake_service.accept_item(values["item"], values, actor_principals.current())
+        result = {
+            "item": accepted["item"],
+            "candidates": accepted["candidates"],
+            "ref": serialize(accepted["ref"], contract.REF),
+            "tasks": [serialize(t, contract.TASK) for t in accepted["tasks"]],
+            "links": [serialize(lnk, contract.TASK_REF) for lnk in accepted["links"]],
+        }
+    elif name == "intake.dismiss":
+        result = intake_service.dismiss_item(values["item"], values, actor_principals.current())
     elif name == "triage.send":
         try:
             item = triage.send(
